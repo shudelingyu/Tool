@@ -1,0 +1,38 @@
+[
+  {
+    "name": "Xml参数管理工具",
+    "path": "D:/YC_Tool/xmlTool/dist/XmlTool.exe",
+    "desc": "用于处理批量处理xml参数",
+    "icon": "📄"
+  },
+  {
+    "name": "日志分析工具",
+    "path": "D:/YC_Tool/LogAnalysis/dist/LogAnalysis.exe",
+    "desc": "YC日志分析工具支持离线模式在线模式"
+  },
+  {
+    "name": "Inst工装控制工具",
+    "path": "D:/YC_Tool/instTool/dist/InstTool.exe",
+    "desc": "用于器械工装简单控制器械姿态"
+  },
+  {
+    "name": "图片角度测量工具",
+    "path": "D:/YC_Tool/instTool/dist/AngleMeasurer.exe",
+    "desc": "用于图片测量角度"
+  },
+  {
+    "name": "xml在线调试工具",
+    "path": "D:/XmlDebugger调试工具/MemoryClientTool.exe",
+    "desc": "用于在线调试参数"
+  },
+  {
+    "name": "plot在线画图工具",
+    "path": "D:/plot_history/plotjuggler.exe",
+    "desc": "用于在线绘制关节曲线"
+  },
+  {
+    "name": "获取主从当前关节角位置",
+    "path": "D:/YC_Tool/jointMonitor/dist/jointMonitor.exe",
+    "desc": "用于获取最新当前关节角"
+  }
+]

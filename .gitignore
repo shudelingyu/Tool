@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts
+dist/
+build/
+log/
+*.exe
+
+# Log files
+*.log
+
+# Documentation PDFs
+*.pdf
+
+# Photos directory
+photos/
+
+# Test file
+test.py
