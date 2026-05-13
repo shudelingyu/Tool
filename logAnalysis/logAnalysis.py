@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTreeWidget, QTreeWidgetItem, QComboBox, QSizePolicy,
                              QRadioButton, QStackedWidget, QTabWidget, QHeaderView)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QEvent
+from PyQt5.QtGui import QDrag
 import pyqtgraph as pg
 import pandas as pd
 import numpy as np
@@ -625,7 +626,7 @@ class TimeAxis(pg.AxisItem):
                 fmt = "%H:%M:%S"
             strs = []
             for v in values:
-                if np.isnan(v) or v <= 0:
+                if np.isnan(v) or v < 0:
                     strs.append("")
                 else:
                     try:
@@ -678,31 +679,40 @@ class DragTreeWidget(QTreeWidget):
         super().__init__(parent)
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragOnly)
+        self._drag_item = None
+        self._drag_start_pos = None
 
-    def mimeData(self, items):
-        selected = self.selectedItems()
-        texts = []
-        for item in selected:
-            if item.childCount() > 0:
-                for i in range(item.childCount()):
-                    texts.append(item.child(i).text(0))
-            else:
-                texts.append(item.text(0))
-        mime_data = QMimeData()
-        mime_data.setText("\n".join(texts))
-        return mime_data
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_item = self.itemAt(event.pos())
+            self._drag_start_pos = event.pos()
+        super().mousePressEvent(event)
 
-    def startDrag(self, supportedActions):
-        selected_before = list(self.selectedItems())
-        super().startDrag(supportedActions)
-        QTimer.singleShot(50, lambda: self._restore_selection(selected_before))
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton and self._drag_item and self._drag_start_pos:
+            delta = (event.pos() - self._drag_start_pos).manhattanLength()
+            if delta >= QApplication.startDragDistance():
+                texts = []
+                item = self._drag_item
+                if item.childCount() > 0:
+                    for i in range(item.childCount()):
+                        texts.append(item.child(i).text(0))
+                else:
+                    texts.append(item.text(0))
+                mime = QMimeData()
+                mime.setText("\n".join(texts))
+                drag = QDrag(self)
+                drag.setMimeData(mime)
+                drag.exec(Qt.CopyAction)
+                self._drag_item = None
+                self._drag_start_pos = None
+                return
+        super().mouseMoveEvent(event)
 
-    def _restore_selection(self, items):
-        self.blockSignals(True)
-        self.clearSelection()
-        for item in items:
-            item.setSelected(True)
-        self.blockSignals(False)
+    def mouseReleaseEvent(self, event):
+        self._drag_item = None
+        self._drag_start_pos = None
+        super().mouseReleaseEvent(event)
 
 # ==================== 绘图子区域 ====================
 class PlotSubWidget(QWidget):
@@ -887,7 +897,7 @@ class PlotSubWidget(QWidget):
             return
         color = self._next_color()
         pen = pg.mkPen(color=color, width=2.5)
-        opts = {'pen': pen, 'name': col, 'antialias': False, 'downsample': 100, 'autoDownsample': True}
+        opts = {'pen': pen, 'name': col, 'antialias': False, 'downsample': 300, 'autoDownsample': True}
         curve = self.plot_widget.plot(x, y, **opts)
         self.plot_items[col] = curve
         # 如果游标已激活，为新曲线添加标注
@@ -1411,15 +1421,20 @@ class MainWindow(QMainWindow):
         offline_layout.addWidget(path_group)
 
         opt_group = QGroupBox("选项")
-        opt_layout = QHBoxLayout()
+        opt_layout = QVBoxLayout()
+        cache_row = QHBoxLayout()
         self.cache_cb = QCheckBox("启用缓存")
         self.cache_cb.setChecked(True)
         self.cache_cb.stateChanged.connect(self.on_cache_toggle)
         self.rebuild_btn = QPushButton("🔄 重建缓存")
         self.rebuild_btn.clicked.connect(self.rebuild_cache)
         self.rebuild_btn.setEnabled(False)
-        opt_layout.addWidget(self.cache_cb)
-        opt_layout.addWidget(self.rebuild_btn)
+        cache_row.addWidget(self.cache_cb)
+        cache_row.addWidget(self.rebuild_btn)
+        opt_layout.addLayout(cache_row)
+        self.relative_time_cb = QCheckBox("使用相对时间")
+        self.relative_time_cb.setToolTip("忽略日志原始时间戳")
+        opt_layout.addWidget(self.relative_time_cb)
         opt_group.setLayout(opt_layout)
         offline_layout.addWidget(opt_group)
 
@@ -1528,7 +1543,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(QLabel("📋 数据列"))
         self.tree = DragTreeWidget()
         self.tree.setHeaderLabel("数据列")
-        self.tree.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.tree.setSelectionMode(QAbstractItemView.NoSelection)
         self.tree.setIndentation(20)
         self.tree.setMinimumHeight(400)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -1982,6 +1997,14 @@ class MainWindow(QMainWindow):
             else:
                 self.timestamp_epoch = None
 
+            # 如果勾选了相对时间，以第一个时间戳为基准，按行号生成时间轴（忽略原始时间戳间隔）
+            if self.relative_time_cb.isChecked() and 'line_no' in df.columns:
+                if self.timestamp_epoch is not None and len(self.timestamp_epoch) > 0 and not np.isnan(self.timestamp_epoch[0]):
+                    base = self.timestamp_epoch[0]
+                else:
+                    base = 0.0
+                self.timestamp_epoch = base + (df['line_no'].values - 1) * 0.001
+
             self.current_columns = [c for c in df.columns if c not in ('timestamp', 'line_no')]
             group_dict = {}
             for col in self.current_columns:
@@ -2011,7 +2034,14 @@ class MainWindow(QMainWindow):
             self.tree.blockSignals(False)
 
             time_range = ""
-            if 'timestamp' in df.columns and df['timestamp'].notna().any():
+            if self.relative_time_cb.isChecked() and 'line_no' in df.columns:
+                total_s = (df['line_no'].max() - 1) * 0.001
+                base_ts = df['timestamp'].iloc[0] if 'timestamp' in df.columns and not df['timestamp'].empty else None
+                if base_ts is not None and pd.notna(base_ts):
+                    time_range = f"\n相对时间（基准 {base_ts}，跨度 {total_s:.3f} s）"
+                else:
+                    time_range = f"\n相对时间: 0 ~ {total_s:.3f} s"
+            elif 'timestamp' in df.columns and df['timestamp'].notna().any():
                 tmin = df['timestamp'].min()
                 tmax = df['timestamp'].max()
                 time_range = f"\n时间范围: {tmin} ~ {tmax}"
