@@ -431,7 +431,7 @@ def convert_folder_to_cache(folder_path, cache_path, progress_callback=None, sto
     if not HAS_PARQUET:
         return False
     files = [os.path.join(folder_path, f) for f in os.listdir(folder_path)
-             if os.path.isfile(os.path.join(folder_path, f))]
+             if os.path.isfile(os.path.join(folder_path, f)) and f != '_combined_cache.parquet']
     total = len(files)
     dfs = []
     for i, fpath in enumerate(files):
@@ -445,9 +445,15 @@ def convert_folder_to_cache(folder_path, cache_path, progress_callback=None, sto
     if not dfs:
         return False
     combined = pd.concat(dfs, ignore_index=True)
-    if 'timestamp' in combined.columns:
-        combined = combined.sort_values('timestamp').reset_index(drop=True)
+    # 不按时间戳排序（原始时间戳不可靠），直接按文件顺序分配行号并使用相对时间
     combined['line_no'] = range(1, len(combined)+1)
+    # 以第一个原始时间戳为基准，每行 +1ms 生成相对时间
+    first_ts = combined['timestamp'].iloc[0] if 'timestamp' in combined.columns and not combined['timestamp'].empty else None
+    if first_ts is not None and pd.notna(first_ts):
+        base_epoch = first_ts.timestamp()
+    else:
+        base_epoch = 0.0
+    combined['timestamp'] = pd.to_datetime(base_epoch * 1000 + (combined['line_no'] - 1), unit='ms', utc=True)
     combined.to_parquet(cache_path, index=False, engine='pyarrow')
     if stop_event and stop_event.is_set():
         return False
@@ -535,11 +541,12 @@ class LoadThread(QThread):
     progress = pyqtSignal(float)
     finished = pyqtSignal(object, bool, str)
 
-    def __init__(self, path, use_cache, force_rebuild):
+    def __init__(self, path, use_cache, force_rebuild, use_relative_time=False):
         super().__init__()
         self.path = path
         self.use_cache = use_cache
         self.force_rebuild = force_rebuild
+        self.use_relative_time = use_relative_time
         self._stop = False
 
     def is_set(self):
@@ -574,7 +581,7 @@ class LoadThread(QThread):
                     df = pd.DataFrame()
                 else:
                     df = pd.concat(dfs, ignore_index=True)
-                    if 'timestamp' in df.columns:
+                    if 'timestamp' in df.columns and not self.use_relative_time:
                         df = df.sort_values('timestamp').reset_index(drop=True)
                     df['line_no'] = range(1, len(df)+1)
                 self.finished.emit(df, self._stop, "")
@@ -1923,7 +1930,8 @@ class MainWindow(QMainWindow):
         self.info_label.setText("加载中...")
         self.tree.clear()
 
-        self.load_thread = LoadThread(path, self.use_cache, self.force_rebuild)
+        self.load_thread = LoadThread(path, self.use_cache, self.force_rebuild,
+                                      use_relative_time=self.relative_time_cb.isChecked())
         self.load_thread.progress.connect(self.update_progress)
         self.load_thread.finished.connect(self.load_finished)
         self.load_thread.start()
