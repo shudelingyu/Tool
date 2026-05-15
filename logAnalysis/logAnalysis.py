@@ -441,11 +441,20 @@ try:
 except ImportError:
     HAS_PARQUET = False
 
+def is_compressed_file(filename):
+    """判断是否为压缩文件（根据扩展名，不区分大小写）"""
+    compressed_exts = ('.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz', '.tbz2', '.txz')
+    return filename.lower().endswith(compressed_exts)
+
 def convert_folder_to_cache(folder_path, cache_path, progress_callback=None, stop_event=None):
     if not HAS_PARQUET:
         return False
     files = [os.path.join(folder_path, f) for f in os.listdir(folder_path)
-             if os.path.isfile(os.path.join(folder_path, f)) and f != '_combined_cache.parquet']
+         if os.path.isfile(os.path.join(folder_path, f))
+         and f != '_combined_cache.parquet'
+         and not is_compressed_file(f)]
+    # 按文件修改时间排序，确保多文件拼接顺序正确
+    files.sort(key=os.path.getmtime)
     total = len(files)
     dfs = []
     for i, fpath in enumerate(files):
@@ -580,8 +589,9 @@ class LoadThread(QThread):
 
             if not self.use_cache:
                 files = [os.path.join(self.path, f) for f in os.listdir(self.path)
-                         if os.path.isfile(os.path.join(self.path, f))
-                         and f != '_combined_cache.parquet']
+                    if os.path.isfile(os.path.join(self.path, f))
+                    and f != '_combined_cache.parquet'
+                    and not is_compressed_file(f)]
                 total = len(files)
                 dfs = []
                 for i, fpath in enumerate(files):
@@ -866,7 +876,7 @@ class PlotSubWidget(QWidget):
         """拦截绘图控件的键盘事件"""
         if obj == self.plot_widget and event.type() == QEvent.KeyPress:
             tab = self.parent_tab
-            if event.key() == Qt.Key_T:
+            if event.key() == Qt.Key_S:
                 tab.sync_x_range_from(self)
                 return True
             if any(tab.cursor_enabled):
