@@ -7,6 +7,9 @@ import sys
 import datetime
 import paramiko
 from collections import deque
+# 注意：pandas/pyarrow 必须在 PyQt5 之前导入，否则 pyarrow C 扩展在 Python 3.14 上会崩溃
+import pandas as pd
+import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
                              QFileDialog, QMessageBox, QProgressBar, QSpinBox, QSplitter,
@@ -16,8 +19,6 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QEvent
 from PyQt5.QtGui import QDrag
 import pyqtgraph as pg
-import pandas as pd
-import numpy as np
 
 # 设置 PyQtGraph 全局背景白色、前景黑色
 pg.setConfigOptions(background='w', foreground='k')
@@ -566,7 +567,8 @@ class LoadThread(QThread):
 
             if not self.use_cache:
                 files = [os.path.join(self.path, f) for f in os.listdir(self.path)
-                         if os.path.isfile(os.path.join(self.path, f))]
+                         if os.path.isfile(os.path.join(self.path, f))
+                         and f != '_combined_cache.parquet']
                 total = len(files)
                 dfs = []
                 for i, fpath in enumerate(files):
@@ -738,6 +740,12 @@ class PlotSubWidget(QWidget):
         # 垂直游标状态
         self.cursor_lines = [None, None]  # InfiniteLine 列表 [游标0(红), 游标1(蓝)]
         self.cursor_labels = []
+        self.cursor_annotations = {}  # (col, cursor_idx) -> TextItem（标注原地更新）
+        self.cursor_time_labels = [None, None]  # 每个游标一个时间标签
+        self._cursor_debounce_timer = QTimer()
+        self._cursor_debounce_timer.setSingleShot(True)
+        self._cursor_debounce_timer.timeout.connect(self.flush_cursor_annotations)
+        self._pending_cursor_update = None  # (x, cursor_idx) 待更新的游标数据
         self.setup_ui()
         self.setup_hover()
 
@@ -753,6 +761,7 @@ class PlotSubWidget(QWidget):
         self.plot_widget.setLabel('bottom', '时间')
         self.plot_widget.showGrid(x=True, y=True, alpha=0.5)
         self.plot_widget.addLegend()
+        self.plot_widget.setClipToView(True)
         self.plot_widget.drop_signal.connect(self.add_curve)
         self.plot_widget.installEventFilter(self)
         self.plot_widget.mouseDoubleClickEvent = self.on_double_click
@@ -862,11 +871,15 @@ class PlotSubWidget(QWidget):
                     step = 0.001  # 1ms
                     if event.key() == Qt.Key_Left:
                         tab.cursor_x[ci] -= step
-                        tab._update_cursor_position()
+                        tab._sync_cursor_lines_only(tab.cursor_x[ci], cursor_idx=ci)
+                        tab._pending_cursor_ci = ci
+                        tab._cursor_update_timer.start(60)
                         return True
                     elif event.key() == Qt.Key_Right:
                         tab.cursor_x[ci] += step
-                        tab._update_cursor_position()
+                        tab._sync_cursor_lines_only(tab.cursor_x[ci], cursor_idx=ci)
+                        tab._pending_cursor_ci = ci
+                        tab._cursor_update_timer.start(60)
                         return True
         return super().eventFilter(obj, event)
 
@@ -1028,9 +1041,15 @@ class PlotSubWidget(QWidget):
         x = line.value()
         self.parent_tab.sync_cursor_annotations(x, cursor_idx=cursor_idx)
 
+    def flush_cursor_annotations(self):
+        """定时器去抖刷新，处理最后一个待更新的游标位置"""
+        if self._pending_cursor_update is not None:
+            x, cursor_idx = self._pending_cursor_update
+            self._pending_cursor_update = None
+            self.update_cursor_annotations(x, cursor_idx)
+
     def update_cursor_annotations(self, x, cursor_idx=0):
-        """创建/更新游标与曲线交点的数值标注"""
-        self._remove_cursor_labels()
+        """创建/更新游标与曲线交点的数值标注（原地更新，避免反复创建删除标签）"""
         self._add_cursor_time_label(x, cursor_idx)
         if not self.plot_items:
             return
@@ -1043,7 +1062,11 @@ class PlotSubWidget(QWidget):
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
                   '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
 
+        active_keys = set()
         for idx, (col, curve) in enumerate(self.plot_items.items()):
+            key = (col, cursor_idx)
+            active_keys.add(key)
+
             y_val = None
             if col in self.main.y_buffers:
                 y_arr = np.array(self.main.y_buffers[col])
@@ -1077,33 +1100,56 @@ class PlotSubWidget(QWidget):
 
             text = f"{col}={y_val:.4f}"
             color = colors[idx % len(colors)]
-            label = pg.TextItem(text=text, anchor=(0, 0.5), color=color)
-            label.setPos(x + x_offset, y_val)
-            self.plot_widget.addItem(label)
-            self.cursor_labels.append(label)
+
+            if key in self.cursor_annotations:
+                label = self.cursor_annotations[key]
+                label.setText(text)
+                label.setColor(color)
+                label.setPos(x + x_offset, y_val)
+            else:
+                label = pg.TextItem(text=text, anchor=(0, 0.5), color=color)
+                label.setPos(x + x_offset, y_val)
+                self.plot_widget.addItem(label)
+                self.cursor_annotations[key] = label
+
+        # 清理已删除曲线的标注
+        stale_keys = [k for k in list(self.cursor_annotations) if k[1] == cursor_idx and k not in active_keys]
+        for key in stale_keys:
+            self.plot_widget.removeItem(self.cursor_annotations.pop(key))
 
     def _remove_cursor_labels(self):
-        """移除所有数值标注"""
+        """移除所有数值标注和时间标注"""
+        for label in self.cursor_annotations.values():
+            self.plot_widget.removeItem(label)
+        self.cursor_annotations.clear()
+        for ci in range(2):
+            if self.cursor_time_labels[ci] is not None:
+                self.plot_widget.removeItem(self.cursor_time_labels[ci])
+                self.cursor_time_labels[ci] = None
         for label in self.cursor_labels:
             self.plot_widget.removeItem(label)
         self.cursor_labels.clear()
 
     def _add_cursor_time_label(self, x, cursor_idx=0):
-        """在游标线顶部添加时间标注"""
+        """在游标线顶部添加/更新时间标注（原地更新）"""
         try:
             dt = datetime.datetime.fromtimestamp(x, tz=datetime.timezone.utc)
             time_str = dt.strftime("%H:%M:%S.%f")[:-3]
         except Exception:
             time_str = f"{x:.3f}"
-        # 获取视图Y范围顶部位置
         view_box = self.plot_widget.getViewBox()
         y_range = view_box.viewRange()[1]
         y_top = y_range[1] - (y_range[1] - y_range[0]) * 0.02
         color = self.CURSOR_COLORS[cursor_idx]
-        label = pg.TextItem(text=f"t={time_str}", anchor=(0, 1), color=color)
-        label.setPos(x, y_top)
-        self.plot_widget.addItem(label)
-        self.cursor_labels.append(label)
+        if self.cursor_time_labels[cursor_idx] is not None:
+            label = self.cursor_time_labels[cursor_idx]
+            label.setText(f"t={time_str}")
+            label.setPos(x, y_top)
+        else:
+            label = pg.TextItem(text=f"t={time_str}", anchor=(0, 1), color=color)
+            label.setPos(x, y_top)
+            self.plot_widget.addItem(label)
+            self.cursor_time_labels[cursor_idx] = label
 
     def clear_all_curves(self):
         self._remove_cursor_labels()
@@ -1123,6 +1169,11 @@ class PlotTab(QWidget):
         self.cursor_enabled = [False, False]  # [游标0, 游标1]
         self.cursor_x = [None, None]
         self.active_cursor = 0
+        self._align_pending = False
+        self._cursor_update_timer = QTimer()
+        self._cursor_update_timer.setSingleShot(True)
+        self._cursor_update_timer.timeout.connect(self._flush_cursor_update)
+        self._pending_cursor_ci = None
         self.init_ui()
 
     def init_ui(self):
@@ -1245,6 +1296,17 @@ class PlotTab(QWidget):
         for sub in self.sub_widgets:
             sub.update_cursor_annotations(x, cursor_idx=cursor_idx)
 
+    def _sync_cursor_lines_only(self, x, cursor_idx=0):
+        """仅同步游标线位置，不更新标注（用于键盘去抖）"""
+        if not self.cursor_enabled[cursor_idx]:
+            return
+        self.cursor_x[cursor_idx] = x
+        for sub in self.sub_widgets:
+            if sub.cursor_lines[cursor_idx] is not None:
+                sub.cursor_lines[cursor_idx].blockSignals(True)
+                sub.cursor_lines[cursor_idx].setPos(x)
+                sub.cursor_lines[cursor_idx].blockSignals(False)
+
     def _refresh_cursor_styles(self):
         """刷新游标样式：活动游标实线，非活动游标虚线"""
         for sub in self.sub_widgets:
@@ -1258,22 +1320,43 @@ class PlotTab(QWidget):
                         line.setPen(pg.mkPen(color, width=1.5, style=Qt.DashLine))
 
     def _update_cursor_position(self):
-        """键盘移动游标后更新所有子图的线条和标注"""
+        """键盘移动游标后更新所有子图的线条和标注（标注去抖）"""
         ci = self.active_cursor
         if not self.cursor_enabled[ci] or self.cursor_x[ci] is None:
             return
+        # 立即同步线条位置
         for sub in self.sub_widgets:
             if sub.cursor_lines[ci] is not None:
                 sub.cursor_lines[ci].blockSignals(True)
                 sub.cursor_lines[ci].setPos(self.cursor_x[ci])
                 sub.cursor_lines[ci].blockSignals(False)
+        # 标注延迟去抖更新（快速按键只刷新最后一次）
+        self._pending_cursor_ci = ci
+        self._cursor_update_timer.start(60)
+
+    def _flush_cursor_update(self):
+        """去抖定时器触发，更新所有子图的游标标注"""
+        ci = self._pending_cursor_ci
+        self._pending_cursor_ci = None
+        if ci is None or not self.cursor_enabled[ci] or self.cursor_x[ci] is None:
+            return
+        for sub in self.sub_widgets:
             sub.update_cursor_annotations(self.cursor_x[ci], cursor_idx=ci)
 
     def _align_left_axes(self):
-        """对齐所有子视图的左轴宽度（垂直分栏时排版对齐）"""
+        """对齐所有子视图的左轴宽度（去抖，多次快速调整只执行一次）"""
         if len(self.sub_widgets) < 2:
             return
-        # 先重置为自动宽度，让各轴重新计算
+        if self._align_pending:
+            return
+        self._align_pending = True
+        QTimer.singleShot(0, self._do_align_left_axes)
+
+    def _do_align_left_axes(self):
+        """实际执行左轴对齐"""
+        self._align_pending = False
+        if len(self.sub_widgets) < 2:
+            return
         for sub in self.sub_widgets:
             sub.plot_widget.getAxis('left').setWidth(None)
         QApplication.processEvents()
