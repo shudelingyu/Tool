@@ -1,0 +1,64 @@
+{
+  "slave": {
+    "detect": { "prefix": ",", "counts": [142, 92] },
+    "array_vars": [
+      {"name": "tar_pos", "count": 13},
+      {"name": "cur_pos", "count": 13},
+      {"name": "tar_toq", "count": 13},
+      {"name": "cur_toq", "count": 13},
+      {"name": "status_word", "count": 13},
+      {"name": "control_word", "count": 13},
+      {"name": "error_code", "count": 13},
+      {"name": "encoder1", "count": 13},
+      {"name": "encoder2", "count": 13},
+      {"name": "mode", "count": 13}
+    ],
+    "flat_vars": [
+      {"name": "pa", "count": 6},
+      {"name": "ff_PDO", "count": 5},
+      {"name": "motion_cmd", "count": 1}
+    ],
+    "simple": { "array_start": 5, "array_end": 13 }
+  },
+  "boom": {
+    "detect": { "prefix": ",", "counts": [36] },
+    "array_vars": [
+      {"name": "tar_pos", "count": 4},
+      {"name": "cur_pos", "count": 4},
+      {"name": "tar_toq", "count": 4},
+      {"name": "cur_toq", "count": 4},
+      {"name": "status_word", "count": 4},
+      {"name": "control_word", "count": 4},
+      {"name": "error_code", "count": 4},
+      {"name": "encoder1", "count": 4},
+      {"name": "encoder2", "count": 4}
+    ]
+  },
+  "master": {
+    "detect": { "prefix": null },
+    "fields": [
+      {"name": "cur_q", "count": 8, "has_label": true},
+      {"name": "cur_qabs", "count": 8, "has_label": true},
+      {"name": "tar_q", "count": 8, "has_label": true},
+      {"name": "pdo6064", "count": 8, "has_label": true},
+      {"name": "pdo20a0", "count": 8, "has_label": true},
+      {"name": "cur_toq", "count": 8, "has_label": true},
+      {"name": "tar_toq", "count": 8, "has_label": true},
+      {"name": "gravityTau", "count": 7, "has_label": true},
+      {"name": "feedbackTau", "count": 7, "has_label": true},
+      {"name": "cur_endpos", "count": 12, "has_label": true},
+      {"name": "clipratio", "count": 1, "has_label": true},
+      {"name": "hall", "count": 1, "has_label": true},
+      {"name": "io_finger_clutch", "count": 1, "has_label": true},
+      {"name": "control_word", "count": 8, "has_label": true},
+      {"name": "status_word", "count": 8, "has_label": true},
+      {"name": "error_code", "count": 8, "has_label": true},
+      {"name": "mode_of_operation", "count": 8, "has_label": true},
+      {"name": "motion_cmd", "count": 1, "has_label": true},
+      {"name": "view_angle", "count": 1, "has_label": true}
+    ]
+  },
+  "lout": {
+    "detect_regex": "\\[ADS\\]"
+  }
+}

@@ -6,6 +6,7 @@ import re
 import sys
 import datetime
 import paramiko
+import json
 from collections import deque
 # 注意：pandas/pyarrow 必须在 PyQt5 之前导入，否则 pyarrow C 扩展在 Python 3.14 上会崩溃
 import pandas as pd
@@ -24,14 +25,184 @@ import pyqtgraph as pg
 pg.setConfigOptions(background='w', foreground='k')
 pg.setConfigOptions(antialias=True)
 
-# ==================== 日志解析模块（保持不变） ====================
+# ==================== 日志解析模块（配置文件驱动） ====================
 TIMESTAMP_PAT = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]\s*')
 MASTER_NUM_PAT = re.compile(r'-?\d+\.?\d*(?:[eE][+-]?\d+)?')
 
-_FULL_SLAVE_COLS = None
-_SIMPLE_SLAVE_COLS = None
-_SIMPLE_TO_FULL_MAP = None
-_MASTER_COLS = None
+# ========== 配置文件驱动 ==========
+class FormatConfig:
+    """从 JSON 配置加载数据格式定义，动态生成列名和解析规则。"""
+
+    def __init__(self, config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            self._raw = json.load(f)
+        self._cols_cache = {}
+        self._simple_to_full = None
+
+    # ---- 列名生成 ----
+
+    def get_columns(self, fmt_name, variant=None):
+        """获取指定格式的列名列表。variant='simple' 仅对 slave 有效。"""
+        cache_key = (fmt_name, variant)
+        if cache_key in self._cols_cache:
+            return self._cols_cache[cache_key]
+
+        fmt = self._raw.get(fmt_name)
+        if fmt is None:
+            return []
+
+        cols = []
+        if fmt_name == 'master':
+            for field in fmt['fields']:
+                name, cnt = field['name'], field['count']
+                if cnt == 1:
+                    cols.append(name)
+                else:
+                    cols.extend([f'{name}_{i}' for i in range(cnt)])
+        else:
+            # slave / boom: array_vars + flat_vars
+            for var in fmt.get('array_vars', []):
+                name, cnt = var['name'], var['count']
+                if variant == 'simple':
+                    s = fmt['simple']['array_start']
+                    e = fmt['simple']['array_end']
+                    cols.extend([f'{name}[{i}]' for i in range(s, e)])
+                else:
+                    cols.extend([f'{name}[{i}]' for i in range(cnt)])
+            for var in fmt.get('flat_vars', []):
+                name, cnt = var['name'], var['count']
+                if cnt == 1:
+                    cols.append(name)
+                else:
+                    cols.extend([f'{name}[{i}]' for i in range(cnt)])
+
+        self._cols_cache[cache_key] = cols
+        return cols
+
+    def get_simple_to_full_indices(self):
+        """92 列简单格式 → 142 列全格式的索引映射。"""
+        if self._simple_to_full is None:
+            full = self.get_columns('slave')
+            simple = self.get_columns('slave', 'simple')
+            self._simple_to_full = [full.index(c) for c in simple]
+        return self._simple_to_full
+
+    def get_field_defs(self, fmt_name):
+        """获取 master 的字段定义列表 [(name, count, has_label), ...]"""
+        fmt = self._raw.get(fmt_name)
+        if fmt is None or 'fields' not in fmt:
+            return []
+        return [(f['name'], f['count'], f.get('has_label', True)) for f in fmt['fields']]
+
+    def get_total_count(self, fmt_name, variant=None):
+        """获取某格式的总列数。"""
+        cols = self.get_columns(fmt_name, variant)
+        return len(cols)
+
+    # ---- 格式检测 ----
+
+    def detect_format(self, data_part):
+        """根据 data_part 判断日志格式，返回 (fmt_name, variant) 或 (None, None)。"""
+        for fmt_name, fmt in self._raw.items():
+            # 跳过 lout（ADS 单独处理）
+            if 'detect_regex' in fmt:
+                continue
+            detect = fmt.get('detect', {})
+            prefix = detect.get('prefix')  # None=master, ","=slave/boom
+            counts = detect.get('counts', [])
+            if prefix is None:
+                # master: 不以逗号开头
+                if not data_part.startswith(','):
+                    return fmt_name, None
+            else:
+                # slave/boom: 以逗号开头，且列数匹配
+                if data_part.startswith(prefix):
+                    n = len(data_part[1:].split(',')) if data_part.startswith(',') else len(data_part.split(','))
+                    if n in counts:
+                        variant = 'simple' if fmt_name == 'slave' and n == 92 else None
+                        return fmt_name, variant
+        return None, None
+
+    # ---- 值解析 ----
+
+    def parse_values(self, fmt_name, data_part, variant=None):
+        """按配置解析一行数据，返回 (cols, values) 或 (None, None)。"""
+        fmt = self._raw.get(fmt_name)
+        if fmt is None:
+            return None, None
+
+        if fmt_name == 'master':
+            return self._parse_master(data_part, fmt)
+        elif fmt_name == 'slave':
+            return self._parse_slave(data_part, variant)
+        elif fmt_name == 'boom':
+            return self._parse_boom(data_part, fmt)
+        return None, None
+
+    def _parse_number(self, tok):
+        tok = tok.strip().rstrip(',')
+        if not tok:
+            return np.nan
+        try:
+            if '.' in tok or 'e' in tok.lower():
+                return float(tok)
+            return int(tok)
+        except Exception:
+            try:
+                return float(tok)
+            except Exception:
+                return np.nan
+
+    def _parse_slave(self, data_part, variant=None):
+        if not data_part.startswith(','):
+            return None, None
+        parts = data_part[1:].split(',')
+        n = len(parts)
+        cols = self.get_columns('slave', variant)
+        expected = len(cols)
+        if n != expected:
+            return None, None
+
+        values = [self._parse_number(p) for p in parts]
+
+        if variant == 'simple':
+            # 92→142 列扩展：把简单格式值填入全格式对应位置
+            indices = self.get_simple_to_full_indices()
+            full_values = [0.0] * len(self.get_columns('slave'))
+            for idx_simple, val in enumerate(values):
+                full_values[indices[idx_simple]] = val
+            return self.get_columns('slave'), full_values
+
+        return cols, values
+
+    def _parse_boom(self, data_part, fmt):
+        if not data_part.startswith(','):
+            return None, None
+        parts = data_part[1:].split(',')
+        cols = self.get_columns('boom')
+        if len(parts) != len(cols):
+            return None, None
+        values = [self._parse_number(p) for p in parts]
+        return cols, values
+
+    def _parse_master(self, data_part, fmt):
+        parts = data_part.strip().split()
+        if not parts:
+            return None, None
+
+        fields = self.get_field_defs('master')
+        values = []
+        i = 0
+        for name, cnt, has_label in fields:
+            if has_label and i < len(parts) and parts[i] == name:
+                i += 1
+            for _ in range(cnt):
+                if i >= len(parts):
+                    return None, None
+                values.append(self._parse_number(parts[i]))
+                i += 1
+        return self.get_columns('master'), values
+
 
 def parse_timestamp(line: str):
     m = TIMESTAMP_PAT.match(line)
@@ -39,184 +210,31 @@ def parse_timestamp(line: str):
         return m.group(1), line[m.end():]
     return None, line
 
-def get_full_slave_columns():
-    global _FULL_SLAVE_COLS
-    if _FULL_SLAVE_COLS is None:
-        vars_long = ['tar_pos', 'cur_pos', 'tar_toq', 'cur_toq', 'status_word',
-                     'control_word', 'error_code', 'encoder1', 'encoder2', 'mode']
-        cols = []
-        for v in vars_long:
-            cols.extend([f'{v}[{i}]' for i in range(13)])
-        cols.extend([f'pa[{i}]' for i in range(6)])
-        cols.extend([f'ff_PDO[{i}]' for i in range(5)])
-        cols.append('motion_cmd')
-        _FULL_SLAVE_COLS = cols
-    return _FULL_SLAVE_COLS
+def get_config_path():
+    if getattr(sys, 'frozen', False):
+        # 打包成 exe 时，配置文件放在 exe 同级目录下的 configs 文件夹
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        # 开发环境，使用脚本所在目录
+        base_dir = os.path.dirname(__file__)
+    return os.path.join(base_dir, 'configs', 'data_formats.json')
 
-def get_simple_slave_columns():
-    global _SIMPLE_SLAVE_COLS
-    if _SIMPLE_SLAVE_COLS is None:
-        vars_short = ['tar_pos', 'cur_pos', 'tar_toq', 'cur_toq', 'status_word',
-                      'control_word', 'error_code', 'encoder1', 'encoder2', 'mode']
-        cols = []
-        for v in vars_short:
-            cols.extend([f'{v}[{i}]' for i in range(5, 13)])
-        cols.extend([f'pa[{i}]' for i in range(6)])
-        cols.extend([f'ff_PDO[{i}]' for i in range(5)])
-        cols.append('motion_cmd')
-        _SIMPLE_SLAVE_COLS = cols
-    return _SIMPLE_SLAVE_COLS
-
-def get_boom_columns():
-    variables = ['tar_pos', 'cur_pos', 'tar_toq', 'cur_toq',
-                 'status_word', 'control_word', 'error_code',
-                 'encoder1', 'encoder2']
-    cols = []
-    for var in variables:
-        for i in range(4):
-            cols.append(f'{var}[{i}]')
-    return cols
-
-def get_simple_to_full_indices():
-    global _SIMPLE_TO_FULL_MAP
-    if _SIMPLE_TO_FULL_MAP is None:
-        full_cols = get_full_slave_columns()
-        simple_cols = get_simple_slave_columns()
-        _SIMPLE_TO_FULL_MAP = [full_cols.index(col) for col in simple_cols]
-    return _SIMPLE_TO_FULL_MAP
-
-def get_master_columns():
-    global _MASTER_COLS
-    if _MASTER_COLS is None:
-        fields = [
-            ('cur_q', 8), ('cur_qabs', 8), ('tar_q', 8),
-            ('pdo6064', 8), ('pdo20a0', 8), ('cur_toq', 8), ('tar_toq', 8),
-            ('gravityTau', 7), ('feedbackTau', 7), ('cur_endpos', 12),
-            ('clipratio', 1), ('hall', 1), ('io_finger_clutch', 1),
-            ('control_word', 8), ('status_word', 8), ('error_code', 8),
-            ('mode_of_operation', 8), ('motion_cmd', 1), ('view_angle', 1)
-        ]
-        cols = []
-        for name, cnt in fields:
-            if cnt == 1:
-                cols.append(name)
-            else:
-                cols.extend([f'{name}_{i}' for i in range(cnt)])
-        _MASTER_COLS = cols
-    return _MASTER_COLS
+# 加载配置文件（与 .py 同目录下的 configs/data_formats.json）
+_CONFIG_PATH = get_config_path()
+if os.path.exists(_CONFIG_PATH):
+    config = FormatConfig(_CONFIG_PATH)
+else:
+    config = None
+    print(f"警告：配置文件未找到，路径 {_CONFIG_PATH}")
 
 def parse_slave_line_fast(data_part: str):
-    if not data_part.startswith(','):
-        return None, None
-    parts = data_part[1:].split(',')
-    n = len(parts)
-
-    if n == 142:
-        cols = get_full_slave_columns()
-        values = []
-        for p in parts:
-            p = p.strip()
-            if not p:
-                values.append(np.nan)
-                continue
-            try:
-                if '.' not in p and 'e' not in p.lower():
-                    values.append(int(p))
-                else:
-                    values.append(float(p))
-            except ValueError:
-                values.append(np.nan)
-        return cols, values
-
-    elif n == 92:
-        simple_vals = []
-        for p in parts:
-            p = p.strip()
-            if not p:
-                simple_vals.append(np.nan)
-                continue
-            try:
-                if '.' not in p and 'e' not in p.lower():
-                    simple_vals.append(int(p))
-                else:
-                    simple_vals.append(float(p))
-            except ValueError:
-                simple_vals.append(np.nan)
-
-        full_vals = [0.0] * 142
-        indices = get_simple_to_full_indices()
-        for idx_simple, val in enumerate(simple_vals):
-            full_vals[indices[idx_simple]] = val
-        return get_full_slave_columns(), full_vals
-
-    else:
-        return None, None
+    return config.parse_values('slave', data_part) if config else (None, None)
 
 def parse_master_line_fast(data_part: str):
-    parts = data_part.strip().split()
-    if not parts:
-        return None, None
-
-    fields = [
-        ('cur_q', 8), ('cur_qabs', 8), ('tar_q', 8),
-        ('pdo6064', 8), ('pdo20a0', 8), ('cur_toq', 8), ('tar_toq', 8),
-        ('gravityTau', 7), ('feedbackTau', 7), ('cur_endpos', 12),
-        ('clipratio', 1), ('hall', 1), ('io_finger_clutch', 1),
-        ('control_word', 8), ('status_word', 8), ('error_code', 8),
-        ('mode_of_operation', 8), ('motion_cmd', 1), ('view_angle', 1)
-    ]
-
-    values = []
-    i = 0
-
-    def _parse_number(tok):
-        tok = tok.strip().rstrip(',')
-        if tok == '':
-            return np.nan
-        try:
-            if '.' in tok or 'e' in tok.lower():
-                return float(tok)
-            else:
-                return int(tok)
-        except Exception:
-            try:
-                return float(tok)
-            except Exception:
-                return np.nan
-
-    for name, cnt in fields:
-        if i < len(parts) and parts[i] == name:
-            i += 1
-        for _ in range(cnt):
-            if i >= len(parts):
-                return None, None
-            val = _parse_number(parts[i])
-            values.append(val)
-            i += 1
-
-    return get_master_columns(), values
+    return config.parse_values('master', data_part) if config else (None, None)
 
 def parse_boom_line_fast(data_part: str):
-    if not data_part.startswith(','):
-        return None, None
-    parts = data_part[1:].split(',')
-    if len(parts) != 36:
-        return None, None
-    cols = get_boom_columns()
-    values = []
-    for p in parts:
-        p = p.strip()
-        if not p:
-            values.append(np.nan)
-            continue
-        try:
-            if '.' not in p and 'e' not in p.lower():
-                values.append(int(p))
-                continue
-            values.append(float(p))
-        except ValueError:
-            values.append(np.nan)
-    return cols, values
+    return config.parse_values('boom', data_part) if config else (None, None)
 
 # ...existing code...
 def parse_lout_line_fast(line: str):
@@ -296,19 +314,14 @@ def parse_log_line(line: str):
     if ads_found:
         return results
 
-    # 否则，原有逻辑：判断是 slave/boom/master/master-like 行
+    # 使用配置文件驱动格式检测
     data_part = rest
-    if data_part.startswith(','):
-        parts_len = len(data_part[1:].split(','))
-        if parts_len == 142 or parts_len == 92:
-            cols, vals = parse_slave_line_fast(data_part)
-        elif parts_len == 36:
-            cols, vals = parse_boom_line_fast(data_part)
-        else:
-            cols, vals = None, None
-    else:
-        cols, vals = parse_master_line_fast(data_part)
-    return [(ts_str, cols, vals)]
+    if config:
+        fmt_name, variant = config.detect_format(data_part)
+        if fmt_name:
+            cols, vals = config.parse_values(fmt_name, data_part, variant)
+            return [(ts_str, cols, vals)]
+    return [(ts_str, None, None)]
 
 # ==================== 实时监控线程 ====================
 class LiveThread(QThread):
@@ -1056,17 +1069,17 @@ class PlotSubWidget(QWidget):
 
         view_box = self.plot_widget.getViewBox()
         x_range = view_box.viewRange()[0]
+        y_range = view_box.viewRange()[1]
         x_width = x_range[1] - x_range[0]
+        y_height = y_range[1] - y_range[0]
         x_offset = x_width * 0.01 if x_width > 0 else 0.01
 
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
                   '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
 
-        active_keys = set()
+        # 第一遍：收集所有曲线的 Y 值
+        candidates = []  # (y_val, col, idx, color)
         for idx, (col, curve) in enumerate(self.plot_items.items()):
-            key = (col, cursor_idx)
-            active_keys.add(key)
-
             y_val = None
             if col in self.main.y_buffers:
                 y_arr = np.array(self.main.y_buffers[col])
@@ -1097,20 +1110,66 @@ class PlotSubWidget(QWidget):
 
             if y_val is None or (isinstance(y_val, float) and np.isnan(y_val)):
                 continue
+            candidates.append((y_val, col, idx, colors[idx % len(colors)]))
 
-            text = f"{col}={y_val:.4f}"
-            color = colors[idx % len(colors)]
+        if not candidates:
+            stale_keys = list(self.cursor_annotations.keys())
+            for key in stale_keys:
+                self.plot_widget.removeItem(self.cursor_annotations.pop(key))
+            return
 
-            if key in self.cursor_annotations:
-                label = self.cursor_annotations[key]
-                label.setText(text)
-                label.setColor(color)
-                label.setPos(x + x_offset, y_val)
+        # 按 Y 值排序，分组处理重合标注
+        candidates.sort(key=lambda t: t[0])
+        y_threshold = y_height * 0.03 if y_height > 0 else 0.1
+
+        # 将相近 Y 值的曲线分成一组，垂直错开避免遮挡
+        groups = []
+        cur_group = [candidates[0]]
+        for i in range(1, len(candidates)):
+            if abs(candidates[i][0] - cur_group[-1][0]) < y_threshold:
+                cur_group.append(candidates[i])
             else:
-                label = pg.TextItem(text=text, anchor=(0, 0.5), color=color)
-                label.setPos(x + x_offset, y_val)
-                self.plot_widget.addItem(label)
-                self.cursor_annotations[key] = label
+                groups.append(cur_group)
+                cur_group = [candidates[i]]
+        groups.append(cur_group)
+
+        active_keys = set()
+        for group in groups:
+            n = len(group)
+            if n == 1:
+                y_val, col, idx, color = group[0]
+                key = (col, cursor_idx)
+                active_keys.add(key)
+                text = f"{col}={y_val:.4f}"
+                if key in self.cursor_annotations:
+                    label = self.cursor_annotations[key]
+                    label.setText(text)
+                    label.setColor(color)
+                    label.setPos(x + x_offset, y_val)
+                else:
+                    label = pg.TextItem(text=text, anchor=(0, 1.3), color=color)
+                    label.setPos(x + x_offset, y_val)
+                    self.plot_widget.addItem(label)
+                    self.cursor_annotations[key] = label
+            else:
+                # 多条曲线 Y 值接近，垂直错开显示
+                spacing = y_threshold * 0.7
+                mid = (n - 1) / 2
+                for i, (y_val, col, idx, color) in enumerate(group):
+                    y_offset = (i - mid) * spacing
+                    key = (col, cursor_idx)
+                    active_keys.add(key)
+                    text = f"{col}={y_val:.4f}"
+                    if key in self.cursor_annotations:
+                        label = self.cursor_annotations[key]
+                        label.setText(text)
+                        label.setColor(color)
+                        label.setPos(x + x_offset, y_val + y_offset)
+                    else:
+                        label = pg.TextItem(text=text, anchor=(0, 1.3), color=color)
+                        label.setPos(x + x_offset, y_val + y_offset)
+                        self.plot_widget.addItem(label)
+                        self.cursor_annotations[key] = label
 
         # 清理已删除曲线的标注
         stale_keys = [k for k in list(self.cursor_annotations) if k[1] == cursor_idx and k not in active_keys]
@@ -1131,7 +1190,7 @@ class PlotSubWidget(QWidget):
         self.cursor_labels.clear()
 
     def _add_cursor_time_label(self, x, cursor_idx=0):
-        """在游标线顶部添加/更新时间标注（原地更新）"""
+        """在游标线左侧添加/更新时间标注（原地更新）"""
         try:
             dt = datetime.datetime.fromtimestamp(x, tz=datetime.timezone.utc)
             time_str = dt.strftime("%H:%M:%S.%f")[:-3]
@@ -1139,15 +1198,15 @@ class PlotSubWidget(QWidget):
             time_str = f"{x:.3f}"
         view_box = self.plot_widget.getViewBox()
         y_range = view_box.viewRange()[1]
-        y_top = y_range[1] - (y_range[1] - y_range[0]) * 0.02
+        y_center = (y_range[0] + y_range[1]) / 2
         color = self.CURSOR_COLORS[cursor_idx]
         if self.cursor_time_labels[cursor_idx] is not None:
             label = self.cursor_time_labels[cursor_idx]
-            label.setText(f"t={time_str}")
-            label.setPos(x, y_top)
+            label.setText(f"{time_str}")
+            label.setPos(x, y_center)
         else:
-            label = pg.TextItem(text=f"t={time_str}", anchor=(0, 1), color=color)
-            label.setPos(x, y_top)
+            label = pg.TextItem(text=f"{time_str}", anchor=(1, 0.5), color=color)
+            label.setPos(x, y_center)
             self.plot_widget.addItem(label)
             self.cursor_time_labels[cursor_idx] = label
 
@@ -2115,7 +2174,13 @@ class MainWindow(QMainWindow):
             for var in sorted(group_dict.keys()):
                 parent = QTreeWidgetItem(self.tree)
                 parent.setText(0, var)
-                for col in sorted(group_dict[var]):
+                # 按数值索引排序：cur_pos[2] 排在 cur_pos[10] 之前
+                def _col_sort_key(c):
+                    m = re.search(r'\[(\d+)\]$|_(\d+)$', c)
+                    if m:
+                        return (0, int(m.group(1) or m.group(2)))
+                    return (1, c)
+                for col in sorted(group_dict[var], key=_col_sort_key):
                     child = QTreeWidgetItem(parent)
                     child.setText(0, col)
                     child.setToolTip(0, col)

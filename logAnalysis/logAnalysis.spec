@@ -15,6 +15,7 @@ a = Analysis(
     datas=pyarrow_datas,
     hiddenimports=[
         'pyarrow',
+        'json',
         'pyarrow.lib',
         'paramiko',
         'paramiko.transport',
