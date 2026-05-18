@@ -99,30 +99,56 @@ def find_parameter_in_folder(folder_path, parameter_name, filename_filter=None):
 
 
 def delete_parameter_in_xml_content(content, parameter_name):
-    pattern1 = re.compile(
-        r'^\s*<!--[^\n]*?' + re.escape(parameter_name) + r'[^>]*?-->\n' +
-        r'\s*<variable name="' + re.escape(parameter_name) + r'"[^>]*?>.*?</variable>\n',
-        re.MULTILINE | re.DOTALL
-    )
-    
-    pattern2 = re.compile(
-        r'^\s*<variable name="' + re.escape(parameter_name) + r'"[^>]*?>.*?</variable>\n',
-        re.MULTILINE | re.DOTALL
-    )
-    
-    match1 = pattern1.search(content)
-    if match1:
-        new_content = pattern1.sub('', content, count=1)
-        if f'name="{parameter_name}"' not in new_content:
-            return True, new_content
-    
-    match2 = pattern2.search(content)
-    if match2:
-        new_content = pattern2.sub('', content, count=1)
-        if f'name="{parameter_name}"' not in new_content:
-            return True, new_content
-    
-    return False, content
+    """
+    删除指定参数，如果该参数上方有紧邻的注释行（允许中间有空行），则一起删除。
+    基于行扫描，保证只删除目标参数，不影响其他内容。
+    返回 (是否成功, 新内容)
+    """
+    # 按行分割内容，保留换行符
+    lines = content.splitlines(keepends=True)
+    target_line_index = -1
+    var_end_line_index = -1
+
+    # 第一步：找到包含 <variable name="参数名"> 的行索引，以及包含 </variable> 的行索引（变量可能跨行）
+    for i, line in enumerate(lines):
+        if f'<variable name="{parameter_name}"' in line:
+            target_line_index = i
+            # 查找闭合标签所在的行
+            for j in range(i, len(lines)):
+                if '</variable>' in lines[j]:
+                    var_end_line_index = j
+                    break
+            break
+
+    if target_line_index == -1:
+        return False, content
+
+    # 第二步：向前查找，确定删除的起始行（包括注释行及其后的空行）
+    start_line = target_line_index
+    # 从目标行的上一行开始向前扫描
+    for i in range(target_line_index - 1, -1, -1):
+        stripped = lines[i].strip()
+        if not stripped:
+            # 空行：继续向前，但保留空行？为了整洁，我们也删除注释和变量之间的空行
+            continue
+        if stripped.startswith('<!--') and stripped.endswith('-->'):
+            # 找到注释行，将它作为起始行
+            start_line = i
+            # 继续向前检查是否有更多连续的注释/空行？通常只有一个注释，但如果有多个连续注释也一并删除
+            continue
+        # 遇到非空且非注释行，停止
+        break
+
+    # 第三步：删除从 start_line 到 var_end_line_index 的所有行
+    new_lines = lines[:start_line] + lines[var_end_line_index + 1:]
+    new_content = ''.join(new_lines)
+
+    # 确认参数已被删除
+    if f'name="{parameter_name}"' not in new_content:
+        return True, new_content
+    else:
+        # 如果仍然存在，回退到原内容，避免误删
+        return False, content
 
 
 def delete_parameter_in_folder(folder_path, parameter_name, filename_filter=None):
