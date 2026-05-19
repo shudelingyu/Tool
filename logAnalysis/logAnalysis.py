@@ -117,7 +117,8 @@ class FormatConfig:
             else:
                 # slave/boom: 以逗号开头，且列数匹配
                 if data_part.startswith(prefix):
-                    n = len(data_part[1:].split(',')) if data_part.startswith(',') else len(data_part.split(','))
+                    # 用 count(',') 代替 split 计数，避免创建临时列表
+                    n = data_part.count(',')
                     if n in counts:
                         variant = 'simple' if fmt_name == 'slave' and n == 92 else None
                         return fmt_name, variant
@@ -446,6 +447,26 @@ def is_compressed_file(filename):
     compressed_exts = ('.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz', '.tbz2', '.txz')
     return filename.lower().endswith(compressed_exts)
 
+def get_file_first_timestamp(filepath):
+    """读取文件第一行的时间戳，用于文件排序。返回 datetime 或 None。"""
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                ts_str, _ = parse_timestamp(line)
+                if ts_str:
+                    for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S'):
+                        try:
+                            return datetime.datetime.strptime(ts_str, fmt)
+                        except ValueError:
+                            continue
+                break  # 只读第一行
+    except Exception:
+        pass
+    return None
+
 def convert_folder_to_cache(folder_path, cache_path, progress_callback=None, stop_event=None):
     if not HAS_PARQUET:
         return False
@@ -453,8 +474,8 @@ def convert_folder_to_cache(folder_path, cache_path, progress_callback=None, sto
          if os.path.isfile(os.path.join(folder_path, f))
          and f != '_combined_cache.parquet'
          and not is_compressed_file(f)]
-    # 按文件修改时间排序，确保多文件拼接顺序正确
-    files.sort(key=os.path.getmtime)
+    # 按文件第一行时间戳排序，确保多文件拼接顺序正确
+    files.sort(key=lambda f: get_file_first_timestamp(f) or datetime.datetime.min)
     total = len(files)
     dfs = []
     for i, fpath in enumerate(files):
@@ -496,66 +517,110 @@ def load_single_log_file(filepath, progress_callback=None, stop_event=None):
     """
     if stop_event and stop_event.is_set():
         return pd.DataFrame()
+
+    # 快速统计总行数（二进制读取，无解码开销）
+    total = 0
     try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
+        with open(filepath, 'rb') as f:
+            for _ in f:
+                total += 1
+    except Exception:
+        return pd.DataFrame()
+    if total == 0:
+        return pd.DataFrame()
+
+    from collections import defaultdict
+    data = defaultdict(list)
+    raw_ts_strs = []  # 收集原始时间戳字符串，循环结束后批量转换
+    try:
+        f = open(filepath, 'r', encoding='utf-8', errors='ignore')
     except Exception:
         return pd.DataFrame()
 
-    rows = []           # list of dict 每个元素为一行数据（包括 timestamp）
-    total = len(lines)
+    try:
+        cached_fmt = None
+        cached_variant = None
+        # 缓存 ADS regex pattern 避免每行重新编译
+        _ads_re = re.compile(r'(\[ADS\]\s*:\s*\d+\s*,[^[]*)')
 
-    for idx, raw_line in enumerate(lines):
-        if stop_event and stop_event.is_set():
-            return pd.DataFrame()
-        line = raw_line.strip()
-        if not line:
-            continue
+        for line_count, raw_line in enumerate(f, 1):
+            if stop_event and stop_event.is_set():
+                f.close()
+                return pd.DataFrame()
+            line = raw_line.rstrip('\n\r')
+            if not line:
+                continue
 
-        results = parse_log_line(line)
-        for ts_str, cols, vals in results:
-            if cols is None or vals is None:
+            ts_str, rest = parse_timestamp(line)
+            if not rest:
+                if ts_str:
+                    raw_ts_strs.append(ts_str)
                 continue
-            if len(cols) != len(vals):
+
+            # ADS 行：使用原解析逻辑（支持一行多段）
+            if '[ADS]' in rest:
+                results = parse_log_line(line)
+                for ts_str2, cols, vals in results:
+                    if cols is None or vals is None:
+                        continue
+                    if len(cols) != len(vals):
+                        continue
+                    raw_ts_strs.append(ts_str2 if ts_str2 else None)
+                    for c, v in zip(cols, vals):
+                        data[c].append(v)
                 continue
-            row = {}
-            # 解析时间戳为 pd.Timestamp（若有）
-            if ts_str:
+
+            # 非 ADS：格式已知后用缓存避免重复 detect_format
+            cols = vals = None
+            if cached_fmt is not None:
+                cols, vals = config.parse_values(cached_fmt, rest, cached_variant)
+            if cols is None:
+                fmt_name, variant = config.detect_format(rest)
+                if fmt_name:
+                    cached_fmt = fmt_name
+                    cached_variant = variant
+                    cols, vals = config.parse_values(fmt_name, rest, variant)
+
+            if cols is not None and vals is not None and len(cols) == len(vals):
+                raw_ts_strs.append(ts_str if ts_str else None)
+                for c, v in zip(cols, vals):
+                    data[c].append(v)
+
+            if progress_callback and total > 0 and line_count % 1000 == 0:
                 try:
-                    ts = pd.to_datetime(ts_str, format='%Y-%m-%d %H:%M:%S.%f', errors='coerce')
-                    if pd.isna(ts):
-                        ts = pd.to_datetime(ts_str, format='%Y-%m-%d %H:%M:%S', errors='coerce')
+                    progress_callback(min(line_count / total, 1.0))
                 except Exception:
-                    ts = pd.NaT
-            else:
-                ts = pd.NaT
-            row['timestamp'] = ts
-            # 填充列值
-            for c, v in zip(cols, vals):
-                row[c] = v
-            rows.append(row)
+                    pass
+    except Exception:
+        f.close()
+        return pd.DataFrame()
+    f.close()
 
-        if progress_callback and idx % 1000 == 0:
-            progress_callback(idx / total if total else 0)
-
-    if not rows:
+    if not raw_ts_strs:
         return pd.DataFrame()
 
-    # 构建 DataFrame（自动合并所有列）
-    df = pd.DataFrame(rows)
+    # 批量转换时间戳（向量化，比逐行调用快 50-100 倍）
+    timestamps = pd.Series(pd.to_datetime(raw_ts_strs, format='%Y-%m-%d %H:%M:%S.%f', errors='coerce'))
+    na_mask = timestamps.isna()
+    if na_mask.any():
+        raw_arr = np.array(raw_ts_strs, dtype=object)
+        timestamps.loc[na_mask] = pd.to_datetime(raw_arr[na_mask.values],
+                                                  format='%Y-%m-%d %H:%M:%S', errors='coerce').values
+
+    # 列式构建 DataFrame（比 list-of-dicts 快，节省大量 Python 对象开销）
+    data['timestamp'] = timestamps
+    df = pd.DataFrame(data)
 
     # 保证 timestamp 在最前并添加 line_no
-    if 'timestamp' in df.columns:
-        cols = list(df.columns)
-        cols.remove('timestamp')
-        df = df[['timestamp'] + cols]
+    cols = list(df.columns)
+    cols.remove('timestamp')
+    df = df[['timestamp'] + cols]
     df.insert(1, 'line_no', range(1, len(df)+1))
 
-    # 将数值列转换为数值类型（保留 NaN）
-    for col in df.columns:
-        if col in ('timestamp', 'line_no'):
-            continue
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+    # 向量化数值类型转换（比逐列循环快）
+    numeric_cols = [c for c in df.columns if c not in ('timestamp', 'line_no')]
+    if numeric_cols:
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
 
     return df
 # ...existing code...
@@ -592,6 +657,7 @@ class LoadThread(QThread):
                     if os.path.isfile(os.path.join(self.path, f))
                     and f != '_combined_cache.parquet'
                     and not is_compressed_file(f)]
+                files.sort(key=lambda f: get_file_first_timestamp(f) or datetime.datetime.min)
                 total = len(files)
                 dfs = []
                 for i, fpath in enumerate(files):
@@ -728,9 +794,12 @@ class DragTreeWidget(QTreeWidget):
                 item = self._drag_item
                 if item.childCount() > 0:
                     for i in range(item.childCount()):
-                        texts.append(item.child(i).text(0))
+                        child = item.child(i)
+                        data = child.data(0, Qt.UserRole)
+                        texts.append(data if data else child.text(0))
                 else:
-                    texts.append(item.text(0))
+                    data = item.data(0, Qt.UserRole)
+                    texts.append(data if data else item.text(0))
                 mime = QMimeData()
                 mime.setText("\n".join(texts))
                 drag = QDrag(self)
@@ -758,8 +827,6 @@ class PlotSubWidget(QWidget):
         self.follow_latest = True
         self.view_width = 20.0
         self.last_update_time = 0
-        self.hover_timer = None    # 节流定时器
-        self.hover_pending = False
         # 垂直游标状态
         self.cursor_lines = [None, None]  # InfiniteLine 列表 [游标0(红), 游标1(蓝)]
         self.cursor_labels = []
@@ -770,7 +837,6 @@ class PlotSubWidget(QWidget):
         self._cursor_debounce_timer.timeout.connect(self.flush_cursor_annotations)
         self._pending_cursor_update = None  # (x, cursor_idx) 待更新的游标数据
         self.setup_ui()
-        self.setup_hover()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -810,67 +876,6 @@ class PlotSubWidget(QWidget):
         ctrl_layout.addWidget(self.close_btn)
 
         layout.addWidget(ctrl_frame)
-
-    def setup_hover(self):
-        """设置鼠标悬浮数值显示"""
-        self.plot_widget.scene().sigMouseMoved.connect(self.on_mouse_moved)
-        self.hover_timer = QTimer()
-        self.hover_timer.setSingleShot(True)
-        self.hover_timer.timeout.connect(self._process_hover)
-
-    def on_mouse_moved(self, pos):
-        if hasattr(self, 'hover_pending') and self.hover_pending:
-            return
-        self.hover_pending = True
-        self.hover_pos = pos
-        self.hover_timer.start(50)
-
-    def _process_hover(self):
-        self.hover_pending = False
-        if not self.plot_widget.sceneBoundingRect().contains(self.hover_pos):
-            return
-        view_box = self.plot_widget.getViewBox()
-        mouse_point = view_box.mapSceneToView(self.hover_pos)
-        x = mouse_point.x()
-        if not self.plot_items:
-            self.main.statusBar().showMessage("")
-            return
-        best_info = None
-        for col, curve in self.plot_items.items():
-            if col in self.main.y_buffers:
-                y_arr = np.array(self.main.y_buffers[col])
-                x_arr = np.array(self.main.x_buffer)
-                if len(x_arr) > len(y_arr):
-                    x_arr = x_arr[-len(y_arr):]
-                elif len(y_arr) > len(x_arr):
-                    y_arr = y_arr[-len(x_arr):]
-                if len(x_arr) == 0:
-                    continue
-                idx = np.argmin(np.abs(x_arr - x))
-                dist = abs(x_arr[idx] - x)
-                if best_info is None or dist < best_info[3]:
-                    best_info = (col, x_arr[idx], y_arr[idx], dist)
-            elif self.main.df is not None and col in self.main.df.columns:
-                if 'timestamp' in self.main.df.columns:
-                    times = self.main.df['timestamp'].astype('int64') / 1e9
-                else:
-                    times = self.main.df['line_no'].values
-                y_arr = self.main.df[col].values
-                idx = np.argmin(np.abs(times - x))
-                dist = abs(times[idx] - x)
-                if best_info is None or dist < best_info[3]:
-                    best_info = (col, times[idx], y_arr[idx], dist)
-        if best_info:
-            col, x_val, y_val, _ = best_info
-            try:
-                dt = datetime.datetime.fromtimestamp(x_val, tz=datetime.timezone.utc)
-                time_str = dt.strftime("%H:%M:%S.%f")[:-3]
-            except:
-                time_str = f"{x_val:.3f}"
-            msg = f"{col} | 时间: {time_str} | 数值: {y_val:.4f}"
-            self.main.statusBar().showMessage(msg)
-        else:
-            self.main.statusBar().showMessage("")
 
     def eventFilter(self, obj, event):
         """拦截绘图控件的键盘事件"""
@@ -1099,7 +1104,9 @@ class PlotSubWidget(QWidget):
                 elif len(y_arr) > len(x_arr):
                     y_arr = y_arr[-len(x_arr):]
                 if len(x_arr) > 0:
-                    i = np.argmin(np.abs(x_arr - x))
+                    i = np.clip(np.searchsorted(x_arr, x), 0, len(x_arr)-1)
+                    if i > 0 and abs(x_arr[i-1] - x) < abs(x_arr[i] - x):
+                        i = i - 1
                     y_val = y_arr[i]
             elif self.main.df is not None and col in self.main.df.columns:
                 if self.main.timestamp_epoch is not None:
@@ -1115,7 +1122,9 @@ class PlotSubWidget(QWidget):
                     x_arr = x_arr[mask]
                     y_arr = y_arr[mask]
                 if len(y_arr) > 0:
-                    i = np.argmin(np.abs(x_arr - x))
+                    i = np.clip(np.searchsorted(x_arr, x), 0, len(x_arr)-1)
+                    if i > 0 and abs(x_arr[i-1] - x) < abs(x_arr[i] - x):
+                        i = i - 1
                     y_val = y_arr[i]
 
             if y_val is None or (isinstance(y_val, float) and np.isnan(y_val)):
@@ -1504,7 +1513,7 @@ class MainWindow(QMainWindow):
         self.df = None
         self.current_columns = []
         self.load_thread = None
-        self.live_thread = None
+        self.live_threads = []
         self.use_cache = True
         self.force_rebuild = False
         self.timestamp_epoch = None
@@ -1514,6 +1523,7 @@ class MainWindow(QMainWindow):
         self.buffer_size = self.buffer_points
         self.x_buffer = deque(maxlen=self.buffer_size)
         self.y_buffers = {}
+        self._tree_prebuilt = False
         self.update_timer = QTimer()
         self.update_timer.setInterval(50)
         self.update_timer.timeout.connect(self.update_plots_from_buffer)
@@ -1620,12 +1630,9 @@ class MainWindow(QMainWindow):
         dev_type_layout = QHBoxLayout()
         dev_type_layout.addWidget(QLabel("设备类型:"))
         self.device_type = QComboBox()
-        self.device_type.addItems(["从臂", "主手", "boom", "ADS"])
+        self.device_type.addItems(["从手", "主手", "ADS"])
         self.device_type.currentTextChanged.connect(self.on_device_type_changed)
         dev_type_layout.addWidget(self.device_type)
-        dev_type_layout.addWidget(QLabel("编号/手别:"))
-        self.device_index = QComboBox()
-        dev_type_layout.addWidget(self.device_index)
         online_layout.addLayout(dev_type_layout)
 
         conn_group = QGroupBox("SSH连接")
@@ -1691,12 +1698,9 @@ class MainWindow(QMainWindow):
         self.online_info_label = QLabel("未连接")
         self.online_info_label.setWordWrap(True)
         online_layout.addWidget(self.online_info_label)
-        self.device_index.currentTextChanged.connect(self.on_device_index_changed)
 
         online_layout.addStretch()
         self.stacked_widget.addWidget(online_widget)
-
-        self.update_device_index()
 
         # 数据列树（支持拖拽）
         left_layout.addWidget(QLabel("📋 数据列"))
@@ -1850,32 +1854,11 @@ class MainWindow(QMainWindow):
             self.stacked_widget.setCurrentIndex(1)
 
     # ========== 在线模式辅助函数 ==========
-    def update_device_index(self):
-        self.device_index.clear()
-        dev_type = self.device_type.currentText()
-        if dev_type == "从臂":
-            for i in range(1, 5):
-                self.device_index.addItem(f"{i}")
-        elif dev_type == "主手":
-            self.device_index.addItem("左")
-            self.device_index.addItem("右")
-        elif dev_type == "ADS":
-            self.device_index.addItem("ADS")
-        else:
-            self.device_index.addItem("boom")
-        self._update_remote_path()
 
     def on_device_type_changed(self):
-        if self.live_thread is not None and self.live_thread.isRunning():
+        if self._is_any_thread_running():
             self.stop_live()
             QMessageBox.information(self, "提示", "设备类型已更改，已停止当前监控。请重新连接。")
-        self.update_device_index()
-
-    def on_device_index_changed(self):
-        if self.live_thread is not None and self.live_thread.isRunning():
-            self.stop_live()
-            QMessageBox.information(self, "提示", "设备编号已更改，已停止当前监控。请重新连接。")
-        self._update_remote_path()
 
     def on_buffer_size_changed(self, new_seconds):
         if new_seconds == self.buffer_seconds:
@@ -1896,25 +1879,120 @@ class MainWindow(QMainWindow):
         self.buffer_size = new_points
         self.statusBar().showMessage(f"保留时间已调整为 {new_seconds} s")
 
-    def _update_remote_path(self):
+    def _get_remote_paths(self):
+        """返回 [(arm_prefix, remote_path), ...] 列表"""
         dev_type = self.device_type.currentText()
-        idx = self.device_index.currentText()
-        if dev_type == "从臂":
-            self.current_remote_path = f"/data/log/rt/mmsArm{idx}/mmsArm{idx}"
+        if dev_type == "从手":
+            return [
+                ("arm1", "/data/log/rt/mmsArm1/mmsArm1"),
+                ("arm2", "/data/log/rt/mmsArm2/mmsArm2"),
+                ("arm3", "/data/log/rt/mmsArm3/mmsArm3"),
+                ("arm4", "/data/log/rt/mmsArm4/mmsArm4"),
+                ("boom", "/data/log/rt/mmsBoom/mmsBoom"),
+            ]
         elif dev_type == "主手":
-            if idx == "左":
-                self.current_remote_path = "/data/log/rt/LeftDataModel/LeftDataModel"
-            else:
-                self.current_remote_path = "/data/log/rt/RightDataModel/RightDataModel"
+            return [
+                ("left", "/data/log/rt/LeftDataModel/LeftDataModel"),
+                ("right", "/data/log/rt/RightDataModel/RightDataModel"),
+            ]
         elif dev_type == "ADS":
-            self.current_remote_path = "/data/log/rt/LOUT/LOUT"
-        else:
-            self.current_remote_path = "/data/log/rt/mmsBoom/mmsBoom"
+            return [("ADS", "/data/log/rt/LOUT/LOUT")]
+        else:  # boom
+            return [("boom", "/data/log/rt/mmsBoom/mmsBoom")]
+
+    def _pre_build_tree_and_buffers(self, dev_type):
+        """根据设备类型预构建树和预分配 y_buffers（ADS 除外）"""
+        self._tree_prebuilt = True
+        self.tree.setUpdatesEnabled(False)
+        self.tree.clear()
+        self.current_columns.clear()
+
+        if dev_type == "从手":
+            slave_cols = config.get_columns('slave')   # 142
+            boom_cols = config.get_columns('boom')     # 36
+            for arm in ('arm1', 'arm2', 'arm3', 'arm4'):
+                for col in slave_cols:
+                    self.y_buffers[f"{arm}:{col}"] = deque(maxlen=self.buffer_size)
+            for col in boom_cols:
+                self.y_buffers[f"boom:{col}"] = deque(maxlen=self.buffer_size)
+
+            for arm_name in ('arm1', 'arm2', 'arm3', 'arm4', 'boom'):
+                cols = boom_cols if arm_name == 'boom' else slave_cols
+                arm_item = QTreeWidgetItem(self.tree)
+                arm_item.setText(0, arm_name)
+                groups = {}
+                for col in cols:
+                    if '[' in col and ']' in col:
+                        var = col.split('[')[0]
+                    elif '_' in col and col.split('_')[-1].isdigit():
+                        var = col.rsplit('_', 1)[0]
+                    else:
+                        var = col
+                    groups.setdefault(var, []).append(col)
+                for var in sorted(groups.keys()):
+                    var_item = QTreeWidgetItem(arm_item)
+                    var_item.setText(0, var)
+                    for c in sorted(groups[var], key=lambda x: int(re.search(r'\[(\d+)]$|_(\d+)$', x).group(1) or 0) if re.search(r'\[(\d+)]$|_(\d+)$', x) else (1, x)):
+                        child = QTreeWidgetItem(var_item)
+                        child.setText(0, c)
+                        child.setData(0, Qt.UserRole, f"{arm_name}:{c}")
+                        child.setToolTip(0, c)
+
+        elif dev_type == "主手":
+            master_cols = config.get_columns('master')
+            for prefix in ('left', 'right'):
+                for col in master_cols:
+                    self.y_buffers[f"{prefix}:{col}"] = deque(maxlen=self.buffer_size)
+            for prefix in ('left', 'right'):
+                arm_item = QTreeWidgetItem(self.tree)
+                arm_item.setText(0, prefix)
+                groups = {}
+                for col in master_cols:
+                    if '_' in col and col.split('_')[-1].isdigit():
+                        var = col.rsplit('_', 1)[0]
+                    else:
+                        var = col
+                    groups.setdefault(var, []).append(col)
+                for var in sorted(groups.keys()):
+                    var_item = QTreeWidgetItem(arm_item)
+                    var_item.setText(0, var)
+                    for c in sorted(groups[var]):
+                        child = QTreeWidgetItem(var_item)
+                        child.setText(0, c)
+                        child.setData(0, Qt.UserRole, f"{prefix}:{c}")
+                        child.setToolTip(0, c)
+
+        elif dev_type == "boom":
+            cols = config.get_columns('boom')
+            for col in cols:
+                self.y_buffers[f"boom:{col}"] = deque(maxlen=self.buffer_size)
+            arm_item = QTreeWidgetItem(self.tree)
+            arm_item.setText(0, "boom")
+            groups = {}
+            for col in cols:
+                var = col.split('[')[0] if '[' in col else col
+                groups.setdefault(var, []).append(col)
+            for var in sorted(groups.keys()):
+                var_item = QTreeWidgetItem(arm_item)
+                var_item.setText(0, var)
+                for c in sorted(groups[var]):
+                    child = QTreeWidgetItem(var_item)
+                    child.setText(0, c)
+                    child.setData(0, Qt.UserRole, f"boom:{c}")
+                    child.setToolTip(0, c)
+
+        self.tree.collapseAll()
+        self.tree.header().resizeSections(QHeaderView.ResizeToContents)
+        self.tree.setUpdatesEnabled(True)
+
+    def _is_any_thread_running(self):
+        return hasattr(self, 'live_threads') and any(t.isRunning() for t in self.live_threads)
 
     def clear_online_data(self):
         self.x_buffer.clear()
         self.y_buffers.clear()
         self.current_columns.clear()
+        self._tree_prebuilt = False
         self.tree.clear()
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
@@ -1922,15 +2000,19 @@ class MainWindow(QMainWindow):
                 tab.clear_all_curves()
 
     def pause_live(self):
-        if self.live_thread and self.live_thread.isRunning():
-            self.live_thread.set_paused(True)
+        if hasattr(self, 'live_threads'):
+            for t in self.live_threads:
+                if t and t.isRunning():
+                    t.set_paused(True)
             self.pause_btn.setEnabled(False)
             self.resume_btn.setEnabled(True)
             self.statusBar().showMessage("实时监控已暂停")
 
     def resume_live(self):
-        if self.live_thread and self.live_thread.isRunning():
-            self.live_thread.set_paused(False)
+        if hasattr(self, 'live_threads'):
+            for t in self.live_threads:
+                if t and t.isRunning():
+                    t.set_paused(False)
             self.pause_btn.setEnabled(True)
             self.resume_btn.setEnabled(False)
             self.statusBar().showMessage("实时监控已恢复")
@@ -1942,15 +2024,21 @@ class MainWindow(QMainWindow):
         port = int(self.port_edit.text().strip())
         user = self.user_edit.text().strip()
         pwd = self.passwd_edit.text().strip()
-        self._update_remote_path()
-        remote_path = self.current_remote_path
+        paths = self._get_remote_paths()
 
-        if not ip or not user or not remote_path:
-            QMessageBox.warning(self, "错误", "请填写完整的主机、用户名，并确保设备类型/编号正确")
+        if not ip or not user or not paths:
+            QMessageBox.warning(self, "错误", "请填写完整的主机、用户名")
             return
 
         self.x_buffer.clear()
         self.y_buffers.clear()
+
+        # 预构建树和预分配 y_buffers（已知格式，ADS除外）
+        dev_type = self.device_type.currentText()
+        if dev_type != "ADS" and config is not None:
+            self._pre_build_tree_and_buffers(dev_type)
+        else:
+            self._tree_prebuilt = False
 
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
@@ -1959,11 +2047,8 @@ class MainWindow(QMainWindow):
                     sub.follow_latest = False
                     sub.follow_btn.setChecked(False)
 
-        self.live_thread = LiveThread(ip, port, user, pwd, remote_path)
-        self.live_thread.new_data.connect(self.on_new_data)
-        self.live_thread.error.connect(self.on_live_error)
-        self.live_thread.status.connect(self.statusBar().showMessage)
-        self.live_thread.start()
+        self.live_threads = []
+        self._start_next_thread(0, paths, ip, port, user, pwd)
 
         self.connect_btn.setEnabled(False)
         self.stop_live_btn.setEnabled(True)
@@ -1973,9 +2058,11 @@ class MainWindow(QMainWindow):
         self.resume_btn.setEnabled(False)
 
     def stop_live(self):
-        if self.live_thread:
-            self.live_thread.stop()
-            self.live_thread = None
+        if hasattr(self, 'live_threads'):
+            for t in self.live_threads:
+                if t:
+                    t.stop()
+            self.live_threads = []
         self.update_timer.stop()
         self.connect_btn.setEnabled(True)
         self.stop_live_btn.setEnabled(False)
@@ -1984,44 +2071,72 @@ class MainWindow(QMainWindow):
         self.pause_btn.setEnabled(False)
         self.resume_btn.setEnabled(False)
 
-    def on_new_data(self, epoch, data_dict):
-        self.x_buffer.append(epoch)
+    def _start_next_thread(self, idx, paths, ip, port, user, pwd):
+        """递归错峰启动 SSH 线程，间隔 300ms"""
+        if idx >= len(paths):
+            return
+        prefix, remote_path = paths[idx]
+        thread = LiveThread(ip, port, user, pwd, remote_path)
+        thread.new_data.connect(lambda epoch, d, p=prefix: self.on_new_data(epoch, d, p))
+        thread.error.connect(self.on_live_error)
+        thread.status.connect(self.statusBar().showMessage)
+        thread.start()
+        self.live_threads.append(thread)
+        if idx + 1 < len(paths):
+            QTimer.singleShot(300, lambda: self._start_next_thread(idx + 1, paths, ip, port, user, pwd))
+
+    def on_new_data(self, epoch, data_dict, arm_prefix):
+        """接收来自某臂的数据"""
+        # 快速路径：树和 buffers 已预构建，仅追数据
+        if self._tree_prebuilt:
+            self.x_buffer.append(epoch)
+            for col, val in data_dict.items():
+                self.y_buffers[f"{arm_prefix}:{col}"].append(val)
+            return
+
+        # 慢速路径（ADS 模式）：动态树构建 + 惰性 buffer 创建
+        prefixed = {}
         for col, val in data_dict.items():
+            prefixed[f"{arm_prefix}:{col}"] = val
+
+        self.x_buffer.append(epoch)
+        for col, val in prefixed.items():
             if col not in self.y_buffers:
                 self.y_buffers[col] = deque(maxlen=self.buffer_size)
             self.y_buffers[col].append(val)
-        # 自动添加新列到树中（如果不存在）
-        for col in data_dict.keys():
-            if col not in self.current_columns:
-                self.current_columns.append(col)
-                # 判断是否为 LOUT 格式的列名（包含下划线且第一部分是数字）
-                if '_' in col and col.split('_')[0].isdigit():
-                    model = col.split('_')[0]
-                    var = model   # 父节点显示为 model 号
-                    # 子节点列名保持全名
-                else:
-                    # 原有处理
-                    if '[' in col and ']' in col:
-                        var = col.split('[')[0]
-                    elif '_' in col and col.split('_')[-1].isdigit():
-                        parts = col.rsplit('_', 1)
-                        var = parts[0]
-                    else:
-                        var = col
-                # 查找父节点
-                found = False
-                for i in range(self.tree.topLevelItemCount()):
-                    if self.tree.topLevelItem(i).text(0) == var:
-                        parent = self.tree.topLevelItem(i)
-                        found = True
-                        break
-                if not found:
-                    parent = QTreeWidgetItem(self.tree)
-                    parent.setText(0, var)
-                # 添加子节点
-                child = QTreeWidgetItem(parent)
-                child.setText(0, col)
-                child.setToolTip(0, col)
+
+        for col in prefixed.keys():
+            if col in self.current_columns:
+                continue
+            self.current_columns.append(col)
+            parts = col.split(":", 1)
+            arm_name = parts[0]
+            var_full = parts[1]
+            if '[' in var_full and ']' in var_full:
+                var = var_full.split('[')[0]
+            elif '_' in var_full and var_full.split('_')[-1].isdigit():
+                var = var_full.rsplit('_', 1)[0]
+            else:
+                var = var_full
+            arm_item = None
+            for i in range(self.tree.topLevelItemCount()):
+                if self.tree.topLevelItem(i).text(0) == arm_name:
+                    arm_item = self.tree.topLevelItem(i)
+                    break
+            if not arm_item:
+                arm_item = QTreeWidgetItem(self.tree)
+                arm_item.setText(0, arm_name)
+            var_item = None
+            for i in range(arm_item.childCount()):
+                if arm_item.child(i).text(0) == var:
+                    var_item = arm_item.child(i)
+                    break
+            if not var_item:
+                var_item = QTreeWidgetItem(arm_item)
+                var_item.setText(0, var)
+            child = QTreeWidgetItem(var_item)
+            child.setText(0, var_full)
+            child.setToolTip(0, var_full)
 
     def update_plots_from_buffer(self):
         if not self.x_buffer:
