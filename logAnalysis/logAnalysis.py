@@ -16,7 +16,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QMessageBox, QProgressBar, QSpinBox, QSplitter,
                             QAbstractItemView, QGroupBox, QCheckBox,
                              QTreeWidget, QTreeWidgetItem, QComboBox, QSizePolicy,
-                             QRadioButton, QStackedWidget, QTabWidget, QHeaderView)
+                             QRadioButton, QStackedWidget, QTabWidget, QHeaderView,
+                             QShortcut)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QEvent
 from PyQt5.QtGui import QDrag
 import pyqtgraph as pg
@@ -686,7 +687,9 @@ class LoadThread(QThread):
                 df = load_cache(cache_path)
                 if df is not None and not df.empty:
                     if 'timestamp' in df.columns:
-                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        # utc=True 确保 timezone 不被剥离，
+                        # 否则 _ts_to_epoch 无法区分 naive UTC 和 naive 本地时间
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
                     self.finished.emit(df, False, "")
                     return
                 self.progress.emit(0)
@@ -699,7 +702,7 @@ class LoadThread(QThread):
                 return
             df = load_cache(cache_path)
             if 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
             self.finished.emit(df, False, "")
         except Exception as e:
             self.finished.emit(pd.DataFrame(), False, str(e))
@@ -728,7 +731,7 @@ class TimeAxis(pg.AxisItem):
                     strs.append("")
                 else:
                     try:
-                        dt = datetime.datetime.fromtimestamp(v, tz=datetime.timezone.utc)
+                        dt = datetime.datetime.fromtimestamp(v)
                         if fmt == "%H:%M:%S.%f":
                             s = dt.strftime("%H:%M:%S.%f")[:-3]
                         else:
@@ -825,7 +828,7 @@ class PlotSubWidget(QWidget):
         self.index = index
         self.plot_items = {}       # 列名 -> curve
         self.follow_latest = True
-        self.view_width = 20.0
+        self.view_width = float(self.main.buffer_seconds)
         self.last_update_time = 0
         # 垂直游标状态
         self.cursor_lines = [None, None]  # InfiniteLine 列表 [游标0(红), 游标1(蓝)]
@@ -914,11 +917,19 @@ class PlotSubWidget(QWidget):
     def request_close(self):
         self.parent_tab.request_remove_subwidget(self)
 
+    def _get_x_buffer(self, col):
+        """从列名提取臂前缀，获取对应 x 轴数据"""
+        if ':' not in col:
+            return deque()
+        prefix = col.split(':', 1)[0]
+        return self.main.x_buffers.get(prefix, deque())
+
     def add_curve(self, col):
         if col in self.plot_items:
             return
-        if self.main.x_buffer:
-            x = np.array(self.main.x_buffer)
+        xbuf = self._get_x_buffer(col)
+        if xbuf:
+            x = np.array(xbuf)
         else:
             x = np.array([])
         if col in self.main.y_buffers:
@@ -952,17 +963,20 @@ class PlotSubWidget(QWidget):
         for ci in range(2):
             if self.parent_tab.cursor_enabled[ci] and self.parent_tab.cursor_x[ci] is not None:
                 self.update_cursor_annotations(self.parent_tab.cursor_x[ci], cursor_idx=ci)
-        if self.follow_latest and self.main.x_buffer:
+        if self.follow_latest and self.main.x_buffers:
             self.scroll_to_latest()
         self.parent_tab._align_left_axes()
 
     def update_curves(self):
-        if not self.main.x_buffer:
+        if not self.main.x_buffers:
             return
-        x_arr = np.array(self.main.x_buffer)
         for col, curve in list(self.plot_items.items()):
             if col in self.main.y_buffers:
                 y_arr = np.array(self.main.y_buffers[col])
+                xbuf = self._get_x_buffer(col)
+                if not xbuf:
+                    continue
+                x_arr = np.array(xbuf)
                 if len(x_arr) > len(y_arr):
                     x_use = x_arr[-len(y_arr):]
                 elif len(y_arr) > len(x_arr):
@@ -971,18 +985,20 @@ class PlotSubWidget(QWidget):
                 else:
                     x_use = x_arr
                 curve.setData(x_use, y_arr)
-        if self.follow_latest and self.main.x_buffer:
+        if self.follow_latest and self.main.x_buffers:
             self.scroll_to_latest()
 
     def scroll_to_latest(self):
-        if not self.main.x_buffer:
+        if not self.main.x_buffers:
             return
         view_box = self.plot_widget.getViewBox()
         current_range = view_box.viewRange()[0]
         width = current_range[1] - current_range[0]
         if width <= 0 or width > 1e9:
             width = self.view_width
-        latest_x = self.main.x_buffer[-1]
+        latest_x = max((xbuf[-1] for xbuf in self.main.x_buffers.values() if len(xbuf) > 0), default=None)
+        if latest_x is None:
+            return
         view_box.setXRange(latest_x - width, latest_x, padding=0)
         self.view_width = width
         self._auto_range_y()
@@ -998,7 +1014,10 @@ class PlotSubWidget(QWidget):
         for col, curve in self.plot_items.items():
             if col in self.main.y_buffers:
                 y_full = np.array(self.main.y_buffers[col])
-                x_full = np.array(self.main.x_buffer)
+                xbuf = self._get_x_buffer(col)
+                if not xbuf:
+                    continue
+                x_full = np.array(xbuf)
                 if len(x_full) > len(y_full):
                     x_full = x_full[-len(y_full):]
                 elif len(y_full) > len(x_full):
@@ -1023,7 +1042,7 @@ class PlotSubWidget(QWidget):
 
     def toggle_follow(self, checked):
         self.follow_latest = checked
-        if checked and self.main.x_buffer:
+        if checked and self.main.x_buffers:
             self.scroll_to_latest()
 
     def _next_color(self):
@@ -1098,7 +1117,8 @@ class PlotSubWidget(QWidget):
             y_val = None
             if col in self.main.y_buffers:
                 y_arr = np.array(self.main.y_buffers[col])
-                x_arr = np.array(self.main.x_buffer)
+                xbuf = self._get_x_buffer(col)
+                x_arr = np.array(xbuf) if xbuf else np.array([])
                 if len(x_arr) > len(y_arr):
                     x_arr = x_arr[-len(y_arr):]
                 elif len(y_arr) > len(x_arr):
@@ -1211,7 +1231,7 @@ class PlotSubWidget(QWidget):
     def _add_cursor_time_label(self, x, cursor_idx=0):
         """在游标线左侧添加/更新时间标注（原地更新）"""
         try:
-            dt = datetime.datetime.fromtimestamp(x, tz=datetime.timezone.utc)
+            dt = datetime.datetime.fromtimestamp(x)
             time_str = dt.strftime("%H:%M:%S.%f")[:-3]
         except Exception:
             time_str = f"{x:.3f}"
@@ -1306,7 +1326,7 @@ class PlotTab(QWidget):
             width = source_width
         else:
             widths = [sub.view_width for sub in self.sub_widgets if sub.view_width > 0]
-            width = max(widths) if widths else 20.0
+            width = max(widths) if widths else float(self.main.buffer_seconds)
         # 遍历所有子图，设置跟随并滚动到最新
         for sub in self.sub_widgets:
             sub.follow_latest = True
@@ -1519,9 +1539,9 @@ class MainWindow(QMainWindow):
         self.timestamp_epoch = None
 
         self.buffer_seconds = 40
-        self.buffer_points = 40000
+        self.buffer_points = self.buffer_seconds * 1000
         self.buffer_size = self.buffer_points
-        self.x_buffer = deque(maxlen=self.buffer_size)
+        self.x_buffers = {}  # arm_prefix → deque(epoch)
         self.y_buffers = {}
         self._tree_prebuilt = False
         self.update_timer = QTimer()
@@ -1678,6 +1698,8 @@ class MainWindow(QMainWindow):
         self.resume_btn = QPushButton("▶️ 继续")
         self.resume_btn.clicked.connect(self.resume_live)
         self.resume_btn.setEnabled(False)
+        # P 键切换暂停/继续
+        QShortcut(Qt.Key_P, self, self._toggle_pause)
         pause_layout.addWidget(self.pause_btn)
         pause_layout.addWidget(self.resume_btn)
         online_layout.addLayout(pause_layout)
@@ -1866,17 +1888,26 @@ class MainWindow(QMainWindow):
         self.buffer_seconds = new_seconds
         new_points = new_seconds * 1000
         new_points = max(1000, min(120000, new_points))
-        old_x = self.x_buffer
-        new_x = deque(maxlen=new_points)
-        new_x.extend(old_x)
-        self.x_buffer = new_x
         new_y_buffers = {}
         for col, ybuf in self.y_buffers.items():
             new_ybuf = deque(maxlen=new_points)
             new_ybuf.extend(ybuf)
             new_y_buffers[col] = new_ybuf
         self.y_buffers = new_y_buffers
+        # 按臂分别调整 x_buffers（x_buffer 与 y_buffer 同一臂频率一致，maxlen 相同）
+        new_x_buffers = {}
+        for prefix, xbuf in self.x_buffers.items():
+            new_xbuf = deque(maxlen=new_points)
+            new_xbuf.extend(xbuf)
+            new_x_buffers[prefix] = new_xbuf
+        self.x_buffers = new_x_buffers
         self.buffer_size = new_points
+        # 同步所有子图的视口宽度
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if hasattr(tab, 'sub_widgets'):
+                for sub in tab.sub_widgets:
+                    sub.view_width = float(new_seconds)
         self.statusBar().showMessage(f"保留时间已调整为 {new_seconds} s")
 
     def _get_remote_paths(self):
@@ -1913,8 +1944,10 @@ class MainWindow(QMainWindow):
             for arm in ('arm1', 'arm2', 'arm3', 'arm4'):
                 for col in slave_cols:
                     self.y_buffers[f"{arm}:{col}"] = deque(maxlen=self.buffer_size)
+                self.x_buffers[arm] = deque(maxlen=self.buffer_size)
             for col in boom_cols:
                 self.y_buffers[f"boom:{col}"] = deque(maxlen=self.buffer_size)
+            self.x_buffers["boom"] = deque(maxlen=self.buffer_size)
 
             for arm_name in ('arm1', 'arm2', 'arm3', 'arm4', 'boom'):
                 cols = boom_cols if arm_name == 'boom' else slave_cols
@@ -1943,6 +1976,7 @@ class MainWindow(QMainWindow):
             for prefix in ('left', 'right'):
                 for col in master_cols:
                     self.y_buffers[f"{prefix}:{col}"] = deque(maxlen=self.buffer_size)
+                self.x_buffers[prefix] = deque(maxlen=self.buffer_size)
             for prefix in ('left', 'right'):
                 arm_item = QTreeWidgetItem(self.tree)
                 arm_item.setText(0, prefix)
@@ -1989,7 +2023,8 @@ class MainWindow(QMainWindow):
         return hasattr(self, 'live_threads') and any(t.isRunning() for t in self.live_threads)
 
     def clear_online_data(self):
-        self.x_buffer.clear()
+        for buf in self.x_buffers.values():
+            buf.clear()
         self.y_buffers.clear()
         self.current_columns.clear()
         self._tree_prebuilt = False
@@ -1998,6 +2033,13 @@ class MainWindow(QMainWindow):
             tab = self.tab_widget.widget(i)
             if hasattr(tab, 'clear_all_curves'):
                 tab.clear_all_curves()
+
+    def _toggle_pause(self):
+        if hasattr(self, 'live_threads') and self._is_any_thread_running():
+            if self.pause_btn.isEnabled():
+                self.pause_live()
+            else:
+                self.resume_live()
 
     def pause_live(self):
         if hasattr(self, 'live_threads'):
@@ -2029,9 +2071,6 @@ class MainWindow(QMainWindow):
         if not ip or not user or not paths:
             QMessageBox.warning(self, "错误", "请填写完整的主机、用户名")
             return
-
-        self.x_buffer.clear()
-        self.y_buffers.clear()
 
         # 预构建树和预分配 y_buffers（已知格式，ADS除外）
         dev_type = self.device_type.currentText()
@@ -2089,7 +2128,7 @@ class MainWindow(QMainWindow):
         """接收来自某臂的数据"""
         # 快速路径：树和 buffers 已预构建，仅追数据
         if self._tree_prebuilt:
-            self.x_buffer.append(epoch)
+            self.x_buffers[arm_prefix].append(epoch)
             for col, val in data_dict.items():
                 self.y_buffers[f"{arm_prefix}:{col}"].append(val)
             return
@@ -2099,7 +2138,7 @@ class MainWindow(QMainWindow):
         for col, val in data_dict.items():
             prefixed[f"{arm_prefix}:{col}"] = val
 
-        self.x_buffer.append(epoch)
+        self.x_buffers.setdefault(arm_prefix, deque(maxlen=self.buffer_size)).append(epoch)
         for col, val in prefixed.items():
             if col not in self.y_buffers:
                 self.y_buffers[col] = deque(maxlen=self.buffer_size)
@@ -2139,7 +2178,7 @@ class MainWindow(QMainWindow):
             child.setToolTip(0, var_full)
 
     def update_plots_from_buffer(self):
-        if not self.x_buffer:
+        if not self.x_buffers:
             return
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
@@ -2264,8 +2303,26 @@ class MainWindow(QMainWindow):
             # 预计算时间戳 epoch
             if 'timestamp' in df.columns and df['timestamp'].notna().any():
                 try:
-                    # 使用列表推导，跳过 NaT
-                    self.timestamp_epoch = np.array([t.timestamp() if pd.notna(t) else np.nan for t in df['timestamp']])
+                    def _ts_to_epoch(t):
+                        """转换为 Unix epoch，使得 fromtimestamp(result)
+                        显示日志文件中的原始壁钟时间。
+
+                        注意：pandas >= 2.0 的 Timestamp.timestamp()
+                        对 naive 时间戳当作 UTC 处理，但我们需要 Python
+                        datetime.timestamp() 的行为（当作本地时间）。"""
+                        if pd.isna(t):
+                            return np.nan
+                        if getattr(t, 'tz', None) is not None:
+                            # UTC-aware: 仅剥 tz 保留原始壁钟值，
+                            # 然后当作本地时间处理。
+                            # 日志是 UTC 时间（如 10:56 UTC），
+                            # 我们想显示 10:56（壁钟时间），
+                            # 所以把 10:56 当作本地时间即可。
+                            t = t.tz_localize(None)
+                        # 用 Python datetime.timestamp() 替代 pandas Timestamp.timestamp()
+                        # Python 的 datetime.timestamp() 把 naive 当作本地时间处理
+                        return t.to_pydatetime().timestamp()
+                    self.timestamp_epoch = np.array([_ts_to_epoch(t) for t in df['timestamp']])
                 except Exception as e:
                     print(f"时间戳转换失败: {e}")
                     self.timestamp_epoch = None
