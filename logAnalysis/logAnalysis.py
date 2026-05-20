@@ -630,12 +630,13 @@ class LoadThread(QThread):
     progress = pyqtSignal(float)
     finished = pyqtSignal(object, bool, str)
 
-    def __init__(self, path, use_cache, force_rebuild, use_relative_time=False):
+    def __init__(self, path, use_cache, force_rebuild, use_relative_time=False, files=None):
         super().__init__()
         self.path = path
         self.use_cache = use_cache
         self.force_rebuild = force_rebuild
         self.use_relative_time = use_relative_time
+        self.files = files  # 可选的多文件列表（拖拽使用）
         self._stop = False
 
     def is_set(self):
@@ -646,6 +647,28 @@ class LoadThread(QThread):
 
     def run(self):
         try:
+            if self.files is not None:
+                # 多文件模式：已按时间戳排序
+                total = len(self.files)
+                dfs = []
+                for i, fpath in enumerate(self.files):
+                    if self._stop:
+                        self.finished.emit(pd.DataFrame(), True, "")
+                        return
+                    self.progress.emit(i / total)
+                    df = load_single_log_file(fpath, stop_event=self)
+                    if not df.empty:
+                        dfs.append(df)
+                if not dfs:
+                    df = pd.DataFrame()
+                else:
+                    df = pd.concat(dfs, ignore_index=True)
+                    if 'timestamp' in df.columns and not self.use_relative_time:
+                        df = df.sort_values('timestamp').reset_index(drop=True)
+                    df['line_no'] = range(1, len(df)+1)
+                self.finished.emit(df, self._stop, "")
+                return
+
             if os.path.isfile(self.path):
                 def progress_callback(p):
                     self.progress.emit(p)
@@ -2323,22 +2346,51 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        """处理拖入的文件/文件夹"""
+        """处理拖入的文件/文件夹（支持多文件）"""
         urls = event.mimeData().urls()
         if not urls:
             return
-        # 只处理第一个拖入项
-        path = urls[0].toLocalFile()
-        if not path:
-            return
-        self.path_edit.setText(path)
-        self.force_rebuild = False
-        if os.path.isdir(path):
-            if self.use_cache:
-                self.rebuild_btn.setEnabled(True)
-        else:
+        # 收集所有有效路径
+        paths = []
+        for u in urls:
+            p = u.toLocalFile()
+            if p and os.path.exists(p):
+                paths.append(p)
+
+        if len(paths) == 1:
+            path = paths[0]
+            self.path_edit.setText(path)
+            self.force_rebuild = False
+            if os.path.isdir(path):
+                if self.use_cache:
+                    self.rebuild_btn.setEnabled(True)
+            else:
+                self.rebuild_btn.setEnabled(False)
+            self.start_load()
+        elif len(paths) > 1:
+            # 多文件：只保留普通文件，按第一行时间戳排序后加载
+            log_files = [p for p in paths if os.path.isfile(p) and not is_compressed_file(p)]
+            if not log_files:
+                QMessageBox.information(self, "提示", "拖入的文件中没有可解析的日志文件")
+                return
+            log_files.sort(key=lambda f: get_file_first_timestamp(f) or datetime.datetime.min)
+            self.path_edit.setText(f"拖放 {len(log_files)} 个文件")
+            self.force_rebuild = False
             self.rebuild_btn.setEnabled(False)
-        self.start_load()
+            # 准备加载
+            self.load_btn.setEnabled(False)
+            self.cancel_btn.setEnabled(True)
+            self.file_btn.setEnabled(False)
+            self.folder_btn.setEnabled(False)
+            self.progress_bar.setValue(0)
+            self.info_label.setText("加载中...")
+            self.tree.clear()
+            self.load_thread = LoadThread(log_files[0], self.use_cache, self.force_rebuild,
+                                          use_relative_time=self.relative_time_cb.isChecked(),
+                                          files=log_files)
+            self.load_thread.progress.connect(self.update_progress)
+            self.load_thread.finished.connect(self.load_finished)
+            self.load_thread.start()
 
     # ========== 离线模式方法 ==========
     def select_file(self):
