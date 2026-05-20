@@ -13,7 +13,7 @@ import pandas as pd
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
-                             QFileDialog, QMessageBox, QProgressBar, QSpinBox, QSplitter,
+                             QFileDialog, QInputDialog, QMessageBox, QProgressBar, QSpinBox, QSplitter,
                             QAbstractItemView, QGroupBox, QCheckBox,
                              QTreeWidget, QTreeWidgetItem, QComboBox, QSizePolicy,
                              QRadioButton, QStackedWidget, QTabWidget, QHeaderView,
@@ -1067,6 +1067,13 @@ class PlotSubWidget(QWidget):
                     lambda l, i=cursor_idx: self._on_cursor_drag_finished(l, i))
                 self.cursor_lines[cursor_idx] = line
             self.cursor_lines[cursor_idx].setPos(x)
+            # 确保 ViewBox 有有效范围，防止 InfiniteLine 导致 NaN
+            vb = self.plot_widget.getViewBox()
+            xr, yr = vb.viewRange()
+            if not np.isfinite(yr[0]) or not np.isfinite(yr[1]) or yr[0] >= yr[1]:
+                vb.setYRange(-1, 1)
+            if not np.isfinite(xr[0]) or not np.isfinite(xr[1]) or xr[0] >= xr[1]:
+                vb.setXRange(x - 1, x + 1)
             self.plot_widget.addItem(self.cursor_lines[cursor_idx])
             self.update_cursor_annotations(x, cursor_idx)
             self._add_cursor_time_label(x, cursor_idx)
@@ -1441,6 +1448,101 @@ class PlotTab(QWidget):
         for sub in self.sub_widgets:
             sub.update_cursor_annotations(self.cursor_x[ci], cursor_idx=ci)
 
+    def jump_to_time(self, time_str):
+        """输入时间字符串，将活动游标跳转到最近的数据位置
+
+        支持格式: HH:MM, HH:MM:SS, HH:MM:SS.fff
+        """
+        ci = self.active_cursor
+        time_str = time_str.strip()
+        # 解析时间字符串
+        if time_str.count(':') == 1:
+            time_str += ':00'
+        elif time_str.count(':') != 2:
+            QMessageBox.warning(self.main, "输入错误", "时间格式无效，请使用 HH:MM 或 HH:MM:SS 或 HH:MM:SS.fff")
+            return
+        try:
+            if '.' in time_str:
+                t = datetime.datetime.strptime(time_str, '%H:%M:%S.%f').time()
+            else:
+                t = datetime.datetime.strptime(time_str, '%H:%M:%S').time()
+        except ValueError:
+            QMessageBox.warning(self.main, "输入错误", f"无法解析时间: {time_str}")
+            return
+
+        # 获取可用的 X 轴数据
+        x_vals = None
+        is_online = bool(self.main.x_buffers)
+
+        if is_online:
+            # 在线模式：收集所有臂的 x 值
+            all_x = []
+            for buf in self.main.x_buffers.values():
+                all_x.extend(buf)
+            if not all_x:
+                QMessageBox.information(self.main, "提示", "在线模式还没有数据")
+                return
+            x_vals = np.array(all_x)
+        elif self.main.timestamp_epoch is not None and len(self.main.timestamp_epoch) > 0:
+            x_vals = self.main.timestamp_epoch
+        else:
+            QMessageBox.information(self.main, "提示", "没有可用的数据")
+            return
+
+        # 从数据中取中间点的日期作为基准
+        mid_x = x_vals[len(x_vals) // 2]
+        try:
+            base_date = datetime.datetime.fromtimestamp(mid_x).date()
+        except (OSError, OverflowError, ValueError):
+            base_date = datetime.date.today()
+
+        # 构建目标 datetime 并转 epoch
+        target_dt = datetime.datetime.combine(base_date, t)
+        target_epoch = target_dt.timestamp()
+
+        # 尝试 target_epoch 和前一天/后一天，取最接近的
+        candidates = [target_epoch, target_epoch - 86400, target_epoch + 86400]
+        best_epoch = None
+        best_dist = float('inf')
+        for cand in candidates:
+            idx = np.searchsorted(x_vals, cand)
+            for i in (idx - 1, idx):
+                if 0 <= i < len(x_vals):
+                    dist = abs(x_vals[i] - cand)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_epoch = x_vals[i]
+
+        if best_epoch is None:
+            QMessageBox.information(self.main, "提示", "未找到匹配的时间位置")
+            return
+
+        # 确保游标已启用
+        if not self.cursor_enabled[ci]:
+            self.toggle_cursor(cursor_idx=ci)
+
+        if not self.cursor_enabled[ci]:
+            return  # 启用失败
+
+        # 设置游标位置
+        self.cursor_x[ci] = best_epoch
+        for sub in self.sub_widgets:
+            if sub.cursor_lines[ci] is not None:
+                sub.cursor_lines[ci].blockSignals(True)
+                sub.cursor_lines[ci].setPos(best_epoch)
+                sub.cursor_lines[ci].blockSignals(False)
+            sub.update_cursor_annotations(best_epoch, cursor_idx=ci)
+
+        # 如果游标不在当前视野内，滚动视图使游标可见
+        if np.isfinite(best_epoch):
+            vb = self.sub_widgets[0].plot_widget.getViewBox()
+            x_range = vb.viewRange()[0]
+            if (np.isfinite(x_range[0]) and np.isfinite(x_range[1])
+                    and (best_epoch < x_range[0] or best_epoch > x_range[1])):
+                margin = (x_range[1] - x_range[0]) * 0.2
+                if margin > 0:
+                    vb.setXRange(best_epoch - margin, best_epoch + margin, padding=0)
+
     def _align_left_axes(self):
         """对齐所有子视图的左轴宽度（去抖，多次快速调整只执行一次）"""
         if len(self.sub_widgets) < 2:
@@ -1794,6 +1896,16 @@ class MainWindow(QMainWindow):
         self.cursor2_btn.clicked.connect(lambda: self.toggle_current_tab_cursor(1))
         corner_layout.addWidget(self.cursor2_btn)
 
+        # 时间跳转按钮
+        self.time_jump_btn = QPushButton("⏱")
+        self.time_jump_btn.setToolTip("跳转到指定时间 (J)")
+        self.time_jump_btn.setFixedSize(30, 30)
+        self.time_jump_btn.clicked.connect(self._jump_cursor_to_time)
+        corner_layout.addWidget(self.time_jump_btn)
+
+        # Ctrl+T 快捷键触发时间跳转
+        QShortcut(Qt.Key_J, self, self._jump_cursor_to_time)
+
         self.tab_widget.setCornerWidget(corner_widget, Qt.TopRightCorner)
 
         self.default_tab = PlotTab(self, "绘图1")
@@ -1845,6 +1957,19 @@ class MainWindow(QMainWindow):
         if isinstance(tab, PlotTab):
             self.cursor_btn.setChecked(tab.cursor_enabled[0])
             self.cursor2_btn.setChecked(tab.cursor_enabled[1])
+
+    def _jump_cursor_to_time(self):
+        """弹出时间输入对话框，跳转到指定时间"""
+        tab = self.tab_widget.currentWidget()
+        if not isinstance(tab, PlotTab):
+            return
+        time_str, ok = QInputDialog.getText(
+            self, "时间跳转",
+            "输入目标时间",
+            text=""
+        )
+        if ok and time_str:
+            tab.jump_to_time(time_str)
 
     def save_current_figure(self):
         current_tab = self.tab_widget.currentWidget()
