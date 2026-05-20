@@ -817,15 +817,18 @@ class DragTreeWidget(QTreeWidget):
             delta = (event.pos() - self._drag_start_pos).manhattanLength()
             if delta >= QApplication.startDragDistance():
                 texts = []
-                item = self._drag_item
-                if item.childCount() > 0:
-                    for i in range(item.childCount()):
-                        child = item.child(i)
-                        data = child.data(0, Qt.UserRole)
-                        texts.append(data if data else child.text(0))
-                else:
-                    data = item.data(0, Qt.UserRole)
-                    texts.append(data if data else item.text(0))
+                # 收集所有已选项（支持 Ctrl 多选拖入）
+                for item in self.selectedItems():
+                    if item.childCount() > 0:
+                        for i in range(item.childCount()):
+                            child = item.child(i)
+                            data = child.data(0, Qt.UserRole)
+                            texts.append(data if data else child.text(0))
+                    else:
+                        data = item.data(0, Qt.UserRole)
+                        texts.append(data if data else item.text(0))
+                if not texts:
+                    return
                 mime = QMimeData()
                 mime.setText("\n".join(texts))
                 drag = QDrag(self)
@@ -1855,7 +1858,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(QLabel("📋 数据列"))
         self.tree = DragTreeWidget()
         self.tree.setHeaderLabel("数据列")
-        self.tree.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.setIndentation(20)
         self.tree.setMinimumHeight(400)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
