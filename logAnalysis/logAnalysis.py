@@ -1632,6 +1632,7 @@ class MainWindow(QMainWindow):
         self.resize(win_width, win_height)
         self.setMinimumSize(1000, 800)   # 允许用户手动缩小但不能小于此尺寸
         self.setWindowTitle("YC日志分析平台")
+        self.setAcceptDrops(True)
         self.df = None
         self.current_columns = []
         self.load_thread = None
@@ -1724,6 +1725,7 @@ class MainWindow(QMainWindow):
         cache_row.addWidget(self.rebuild_btn)
         opt_layout.addLayout(cache_row)
         self.relative_time_cb = QCheckBox("使用相对时间")
+        self.relative_time_cb.setChecked(True)
         self.relative_time_cb.setToolTip("忽略日志原始时间戳")
         opt_layout.addWidget(self.relative_time_cb)
         opt_group.setLayout(opt_layout)
@@ -2313,6 +2315,30 @@ class MainWindow(QMainWindow):
     def on_live_error(self, err):
         QMessageBox.critical(self, "实时监控错误", err)
         self.stop_live()
+
+    # ========== 拖放加载 ==========
+    def dragEnterEvent(self, event):
+        """接受文件/文件夹拖入"""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        """处理拖入的文件/文件夹"""
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        # 只处理第一个拖入项
+        path = urls[0].toLocalFile()
+        if not path:
+            return
+        self.path_edit.setText(path)
+        self.force_rebuild = False
+        if os.path.isdir(path):
+            if self.use_cache:
+                self.rebuild_btn.setEnabled(True)
+        else:
+            self.rebuild_btn.setEnabled(False)
+        self.start_load()
 
     # ========== 离线模式方法 ==========
     def select_file(self):
