@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QAbstractItemView, QGroupBox, QCheckBox,
                              QTreeWidget, QTreeWidgetItem, QComboBox, QSizePolicy,
                              QRadioButton, QStackedWidget, QTabWidget, QHeaderView,
-                             QShortcut)
+                             QShortcut, QMenu, QAction)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QEvent
 from PyQt5.QtGui import QDrag
 import pyqtgraph as pg
@@ -880,6 +880,7 @@ class PlotSubWidget(QWidget):
         self.plot_widget.showGrid(x=True, y=True, alpha=0.5)
         self.plot_widget.addLegend()
         self.plot_widget.setClipToView(True)
+        self.plot_widget.scene().installEventFilter(self)
         self.plot_widget.drop_signal.connect(self.add_curve)
         self.plot_widget.installEventFilter(self)
         self.plot_widget.mouseDoubleClickEvent = self.on_double_click
@@ -907,7 +908,14 @@ class PlotSubWidget(QWidget):
         layout.addWidget(ctrl_frame)
 
     def eventFilter(self, obj, event):
-        """拦截绘图控件的键盘事件"""
+        """拦截绘图控件的键盘事件和场景右键事件"""
+        # 场景级：拦截图例右键（在事件到达任何 item 之前）
+        if obj is self.plot_widget.scene():
+            if event.type() == QEvent.GraphicsSceneMousePress and event.button() == Qt.RightButton:
+                col = self._get_legend_col_at_scene_pos(event.scenePos())
+                if col:
+                    self._show_diff_menu(col, event.screenPos())
+                    return True
         if obj == self.plot_widget and event.type() == QEvent.KeyPress:
             tab = self.parent_tab
             if event.key() == Qt.Key_S:
@@ -953,12 +961,66 @@ class PlotSubWidget(QWidget):
     def add_curve(self, col):
         if col in self.plot_items:
             return
-        xbuf = self._get_x_buffer(col)
+        is_diff = col.endswith('[diff]')
+        base_col = col[:-6] if is_diff else col
+        xbuf = self._get_x_buffer(base_col if is_diff else col)
         if xbuf:
             x = np.array(xbuf)
         else:
             x = np.array([])
-        if col in self.main.y_buffers:
+
+        if is_diff:
+            # 差分模式：从原始曲线数据计算
+            if base_col in self.main.y_buffers:
+                y_orig = np.array(self.main.y_buffers[base_col])
+                if len(y_orig) < 2:
+                    return
+                y = np.diff(y_orig)
+                if len(x) > len(y_orig):
+                    x_arr = x[-len(y_orig):]
+                else:
+                    x_arr = x
+                x = x_arr[1:] if len(x_arr) > 1 else x_arr
+                if len(x) > len(y):
+                    x = x[-len(y):]
+            elif self.main.df is not None and base_col in self.main.df.columns:
+                y_orig = self.main.df[base_col].values
+                if len(y_orig) < 2:
+                    return
+                y = np.diff(y_orig)  # 先 diff，NaN 自然传播
+                if base_col in self.plot_items:
+                    orig_curve = self.plot_items[base_col]
+                    orig_x, _ = orig_curve.getOriginalDataset()
+                    if orig_x is not None and len(orig_x) > 1:
+                        x = orig_x[1:]
+                else:
+                    if self.main.timestamp_epoch is not None:
+                        x = self.main.timestamp_epoch[1:]
+                    elif 'line_no' in self.main.df.columns:
+                        x = self.main.df['line_no'].values[1:]
+                min_len = min(len(x), len(y))
+                if min_len == 0:
+                    return
+                x = x[-min_len:]
+                y = y[-min_len:]
+            elif base_col in self.plot_items:
+                # 对已有曲线（含差分曲线）再次差分
+                orig_curve = self.plot_items[base_col]
+                orig_x, orig_y = orig_curve.getOriginalDataset()
+                if orig_y is None or len(orig_y) < 2:
+                    return
+                y = np.diff(orig_y)
+                x = orig_x[1:] if orig_x is not None and len(orig_x) > 1 else x
+                if len(x) > len(y):
+                    x = x[-len(y):]
+                elif len(y) > len(x):
+                    y = y[-len(x):]
+            # 相对时间模式：差分除以采样周期 0.001s，得到每秒变化率
+            if getattr(self.main, 'relative_time_cb', None) and self.main.relative_time_cb.isChecked():
+                y = y / 0.001
+            else:
+                return
+        elif col in self.main.y_buffers:
             y = np.array(self.main.y_buffers[col])
             if len(x) > len(y):
                 x = x[-len(y):]
@@ -969,7 +1031,6 @@ class PlotSubWidget(QWidget):
             if self.main.timestamp_epoch is not None:
                 x = self.main.timestamp_epoch
             elif 'timestamp' in self.main.df.columns:
-                # 兜底：转换一次
                 x = np.array([t.to_pydatetime().timestamp() for t in self.main.df['timestamp']])
             else:
                 x = self.main.df['line_no'].values
@@ -980,8 +1041,19 @@ class PlotSubWidget(QWidget):
             return
         if len(y) == 0 or np.all(np.isnan(y)):
             return
-        color = self._next_color()
-        pen = pg.mkPen(color=color, width=2.5)
+
+        if is_diff and base_col in self.plot_items:
+            orig_pen = self.plot_items[base_col].opts.get('pen')
+            if orig_pen is not None:
+                try:
+                    color = pg.mkPen(orig_pen).color()
+                except Exception:
+                    color = self._next_color()
+            else:
+                color = self._next_color()
+        else:
+            color = self._next_color()
+        pen = pg.mkPen(color=color, width=2.0, style=Qt.DashLine if is_diff else Qt.SolidLine)
         opts = {'pen': pen, 'name': col, 'antialias': False, 'downsample': 300, 'autoDownsample': True}
         curve = self.plot_widget.plot(x, y, **opts)
         self.plot_items[col] = curve
@@ -993,10 +1065,105 @@ class PlotSubWidget(QWidget):
             self.scroll_to_latest()
         self.parent_tab._align_left_axes()
 
+    def _get_legend_col_at_scene_pos(self, scene_pos):
+        """如果 scene_pos 落在图例标签上，返回对应的 col 名，否则返回 None"""
+        legend = self.plot_widget.plotItem.legend
+        if legend is None or not legend.scene():
+            return None
+        legend_rect = legend.mapRectToScene(legend.boundingRect())
+        if not legend_rect.contains(scene_pos):
+            return None
+        for sample, label in legend.items:
+            name = label.text
+            if isinstance(name, str):
+                try:
+                    r = label.mapRectToScene(label.boundingRect())
+                    if r.contains(scene_pos):
+                        return name
+                except Exception:
+                    continue
+        return None
+
+    def _show_diff_menu(self, col, screen_pos):
+        """弹出差分/操作菜单"""
+        menu = QMenu(self)
+        # 差分切换（对所有曲线都可用，含 [diff] 曲线）
+        diff_col = f"{col}[diff]"
+        if diff_col in self.plot_items:
+            action = QAction("隐藏差分", self)
+        else:
+            action = QAction("显示差分", self)
+        action.triggered.connect(lambda: self._toggle_diff(col))
+        menu.addAction(action)
+        menu.addSeparator()
+        # 删除曲线
+        delete_action = QAction("删除曲线", self)
+        delete_action.triggered.connect(lambda: self._remove_curve(col))
+        menu.addAction(delete_action)
+        menu.exec_(screen_pos)
+
+    def _toggle_diff(self, col):
+        """切换差分曲线的显示/隐藏"""
+        diff_col = f"{col}[diff]"
+        if diff_col in self.plot_items:
+            self.plot_widget.removeItem(self.plot_items[diff_col])
+            del self.plot_items[diff_col]
+        else:
+            self.add_curve(diff_col)
+
+    def _remove_curve(self, col):
+        """从绘图区域移除曲线及其依赖曲线（嵌套差分）"""
+        # 先递归移除依赖此曲线的子曲线
+        for key in list(self.plot_items.keys()):
+            if key.endswith('[diff]') and key[:-6] == col:
+                self._remove_curve(key)
+        # 再移除自身
+        if col in self.plot_items:
+            self.plot_widget.removeItem(self.plot_items[col])
+            del self.plot_items[col]
+
     def update_curves(self):
         if not self.main.x_buffers:
             return
         for col, curve in list(self.plot_items.items()):
+            if col.endswith('[diff]'):
+                base_col = col[:-6]
+                if base_col in self.main.y_buffers:
+                    y_orig = np.array(self.main.y_buffers[base_col])
+                    if len(y_orig) < 2:
+                        continue
+                    y_arr = np.diff(y_orig)
+                    xbuf = self._get_x_buffer(base_col)
+                    if xbuf:
+                        x_arr = np.array(xbuf)
+                        if len(x_arr) > len(y_orig):
+                            x_arr = x_arr[-len(y_orig):]
+                        x_use = x_arr[1:] if len(x_arr) > 1 else x_arr
+                        if len(x_use) > len(y_arr):
+                            x_use = x_use[-len(y_arr):]
+                        elif len(y_arr) > len(x_use):
+                            y_arr = y_arr[-len(x_use):]
+                    else:
+                        continue
+                    # if getattr(self.main, 'relative_time_cb', None) and self.main.relative_time_cb.isChecked():
+                    #     y_arr = y_arr / 0.001
+                    curve.setData(x_use, y_arr)
+                elif base_col in self.plot_items:
+                    # 嵌套差分（diff of diff）：从已有曲线数据再差分
+                    orig_curve = self.plot_items[base_col]
+                    ox, oy = orig_curve.getOriginalDataset()
+                    if oy is None or len(oy) < 2:
+                        continue
+                    y_arr = np.diff(oy)
+                    x_use = ox[1:] if ox is not None and len(ox) > 1 else np.array([])
+                    if len(x_use) > len(y_arr):
+                        x_use = x_use[-len(y_arr):]
+                    elif len(y_arr) > len(x_use):
+                        y_arr = y_arr[-len(x_use):]
+                    # if getattr(self.main, 'relative_time_cb', None) and self.main.relative_time_cb.isChecked():
+                    #     y_arr = y_arr / 0.001
+                    curve.setData(x_use, y_arr)
+                continue  # diff 曲线跳过常规更新
             if col in self.main.y_buffers:
                 y_arr = np.array(self.main.y_buffers[col])
                 xbuf = self._get_x_buffer(col)
@@ -1212,7 +1379,7 @@ class PlotSubWidget(QWidget):
                 y_val, col, idx, color = group[0]
                 key = (col, cursor_idx)
                 active_keys.add(key)
-                text = f"{col}={y_val:.4f}"
+                text = f"{col}={y_val:.5f}"
                 if key in self.cursor_annotations:
                     label = self.cursor_annotations[key]
                     label.setText(text)
@@ -1231,7 +1398,7 @@ class PlotSubWidget(QWidget):
                     y_offset = (i - mid) * spacing
                     key = (col, cursor_idx)
                     active_keys.add(key)
-                    text = f"{col}={y_val:.4f}"
+                    text = f"{col}={y_val:.5f}"
                     if key in self.cursor_annotations:
                         label = self.cursor_annotations[key]
                         label.setText(text)
@@ -2004,15 +2171,14 @@ class MainWindow(QMainWindow):
         if not current_tab or not current_tab.sub_widgets:
             QMessageBox.information(self, "提示", "当前标签页没有曲线可保存")
             return
-        # 只保存第一个子图（或其他逻辑）
-        first_sub = current_tab.sub_widgets[0]
-        if not first_sub.plot_items:
+        has_any_curve = any(sub.plot_items for sub in current_tab.sub_widgets)
+        if not has_any_curve:
             QMessageBox.information(self, "提示", "当前标签页没有曲线可保存")
             return
         path, _ = QFileDialog.getSaveFileName(self, "保存图像", "",
                                             "PNG图片 (*.png);;JPEG图片 (*.jpg);;BMP图片 (*.bmp)")
         if path:
-            pixmap = first_sub.plot_widget.grab()
+            pixmap = current_tab.grab()
             if path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
                 pixmap.save(path)
                 self.statusBar().showMessage(f"图像已保存至: {path}")
