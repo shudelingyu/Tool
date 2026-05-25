@@ -308,10 +308,10 @@ class SimpleMonitor:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         arms = [
-            (1, "从臂1", "slave", 0),
-            (2, "从臂2", "slave", 1),
-            (3, "从臂3", "slave", 2),
-            (4, "从臂4", "slave", 3),
+            (1, "从臂1", "slave", 1),
+            (2, "从臂2", "slave", 2),
+            (3, "从臂3", "slave", 3),
+            (4, "从臂4", "slave", 4),
             (5, "主手 LEFT", "master", "Left"),
             (6, "主手 RIGHT", "master", "Right")
         ]
@@ -477,8 +477,8 @@ class SimpleMonitor:
             data_dir = self._get_data_dir()
             front_8 = angles[:8]
             back_4 = angles[8:12]
-            psm_file = os.path.join(data_dir, f"psm{identifier+1}_joint.cst")
-            inst_file = os.path.join(data_dir, f"inst{identifier+1}_joint.cst")
+            psm_file = os.path.join(data_dir, f"psm{identifier}_joint.cst")
+            inst_file = os.path.join(data_dir, f"inst{identifier}_joint.cst")
             line_no_psm = self._write_joint_file(psm_file, front_8, 8, "actpos")
             line_no_inst = self._write_joint_file(inst_file, back_4, 4, "actpos")
             if line_no_psm > 0:
@@ -552,8 +552,8 @@ class SimpleMonitor:
 
         elif arm_type == "slave":
             arm_id = identifier
-            psm_file = os.path.join(data_dir, f"psm{arm_id+1}_joint.cst")
-            inst_file = os.path.join(data_dir, f"inst{arm_id+1}_joint.cst")
+            psm_file = os.path.join(data_dir, f"psm{arm_id}_joint.cst")
+            inst_file = os.path.join(data_dir, f"inst{arm_id}_joint.cst")
             line_count = self._get_file_line_count(psm_file)
             if line_count == 0:
                 self.log(f"{display_name} 没有数据可删除")

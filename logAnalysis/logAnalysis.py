@@ -39,6 +39,15 @@ class FormatConfig:
             self._raw = json.load(f)
         self._cols_cache = {}
         self._simple_to_full = None
+        
+    def get_online_device_types(self):
+        """返回在线模式支持的设备类型列表（按配置顺序）"""
+        return list(self._raw.get('online_paths', {}).keys())
+
+    def get_online_paths(self, device_type):
+        """根据设备类型返回 [(prefix, remote_path), ...]"""
+        paths_cfg = self._raw.get('online_paths', {}).get(device_type, [])
+        return [(item['prefix'], item['path']) for item in paths_cfg]
 
     # ---- 列名生成 ----
 
@@ -1947,7 +1956,15 @@ class MainWindow(QMainWindow):
         dev_type_layout = QHBoxLayout()
         dev_type_layout.addWidget(QLabel("设备类型:"))
         self.device_type = QComboBox()
-        self.device_type.addItems(["从手", "主手", "ADS"])
+        if config:
+            device_types = config.get_online_device_types()
+            if device_types:
+                self.device_type.addItems(device_types)
+            else:
+                # 降级硬编码
+                self.device_type.addItems(["从手", "主手", "ADS"])
+        else:
+            self.device_type.addItems(["从手", "主手", "ADS"])
         self.device_type.currentTextChanged.connect(self.on_device_type_changed)
         dev_type_layout.addWidget(self.device_type)
         online_layout.addLayout(dev_type_layout)
@@ -2230,8 +2247,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"保留时间已调整为 {new_seconds} s")
 
     def _get_remote_paths(self):
-        """返回 [(arm_prefix, remote_path), ...] 列表"""
+        """返回 [(arm_prefix, remote_path), ...] 列表，从配置读取"""
         dev_type = self.device_type.currentText()
+        if config:
+            paths = config.get_online_paths(dev_type)
+            if paths:
+                return paths
+        # 降级（兼容无配置文件或未找到）
         if dev_type == "从手":
             return [
                 ("arm1", "/data/log/rt/mmsArm1/mmsArm1"),
@@ -2247,8 +2269,8 @@ class MainWindow(QMainWindow):
             ]
         elif dev_type == "ADS":
             return [("ADS", "/data/log/rt/LOUT/LOUT")]
-        else:  # boom
-            return [("boom", "/data/log/rt/mmsBoom/mmsBoom")]
+        else:
+            return []
 
     def _pre_build_tree_and_buffers(self, dev_type):
         """根据设备类型预构建树和预分配 y_buffers（ADS 除外）"""

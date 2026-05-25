@@ -7,7 +7,6 @@ import datetime
 import sys
 import threading
 
-# 设置外观
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
@@ -31,7 +30,8 @@ class ProgramLauncher:
         self.init_log_window = None
 
         self.setup_ui()
-        self.check_missing_tools()
+        # 异步检查缺失工具，不阻塞启动
+        self.check_missing_tools_async()
         self.add_log("INFO", "工具箱已启动")
 
     def load_config(self):
@@ -49,7 +49,6 @@ class ProgramLauncher:
         return default_config
 
     def setup_ui(self):
-        # 主容器
         self.main_container = ctk.CTkFrame(self.root, fg_color="transparent")
         self.main_container.pack(fill="both", expand=True)
 
@@ -58,19 +57,16 @@ class ProgramLauncher:
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
 
-        # Logo
         logo_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         logo_frame.pack(pady=(30, 20))
         ctk.CTkLabel(logo_frame, text="🛠️", font=("Segoe UI", 40)).pack()
         ctk.CTkLabel(logo_frame, text="工具箱", font=("Microsoft YaHei", 18, "bold"),
                      text_color="#4f46e5").pack()
 
-        # 统计
         self.stats_label = ctk.CTkLabel(self.sidebar, text=f"📦 {len(self.programs)} 个工具",
                                         font=("Microsoft YaHei", 10), text_color="#6b7280")
         self.stats_label.pack(pady=20)
 
-        # 导航按钮
         nav_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         nav_frame.pack(fill="x", pady=20)
         for text, cmd in [("📋 全部工具", self.show_all_tools),
@@ -81,7 +77,6 @@ class ProgramLauncher:
                                 anchor="w", command=cmd)
             btn.pack(fill="x", padx=20, pady=5)
 
-        # 底部
         ctk.CTkLabel(self.sidebar, text="Made with TC❤️", font=("Microsoft YaHei", 8),
                      text_color="#9ca3af").pack(side="bottom", pady=20)
 
@@ -89,26 +84,26 @@ class ProgramLauncher:
         self.main_area = ctk.CTkFrame(self.main_container, fg_color="#f8f9fa")
         self.main_area.pack(side="left", fill="both", expand=True)
 
-        # 头部
         header = ctk.CTkFrame(self.main_area, fg_color="transparent", height=70)
         header.pack(fill="x", padx=20, pady=(15, 0))
         header.pack_propagate(False)
         ctk.CTkLabel(header, text="工具管理中心", font=("Microsoft YaHei", 22, "bold"),
                      text_color="#1f2937").pack(side="left")
 
-        # 搜索框
         self.search_var = ctk.StringVar()
         self.search_var.trace_add("write", self.on_search)
         self.search_entry = ctk.CTkEntry(header, textvariable=self.search_var,
                                          width=250, placeholder_text="🔍 搜索工具...")
         self.search_entry.pack(side="right")
 
-        # 滚动区域
         self.tools_container = ctk.CTkScrollableFrame(self.main_area, fg_color="#f8f9fa")
         self.tools_container.pack(fill="both", expand=True, padx=20, pady=(10, 20))
 
-        # 固定列数为3（可自行调整）
+        # 固定列数，只配置一次
         self.COLS = 3
+        for i in range(self.COLS):
+            self.tools_container.grid_columnconfigure(i, weight=1, uniform="tool_col")
+
         self.load_tools()
 
     def on_search(self, *args):
@@ -119,11 +114,10 @@ class ProgramLauncher:
         self.load_tools()
 
     def load_tools(self, search_text=""):
-        # 清空
+        # 清空容器
         for widget in self.tools_container.winfo_children():
             widget.destroy()
 
-        # 过滤
         filtered = self.programs.copy()
         if search_text:
             filtered = [p for p in self.programs
@@ -132,18 +126,12 @@ class ProgramLauncher:
 
         if not filtered:
             ctk.CTkLabel(self.tools_container, text="😔 没有找到相关工具",
-                        font=("Microsoft YaHei", 14), text_color="#6b7280").pack(pady=50)
+                         font=("Microsoft YaHei", 14), text_color="#6b7280").pack(pady=50)
             return
 
-        # 固定列数
-        COLS = 3
-        # 关键：设置 uniform 确保各列宽度严格一致
-        for i in range(COLS):
-            self.tools_container.grid_columnconfigure(i, weight=1, uniform="tool_col")
-
         for idx, prog in enumerate(filtered):
-            row = idx // COLS
-            col = idx % COLS
+            row = idx // self.COLS
+            col = idx % self.COLS
             self.create_tool_card(prog, row, col)
 
     def create_tool_card(self, prog, row, col):
@@ -151,28 +139,22 @@ class ProgramLauncher:
         exists = os.path.exists(full_path)
         icon = prog.get('icon', '🔧')
 
-        # 卡片使用 sticky="nsew" 填充整个网格单元格，宽度由列统一控制
         card = ctk.CTkFrame(self.tools_container, corner_radius=10, border_width=1,
                             border_color="#e5e7eb", fg_color="white")
         card.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
 
-        # 为了让卡片内部内容紧凑但宽度不溢出，设置内部 widget 的 pack 选项
-        # 图标
         icon_label = ctk.CTkLabel(card, text=icon, font=("Segoe UI", 36), text_color="#4f46e5")
         icon_label.pack(pady=(15, 5))
 
-        # 标题
         ctk.CTkLabel(card, text=prog['name'], font=("Microsoft YaHei", 12, "bold"),
-                    text_color="#1f2937").pack()
+                     text_color="#1f2937").pack()
 
-        # 描述（固定换行宽度，避免撑开）
         desc = prog.get('desc', '暂无描述')[:50]
         if len(prog.get('desc', '')) > 50:
             desc += "..."
         ctk.CTkLabel(card, text=desc, font=("Microsoft YaHei", 9),
-                    text_color="#6b7280", wraplength=200, justify="center").pack(pady=(5, 10))
+                     text_color="#6b7280", wraplength=200, justify="center").pack(pady=(5, 10))
 
-        # 按钮
         btn_frame = ctk.CTkFrame(card, fg_color="transparent")
         btn_frame.pack(pady=(0, 15))
 
@@ -183,13 +165,24 @@ class ProgramLauncher:
             btn.pack()
         else:
             ctk.CTkLabel(btn_frame, text="❌ 文件缺失", font=("Microsoft YaHei", 9),
-                        text_color="#ef4444").pack()
+                         text_color="#ef4444").pack()
 
-    # 日志功能（与原代码相同，稍作简化）
+    # 异步检查缺失工具
+    def check_missing_tools_async(self):
+        def _check():
+            missing = [p['name'] for p in self.programs
+                       if not os.path.exists(os.path.join(self.script_dir, p['path']))]
+            if missing:
+                self.root.after(0, lambda: self.show_notification(f"⚠️ 缺失 {len(missing)} 个工具文件", "warning"))
+                self.add_log("WARNING", f"缺失: {', '.join(missing)}")
+        threading.Thread(target=_check, daemon=True).start()
+
+    # 优化日志写入：避免频繁打开关闭文件，使用缓冲写入（简单方案：追加时只开一次，但每次都要开；可改用队列）
     def add_log(self, level, message):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_entry = f"[{timestamp}] [{level}] {message}\n"
         try:
+            # 使用追加模式，系统会缓存，性能尚可；如果追求极致可引入队列异步写入
             with open(self.log_file, 'a', encoding='utf-8') as f:
                 f.write(log_entry)
         except Exception:
@@ -306,8 +299,11 @@ class ProgramLauncher:
         try:
             self.show_notification(f"启动 {prog['name']}...", "info")
             self.add_log("INFO", f"启动 {prog['name']} ({exe_path})")
-            threading.Thread(target=lambda: subprocess.Popen(exe_path, shell=True),
-                             daemon=True).start()
+
+            # 优化启动速度：不使用 shell=True，直接执行
+            # 如果 exe_path 包含空格，需要加引号，这里用 list 形式传递参数
+            subprocess.Popen([exe_path], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)
+            # 如果目标程序需要特定工作目录，可以加 cwd 参数
         except Exception as e:
             self.add_log("ERROR", f"启动失败 {prog['name']}: {e}")
             messagebox.showerror("错误", f"启动失败:\n{e}")

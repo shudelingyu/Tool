@@ -60,5 +60,21 @@
   },
   "lout": {
     "detect_regex": "\\[ADS\\]"
+  },
+  "online_paths": {
+    "从手": [
+      {"prefix": "arm1", "path": "/data/log/rt/mmsArm1/mmsArm1"},
+      {"prefix": "arm2", "path": "/data/log/rt/mmsArm2/mmsArm2"},
+      {"prefix": "arm3", "path": "/data/log/rt/mmsArm3/mmsArm3"},
+      {"prefix": "arm4", "path": "/data/log/rt/mmsArm4/mmsArm4"},
+      {"prefix": "boom", "path": "/data/log/rt/mmsBoom/mmsBoom"}
+    ],
+    "主手": [
+      {"prefix": "left", "path": "/data/log/rt/LeftDataModel/LeftDataModel"},
+      {"prefix": "right", "path": "/data/log/rt/RightDataModel/RightDataModel"}
+    ],
+    "ADS": [
+      {"prefix": "ADS", "path": "/data/log/rt/LOUT/LOUT"}
+    ]
   }
 }
