@@ -299,7 +299,42 @@ def parse_lout_line_fast(line: str):
     if not cols:
         return None, None
     return cols, vals
-# ...existing code...
+
+# ---- DISPLAY 格式解析 ----
+
+def parse_display_line(rest):
+    """
+    解析 [DISPLAY] 行，格式：
+      [DISPLAY]count: <time_val>, name1:[v1, v2, ...], name2:[v1, v2, ...]
+    变量名和数组长度均为动态。
+    返回 (count_val, cols, vals) 或 (None, None, None)。
+    """
+    m = re.search(r'\[DISPLAY\]\s*(.*)', rest)
+    if not m:
+        return None, None, None
+    content = m.group(1).strip()
+    # 提取 count 值（时间轴）
+    count_m = re.match(
+        r'count\s*:\s*([-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?)\s*,\s*(.*)', content
+    )
+    if not count_m:
+        return None, None, None
+    count_val = float(count_m.group(1))
+    remaining = count_m.group(2)
+    # 提取变量数组：name:[v1, v2, ...]
+    pattern = re.compile(r'(\w+)\s*:\s*\[([^\]]*)\]\s*,?\s*')
+    cols = []
+    vals = []
+    for name, arr_str in pattern.findall(remaining):
+        parts = [p.strip() for p in arr_str.split(',') if p.strip()]
+        for i, p in enumerate(parts):
+            cols.append(f"{name}[{i}]")
+            try:
+                vals.append(float(p))
+            except Exception:
+                vals.append(np.nan)
+    return count_val, cols, vals
+
 
 def parse_log_line(line: str):
     """
@@ -542,6 +577,7 @@ def load_single_log_file(filepath, progress_callback=None, stop_event=None):
     from collections import defaultdict
     data = defaultdict(list)
     raw_ts_strs = []  # 收集原始时间戳字符串，循环结束后批量转换
+    display_time_vals = []  # DISPLAY 格式的 count 值（用作时间轴）
     try:
         f = open(filepath, 'r', encoding='utf-8', errors='ignore')
     except Exception:
@@ -577,6 +613,16 @@ def load_single_log_file(filepath, progress_callback=None, stop_event=None):
                         continue
                     raw_ts_strs.append(ts_str2 if ts_str2 else None)
                     for c, v in zip(cols, vals):
+                        data[c].append(v)
+                continue
+
+            # DISPLAY 行：以 count 值为时间轴
+            if '[DISPLAY]' in rest:
+                count_val, d_cols, d_vals = parse_display_line(rest)
+                if count_val is not None and d_cols:
+                    display_time_vals.append(count_val)
+                    raw_ts_strs.append(None)
+                    for c, v in zip(d_cols, d_vals):
                         data[c].append(v)
                 continue
 
@@ -620,6 +666,11 @@ def load_single_log_file(filepath, progress_callback=None, stop_event=None):
     # 列式构建 DataFrame（比 list-of-dicts 快，节省大量 Python 对象开销）
     data['timestamp'] = timestamps
     df = pd.DataFrame(data)
+
+    # DISPLAY 格式：将 count 值存入特殊列，后续在 load_finished 中用作时间轴
+    # 仅当长度匹配时才添加（纯 DISPLAY 文件正常；混用文件跳过）
+    if display_time_vals and len(display_time_vals) == len(df):
+        df['__display_time__'] = display_time_vals
 
     # 保证 timestamp 在最前并添加 line_no
     cols = list(df.columns)
@@ -2695,7 +2746,11 @@ class MainWindow(QMainWindow):
 
             self.df = df
             # 预计算时间戳 epoch
-            if 'timestamp' in df.columns and df['timestamp'].notna().any():
+            # DISPLAY 格式直接用 count 值作为时间轴
+            if '__display_time__' in df.columns:
+                self.timestamp_epoch = df['__display_time__'].values.astype(float)
+                df = df.drop(columns=['__display_time__'])
+            elif 'timestamp' in df.columns and df['timestamp'].notna().any():
                 try:
                     def _ts_to_epoch(t):
                         """转换为 Unix epoch，使得 fromtimestamp(result)
