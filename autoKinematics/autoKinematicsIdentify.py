@@ -48,19 +48,46 @@ ARM_COLORS = [
     {"bg": "#10B981", "hover": "#059669", "icon": "❹"},
 ]
 
-# ==================== 自动摆位命令配置 ====================
-# 每条臂对应控制器的位置索引和参数
+# ==================== 执行路点 ====================
+# 指令格式: {model0||model1||Boom||从臂1||从臂2||从臂3||从臂4}
+# 主手格式: {左手||右手}
 ARM_CFG = {
+    1: {"pos": 4, "num": 8},
+    2: {"pos": 5, "num": 8},
+    3: {"pos": 6, "num": 8},
+    4: {"pos": 7, "num": 8},
+}
+
+# 从臂执行路点的7条指令模板
+SLAVE_EXEC_TEMPLATE = [
+    "URecover",
+    "Mode",
+    "UEnable --begin_motion_id=0 --num={num}",
+    "URecover",
+    "MoveAbs --wp={wp}",
+    "URecover",
+    "UDisable --begin_motion_id=0 --num={num}",
+]
+
+
+def _slot_cmd(arm_id: int, cmd: str) -> str:
+    """将指令放入对应臂的槽位，其余为Idle"""
+    pos = ARM_CFG[arm_id]["pos"]
+    parts = ["Idle"] * 7
+    parts[pos] = cmd
+    return "{" + "||".join(parts) + "}"
+
+# ==================== 自动摆位命令配置 ====================
+ARM_CFG_AUTOPOS = {
     1: {"pos": 2, "num": 4, "type": "ARM1IDENTIFY"},
     2: {"pos": 3, "num": 8, "type": "ARM2IDENTIFY"},
     3: {"pos": 4, "num": 8, "type": "ARM3IDENTIFY"},
     4: {"pos": 5, "num": 8, "type": "ARM4IDENTIFY"},
 }
 
-
 def _build_press_cmds(arm_id: int) -> List[str]:
     """构建按住时下发的8条指令"""
-    cfg = ARM_CFG[arm_id]
+    cfg = ARM_CFG_AUTOPOS[arm_id]
     pos, num, ptype = cfg["pos"], cfg["num"], cfg["type"]
 
     def _all(cmd: str) -> str:
@@ -97,10 +124,27 @@ def _build_press_cmds(arm_id: int) -> List[str]:
 
 def _build_release_cmds() -> List[str]:
     """构建松开时下发的指令"""
-    all_stop = "{Stop||Stop||Stop||Stop||Stop||Stop||Stop}"
-    all_start = "{Start||Start||Start||Start||Start||Start||Start}"
-    all_recover = "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}"
-    return [all_stop, all_start, all_recover]
+    all_stop = "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=0||PushStatus --mode_id=1 --motion_cmd=0||PushStatus --mode_id=2 --motion_cmd=0||PushStatus --mode_id=3 --motion_cmd=0||PushStatus --mode_id=4 --motion_cmd=0}"
+    all_start = "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=100||PushStatus --mode_id=1 --motion_cmd=100||PushStatus --mode_id=2 --motion_cmd=100||PushStatus --mode_id=3 --motion_cmd=100||PushStatus --mode_id=4 --motion_cmd=100}"
+    return [all_stop, all_start]
+
+
+def _build_slave_exec_cmds(arm_id: int, wp_name: str) -> List[str]:
+    """构建从手执行路点的7条指令"""
+    num = ARM_CFG[arm_id]["num"]
+    cmds = []
+    for template in SLAVE_EXEC_TEMPLATE:
+        cmd = template.format(num=num, wp=wp_name)
+        cmds.append(_slot_cmd(arm_id, cmd))
+    return cmds
+
+
+def _build_master_exec_cmd(wp_name: str, hand: int = 0) -> str:
+    """构建主手执行路点的单条指令  hand=0左, 1右"""
+    if hand == 0:
+        return f"{{MtmMoveP --wp={wp_name}||Idle}}"
+    else:
+        return f"{{Idle||MtmMoveP --wp={wp_name}}}"
 
 # ==================== 全局样式表 ====================
 STYLESHEET = f"""
@@ -323,6 +367,9 @@ class AutoKinematicsWindow(QWidget):
         self.connected = False
         self.waypoints: List[Tuple[str, List[float]]] = []
 
+        # 模式: 0=主手, 1=从手
+        self.mode = 1
+
         # 自动摆位状态（每条臂一个线程标志）
         self.pos_running = {i: False for i in range(1, 5)}
         self.pos_lock = threading.Lock()
@@ -384,7 +431,8 @@ class AutoKinematicsWindow(QWidget):
         # ── 左右分栏 ──
         cols = QHBoxLayout()
         cols.setSpacing(14)
-        cols.addWidget(self._build_pos_card(), stretch=2)
+        self.pos_card = self._build_pos_card()
+        cols.addWidget(self.pos_card, stretch=2)
         cols.addWidget(self._build_waypoint_card(), stretch=3)
         body.addLayout(cols, stretch=1)
 
@@ -447,6 +495,23 @@ class AutoKinematicsWindow(QWidget):
         self.status_label = QLabel("未连接")
         self.status_label.setStyleSheet(f"color: {C['slate_lt']}; font-size: 9pt;")
         row.addWidget(self.status_label)
+        row.addSpacing(16)
+
+        # ── 主手/从手切换 ──
+        row.addWidget(QLabel("模式:"))
+        self.mode_btn_master = QPushButton("主手")
+        self.mode_btn_master.setCheckable(True)
+        self.mode_btn_master.setFixedWidth(60)
+        self.mode_btn_master.clicked.connect(lambda: self._set_mode(0))
+        self.mode_btn_slave = QPushButton("从手")
+        self.mode_btn_slave.setCheckable(True)
+        self.mode_btn_slave.setFixedWidth(60)
+        self.mode_btn_slave.setChecked(True)
+        self.mode_btn_slave.clicked.connect(lambda: self._set_mode(1))
+        self._style_mode_buttons()
+        row.addWidget(self.mode_btn_master)
+        row.addWidget(self.mode_btn_slave)
+
         row.addStretch()
 
         card.addLayout(row)
@@ -536,6 +601,49 @@ class AutoKinematicsWindow(QWidget):
         file_row.addWidget(self.load_btn)
         card.addLayout(file_row)
 
+        # ── 执行目标选择 ──
+        self.target_frame = QFrame()
+        target_row = QHBoxLayout(self.target_frame)
+        target_row.setContentsMargins(0, 0, 0, 0)
+        target_row.setSpacing(4)
+
+        self.target_label = QLabel("执行于:")
+        self.target_label.setStyleSheet(f"color: {C['slate_md']}; font-size: 8pt; font-weight: bold;")
+        target_row.addWidget(self.target_label)
+
+        # 从手臂选择按钮
+        self.arm_target_btns = []
+        arm_labels = ["❶ 从臂1", "❷ 从臂2", "❸ 从臂3", "❹ 从臂4"]
+        for i in range(4):
+            btn = QPushButton(arm_labels[i])
+            btn.setCheckable(True)
+            btn.setFixedHeight(26)
+            btn.setStyleSheet(self._target_btn_css(selected=(i == 0)))
+            btn.clicked.connect(lambda _, a=i+1: self._select_arm_target(a))
+            target_row.addWidget(btn)
+            self.arm_target_btns.append(btn)
+        self.arm_target_btns[0].setChecked(True)
+
+        # 主手左右选择按钮
+        self.hand_target_btns = []
+        for i, label in enumerate(["👈 左手", "👉 右手"]):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setFixedHeight(26)
+            btn.setStyleSheet(self._target_btn_css(selected=(i == 0)))
+            btn.clicked.connect(lambda _, h=i: self._select_hand_target(h))
+            target_row.addWidget(btn)
+            self.hand_target_btns.append(btn)
+        self.hand_target_btns[0].setChecked(True)
+
+        target_row.addStretch()
+        card.addWidget(self.target_frame)
+
+        # 存储选中状态
+        self.selected_arm = 1
+        self.selected_hand = 0
+        self._refresh_target_visibility()
+
         # 表格
         self.table = QTableWidget()
         self.table.setColumnCount(2)
@@ -573,6 +681,61 @@ class AutoKinematicsWindow(QWidget):
         ts = datetime.now().strftime("%H:%M:%S")
         self.log_edit.appendPlainText(f"[{ts}] {msg}")
 
+    # ---------- 目标选择辅助 ----------
+    def _target_btn_css(self, selected: bool = False) -> str:
+        if selected:
+            return f"background: {C['indigo']}; color: white; border: none; border-radius: 4px; padding: 4px 10px; font-size: 8pt;"
+        else:
+            return f"background: {C['card']}; color: {C['slate_md']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 4px 10px; font-size: 8pt;"
+
+    def _select_arm_target(self, arm_id: int):
+        self.selected_arm = arm_id
+        for i, btn in enumerate(self.arm_target_btns):
+            btn.setChecked(i + 1 == arm_id)
+            btn.setStyleSheet(self._target_btn_css(i + 1 == arm_id))
+
+    def _select_hand_target(self, hand: int):
+        self.selected_hand = hand
+        for i, btn in enumerate(self.hand_target_btns):
+            btn.setChecked(i == hand)
+            btn.setStyleSheet(self._target_btn_css(i == hand))
+
+    def _refresh_target_visibility(self):
+        """根据当前模式显示对应目标选择器"""
+        if not hasattr(self, 'arm_target_btns'):
+            return
+        show_arm = (self.mode == 1)
+        show_hand = (self.mode == 0)
+        self.target_label.setText("执行于:" if show_arm else "手:")
+        for btn in self.arm_target_btns:
+            btn.setVisible(show_arm)
+        for btn in self.hand_target_btns:
+            btn.setVisible(show_hand)
+
+    # ---------- 模式切换 ----------
+    def _style_mode_buttons(self):
+        """更新模式按钮样式"""
+        active = f"background: {C['indigo']}; color: white; border: 1px solid {C['indigo']}; border-radius: 4px; padding: 4px 10px; font-size: 8pt;"
+        inactive = f"background: {C['card']}; color: {C['slate_md']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 4px 10px; font-size: 8pt;"
+        self.mode_btn_master.setStyleSheet(active if self.mode == 0 else inactive)
+        self.mode_btn_slave.setStyleSheet(active if self.mode == 1 else inactive)
+
+    def _set_mode(self, mode: int):
+        """切换主手/从手模式"""
+        self.mode = mode
+        self.mode_btn_master.setChecked(mode == 0)
+        self.mode_btn_slave.setChecked(mode == 1)
+        self._style_mode_buttons()
+
+        # 主手隐藏摆位卡片，从手显示
+        if hasattr(self, 'pos_card'):
+            self.pos_card.setVisible(mode == 1)
+
+        self._refresh_target_visibility()
+        self._update_exec_btn()
+        mode_name = "主手" if mode == 0 else "从手"
+        self._log(f"切换至{mode_name}模式")
+
     # ---------- 连接管理 ----------
     def _update_ui_state(self):
         for i, btn in enumerate(self.pos_btns):
@@ -581,7 +744,12 @@ class AutoKinematicsWindow(QWidget):
         self._update_exec_btn()
 
     def _update_exec_btn(self):
-        self.exec_btn.setEnabled(self.connected and len(self.waypoints) > 0)
+        has_data = len(self.waypoints) > 0
+        self.exec_btn.setEnabled(self.connected and has_data)
+        if self.mode == 0:
+            self.exec_btn.setText("▶  MtmMoveP 执行")
+        else:
+            self.exec_btn.setText("▶  MoveAbs 执行")
 
     def _do_connect(self):
         if self.connected:
@@ -647,13 +815,15 @@ class AutoKinematicsWindow(QWidget):
 
     # ---------- 连接初始化 ----------
     def _send_connect_init(self):
-        """连接成功后发送{Stop} {Start} 间隔0.5s"""
+        """连接成功后发送初始化指令"""
         def task():
-            self._log("连接初始化: {Stop}")
-            self.ssh.exec_command("{Stop}")
+            stop_cmd = "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=0||PushStatus --mode_id=1 --motion_cmd=0||PushStatus --mode_id=2 --motion_cmd=0||PushStatus --mode_id=3 --motion_cmd=0||PushStatus --mode_id=4 --motion_cmd=0}"
+            start_cmd = "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=100||PushStatus --mode_id=1 --motion_cmd=100||PushStatus --mode_id=2 --motion_cmd=100||PushStatus --mode_id=3 --motion_cmd=100||PushStatus --mode_id=4 --motion_cmd=100}"
+            self._log("连接初始化: PushStatus stop")
+            self.ssh.exec_command(stop_cmd)
             threading.Event().wait(0.5)
-            self._log("连接初始化: {Start}")
-            self.ssh.exec_command("{Start}")
+            self._log("连接初始化: PushStatus start")
+            self.ssh.exec_command(start_cmd)
             self._log("连接初始化完成")
         threading.Thread(target=task, daemon=True).start()
 
@@ -711,13 +881,10 @@ class AutoKinematicsWindow(QWidget):
             # Stop
             self._log(f"[释放] {release_cmds[0]}")
             self.ssh.exec_command(release_cmds[0])
-            threading.Event().wait(0.1)  # 100ms
+            threading.Event().wait(0.5)  # 100ms
             # Start
             self._log(f"[释放] {release_cmds[1]}")
             self.ssh.exec_command(release_cmds[1])
-            # URecover
-            self._log(f"[释放] {release_cmds[2]}")
-            self.ssh.exec_command(release_cmds[2])
 
             self.signal_auto_pos_done.emit(arm_id)
 
@@ -796,6 +963,12 @@ class AutoKinematicsWindow(QWidget):
         if self.table.rowCount() > 0:
             self.table.selectRow(0)
 
+    def _get_selected_arm(self) -> int:
+        return self.selected_arm
+
+    def _get_selected_hand(self) -> int:
+        return self.selected_hand
+
     def _execute_waypoint(self):
         if not self.connected:
             QMessageBox.warning(self, "警告", "请先连接远程服务器")
@@ -819,13 +992,19 @@ class AutoKinematicsWindow(QWidget):
         self.exec_btn.setText("执行中...")
 
         def task():
-            command = f"ExecTraj --wp={wp_name}"
-            self._log(f"执行命令: {command}")
-            stdout, stderr = self.ssh.exec_command(command)
-            if stdout:
-                self._log(f"输出: {stdout}")
-            if stderr:
-                self._log(f"错误: {stderr}")
+            if self.mode == 0:
+                hand = self._get_selected_hand()
+                cmd = _build_master_exec_cmd(wp_name, hand)
+                self._log(f"执行 ({'左手' if hand==0 else '右手'}): {cmd}")
+                self.ssh.exec_command(cmd)
+            else:
+                arm_id = self._get_selected_arm()
+                cmds = _build_slave_exec_cmds(arm_id, wp_name)
+                for i, cmd in enumerate(cmds, 1):
+                    self._log(f"[{i}/7] {cmd}")
+                    self.ssh.exec_command(cmd)
+                    threading.Event().wait(0.05)
+
             self.signal_exec_done.emit()
 
         threading.Thread(target=task, daemon=True).start()
