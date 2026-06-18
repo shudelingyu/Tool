@@ -2109,9 +2109,21 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.save_btn)
 
         left_layout.addStretch()
+
+        # logo（与 launcher 风格一致）
+        logo_label = QLabel("Made with TC❤️")
+        logo_label.setAlignment(Qt.AlignCenter)
+        logo_label.setStyleSheet("color: #9ca3af; font-size: 8pt; padding: 4px 0px;")
+        left_layout.addWidget(logo_label)
+
         main_layout.addWidget(left_panel)
 
-        # ========== 右侧绘图区域 (QTabWidget) ==========
+        # ========== 右侧绘图区域 ==========
+        right_container = QWidget()
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(2)
+
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(True)
         self.tab_widget.tabCloseRequested.connect(self.close_tab)
@@ -2174,7 +2186,9 @@ class MainWindow(QMainWindow):
         self.default_tab = PlotTab(self, "绘图1")
         self.tab_widget.addTab(self.default_tab, "绘图1")
         self.tab_widget.currentChanged.connect(self._on_plot_tab_changed)
-        main_layout.addWidget(self.tab_widget, stretch=1)
+        right_layout.addWidget(self.tab_widget, stretch=1)
+
+        main_layout.addWidget(right_container, stretch=1)
 
     # ========== 标签页管理 ==========
     def new_plot_tab(self):
@@ -2567,6 +2581,7 @@ class MainWindow(QMainWindow):
                 var_item.setText(0, var)
             child = QTreeWidgetItem(var_item)
             child.setText(0, var_full)
+            child.setData(0, Qt.UserRole, col)  # 存储完整 key，拖拽时匹配 y_buffers
             child.setToolTip(0, var_full)
 
     def update_plots_from_buffer(self):
