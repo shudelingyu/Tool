@@ -52,10 +52,10 @@ ARM_COLORS = [
 # 指令格式: {model0||model1||Boom||从臂1||从臂2||从臂3||从臂4}
 # 主手格式: {左手||右手}
 ARM_CFG = {
-    1: {"pos": 4, "num": 8},
-    2: {"pos": 5, "num": 8},
-    3: {"pos": 6, "num": 8},
-    4: {"pos": 7, "num": 8},
+    1: {"pos": 3, "num": 8},
+    2: {"pos": 4, "num": 8},
+    3: {"pos": 5, "num": 8},
+    4: {"pos": 6, "num": 8},
 }
 
 # 从臂执行路点的7条指令模板
@@ -64,7 +64,7 @@ SLAVE_EXEC_TEMPLATE = [
     "Mode",
     "UEnable --begin_motion_id=0 --num={num}",
     "URecover",
-    "MoveAbs --wp={wp}",
+    "MoveAbs --wp={{{wp}}}",
     "URecover",
     "UDisable --begin_motion_id=0 --num={num}",
 ]
@@ -129,22 +129,24 @@ def _build_release_cmds() -> List[str]:
     return [all_stop, all_start]
 
 
-def _build_slave_exec_cmds(arm_id: int, wp_name: str) -> List[str]:
-    """构建从手执行路点的7条指令"""
+def _build_slave_exec_cmds(arm_id: int, angles: List[float]) -> List[str]:
+    """构建从手执行路点的7条指令，angles为关节角度列表"""
     num = ARM_CFG[arm_id]["num"]
+    angle_str = ",".join(f"{a:.4f}" for a in angles)
     cmds = []
     for template in SLAVE_EXEC_TEMPLATE:
-        cmd = template.format(num=num, wp=wp_name)
+        cmd = template.format(num=num, wp=angle_str)
         cmds.append(_slot_cmd(arm_id, cmd))
     return cmds
 
 
-def _build_master_exec_cmd(wp_name: str, hand: int = 0) -> str:
-    """构建主手执行路点的单条指令  hand=0左, 1右"""
+def _build_master_exec_cmd(angles: List[float], hand: int = 0) -> str:
+    """构建主手执行路点的单条指令  hand=0左, 1右, angles为关节角度列表"""
+    angle_str = "{" + ",".join(f"{a:.4f}" for a in angles) + "}"
     if hand == 0:
-        return f"{{MtmMoveP --wp={wp_name}||Idle}}"
+        return f"{{MtmMoveP --wp={angle_str}||Idle}}"
     else:
-        return f"{{Idle||MtmMoveP --wp={wp_name}}}"
+        return f"{{Idle||MtmMoveP --wp={angle_str}}}"
 
 # ==================== 全局样式表 ====================
 STYLESHEET = f"""
@@ -255,6 +257,25 @@ QHeaderView::section {{
     padding: 6px; selection-background-color: {C['indigo_lt']};
 }}
 """
+
+
+# ==================== 摆位按钮组件 ====================
+class PosButton(QPushButton):
+    """自定义按钮，精确控制鼠标按下/松开事件"""
+    press_arm = pyqtSignal(int)
+    release_arm = pyqtSignal(int)
+
+    def __init__(self, arm_id, parent=None):
+        super().__init__(parent)
+        self._arm_id = arm_id
+
+    def mousePressEvent(self, event):
+        self.press_arm.emit(self._arm_id)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.release_arm.emit(self._arm_id)
+        super().mouseReleaseEvent(event)
 
 
 # ==================== 卡片组件 ====================
@@ -539,13 +560,13 @@ class AutoKinematicsWindow(QWidget):
         self.pos_btns = []
         for i in range(4):
             ac = ARM_COLORS[i]
-            btn = QPushButton()
+            btn = PosButton(i + 1)
             btn.setMinimumSize(0, 90)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setStyleSheet(self._pos_css(i, enabled=False))
             btn.setEnabled(False)
-            btn.pressed.connect(lambda a=i+1: self._start_auto_position(a))
-            btn.released.connect(lambda a=i+1: self._stop_auto_position(a))
+            btn.press_arm.connect(self._start_auto_position)
+            btn.release_arm.connect(self._stop_auto_position)
 
             # 按钮内用垂直布局排列图标+文字
             bl = QVBoxLayout()
@@ -554,10 +575,12 @@ class AutoKinematicsWindow(QWidget):
             bl.addStretch()
             icon = QLabel(ac["icon"])
             icon.setAlignment(Qt.AlignCenter)
+            icon.setAttribute(Qt.WA_TransparentForMouseEvents)
             icon.setStyleSheet("font-size: 22px; color: white; background: transparent;")
             bl.addWidget(icon)
             txt = QLabel(f"从臂{i+1}\n自动摆位")
             txt.setAlignment(Qt.AlignCenter)
+            txt.setAttribute(Qt.WA_TransparentForMouseEvents)
             txt.setStyleSheet("color: white; font-size: 10pt; font-weight: bold; background: transparent;")
             bl.addWidget(txt)
             bl.addStretch()
@@ -817,12 +840,12 @@ class AutoKinematicsWindow(QWidget):
     def _send_connect_init(self):
         """连接成功后发送初始化指令"""
         def task():
-            stop_cmd = "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=0||PushStatus --mode_id=1 --motion_cmd=0||PushStatus --mode_id=2 --motion_cmd=0||PushStatus --mode_id=3 --motion_cmd=0||PushStatus --mode_id=4 --motion_cmd=0}"
-            start_cmd = "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=100||PushStatus --mode_id=1 --motion_cmd=100||PushStatus --mode_id=2 --motion_cmd=100||PushStatus --mode_id=3 --motion_cmd=100||PushStatus --mode_id=4 --motion_cmd=100}"
-            self._log("连接初始化: PushStatus stop")
+            stop_cmd = "{Stop}"
+            start_cmd = "{Strat}"
+            self._log("连接初始化:  stop")
             self.ssh.exec_command(stop_cmd)
             threading.Event().wait(0.5)
-            self._log("连接初始化: PushStatus start")
+            self._log("连接初始化:  start")
             self.ssh.exec_command(start_cmd)
             self._log("连接初始化完成")
         threading.Thread(target=task, daemon=True).start()
@@ -831,7 +854,6 @@ class AutoKinematicsWindow(QWidget):
     def _set_pos_label(self, arm_id: int, text: str, busy: bool = False):
         """更新摆位按钮文字和样式"""
         btn = self.pos_btns[arm_id - 1]
-        btn.setEnabled(self.connected and not busy)
         btn.setStyleSheet(self._pos_css(arm_id - 1, enabled=not busy, busy=busy))
         for child in btn.findChildren(QLabel):
             if "从臂" in child.text() or "执行" in child.text():
@@ -994,12 +1016,12 @@ class AutoKinematicsWindow(QWidget):
         def task():
             if self.mode == 0:
                 hand = self._get_selected_hand()
-                cmd = _build_master_exec_cmd(wp_name, hand)
+                cmd = _build_master_exec_cmd(angles, hand)
                 self._log(f"执行 ({'左手' if hand==0 else '右手'}): {cmd}")
                 self.ssh.exec_command(cmd)
             else:
                 arm_id = self._get_selected_arm()
-                cmds = _build_slave_exec_cmds(arm_id, wp_name)
+                cmds = _build_slave_exec_cmds(arm_id, angles)
                 for i, cmd in enumerate(cmds, 1):
                     self._log(f"[{i}/7] {cmd}")
                     self.ssh.exec_command(cmd)
