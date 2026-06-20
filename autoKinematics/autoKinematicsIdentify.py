@@ -9,7 +9,8 @@
 
 import os
 import threading
-import paramiko
+import socket
+import struct
 from datetime import datetime
 from typing import Optional, List, Tuple
 
@@ -64,7 +65,7 @@ SLAVE_EXEC_TEMPLATE = [
     "Mode",
     "UEnable --begin_motion_id=0 --num={num}",
     "URecover",
-    "MoveAbs --wp={{{wp}}}",
+    "MoveAbsolute --num={num} --pos={{{wp}}}",
     "URecover",
     "UDisable --begin_motion_id=0 --num={num}",
 ]
@@ -79,16 +80,16 @@ def _slot_cmd(arm_id: int, cmd: str) -> str:
 
 # ==================== 自动摆位命令配置 ====================
 ARM_CFG_AUTOPOS = {
-    1: {"pos": 2, "num": 4, "type": "ARM1IDENTIFY"},
-    2: {"pos": 3, "num": 8, "type": "ARM2IDENTIFY"},
-    3: {"pos": 4, "num": 8, "type": "ARM3IDENTIFY"},
-    4: {"pos": 5, "num": 8, "type": "ARM4IDENTIFY"},
+    1: {"pos": 2, "type": "DRAPING"},
+    2: {"pos": 3, "type": "ARM2IDENTIFY"},
+    3: {"pos": 4, "type": "ARM3IDENTIFY"},
+    4: {"pos": 5, "type": "ARM4IDENTIFY"},
 }
 
 def _build_press_cmds(arm_id: int) -> List[str]:
     """构建按住时下发的8条指令"""
     cfg = ARM_CFG_AUTOPOS[arm_id]
-    pos, num, ptype = cfg["pos"], cfg["num"], cfg["type"]
+    pos, ptype = cfg["pos"], cfg["type"]
 
     def _all(cmd: str) -> str:
         """所有臂位置(2-6)设为相同命令"""
@@ -98,11 +99,11 @@ def _build_press_cmds(arm_id: int) -> List[str]:
     cmds.append(_all("URecover"))                                    # 1
     cmds.append(_all("Mode"))                                        # 2
     cmds.append(                                                      # 3
-        f"{{Idle||Idle||UEnable --begin_motion_id=0 --num={num}"
-        f"||UEnable --begin_motion_id=0 --num={num}"
-        f"||UEnable --begin_motion_id=0 --num={num}"
-        f"||UEnable --begin_motion_id=0 --num={num}"
-        f"||UEnable --begin_motion_id=0 --num={num}}}"
+        f"{{Idle||Idle||UEnable --begin_motion_id=0 --num=4"
+        f"||UEnable --begin_motion_id=0 --num=8"
+        f"||UEnable --begin_motion_id=0 --num=8"
+        f"||UEnable --begin_motion_id=0 --num=8"
+        f"||UEnable --begin_motion_id=0 --num=8}}"
     )
     cmds.append(_all("URecover"))                                    # 4
     # 5: 仅选中臂做规划，其余 UEmpty
@@ -113,11 +114,11 @@ def _build_press_cmds(arm_id: int) -> List[str]:
     cmds.append(_all("AutoPositionRunning"))                          # 6
     cmds.append(_all("URecover"))                                    # 7
     cmds.append(                                                      # 8
-        f"{{Idle||Idle||UDisable --begin_motion_id=0 --num={num}"
-        f"||UDisable --begin_motion_id=0 --num={num}"
-        f"||UDisable --begin_motion_id=0 --num={num}"
-        f"||UDisable --begin_motion_id=0 --num={num}"
-        f"||UDisable --begin_motion_id=0 --num={num}}}"
+        f"{{Idle||Idle||UDisable --begin_motion_id=0 --num=4"
+        f"||UDisable --begin_motion_id=0 --num=8"
+        f"||UDisable --begin_motion_id=0 --num=8"
+        f"||UDisable --begin_motion_id=0 --num=8"
+        f"||UDisable --begin_motion_id=0 --num=8}}"
     )
     return cmds
 
@@ -144,9 +145,9 @@ def _build_master_exec_cmd(angles: List[float], hand: int = 0) -> str:
     """构建主手执行路点的单条指令  hand=0左, 1右, angles为关节角度列表"""
     angle_str = "{" + ",".join(f"{a:.4f}" for a in angles) + "}"
     if hand == 0:
-        return f"{{MtmMoveP --wp={angle_str}||Idle}}"
+        return f"{{MtmMoveP --pos={angle_str}||Idle}}"
     else:
-        return f"{{Idle||MtmMoveP --wp={angle_str}}}"
+        return f"{{Idle||MtmMoveP --pos={angle_str}}}"
 
 # ==================== 全局样式表 ====================
 STYLESHEET = f"""
@@ -309,12 +310,12 @@ class Card(QFrame):
         self._content.addWidget(widget)
 
 
-# ==================== SSH客户端 ====================
-class SSHClient:
-    """SSH远程连接客户端"""
+# ==================== TCP客户端 ====================
+class TcpClient:
+    """TCP 套接字连接客户端（仿 InstTool.py）"""
 
     def __init__(self, log_callback=None):
-        self.client: Optional[paramiko.SSHClient] = None
+        self.sock: Optional[socket.socket] = None
         self.log_callback = log_callback
         self.connected = False
 
@@ -322,48 +323,54 @@ class SSHClient:
         if self.log_callback:
             self.log_callback(msg)
 
-    def connect(self, host: str, port: int, username: str, password: str) -> bool:
+    def connect(self, host: str, port: int) -> bool:
         try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(hostname=host, port=port,
-                           username=username, password=password, timeout=5)
-            self.client = client
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((host, port))
+            self.sock = sock
             self.connected = True
-            self._log(f"SSH连接成功 {host}:{port}")
+            self._log(f"TCP连接成功 {host}:{port}")
             return True
-        except paramiko.AuthenticationException:
-            self._log("认证失败：用户名或密码错误")
+        except socket.timeout:
+            self._log("连接超时")
             return False
-        except paramiko.SSHException as e:
-            self._log(f"SSH连接异常: {e}")
+        except ConnectionRefusedError:
+            self._log("连接被拒绝")
             return False
         except Exception as e:
             self._log(f"连接失败: {type(e).__name__}: {e}")
             return False
 
-    def exec_command(self, command: str, timeout: int = 30) -> Tuple[str, str]:
-        if not self.client or not self.connected:
-            return "", "SSH未连接"
+    @staticmethod
+    def _encode_message(data: str) -> bytes:
+        """按 InstTool 协议格式编码: 4字节长度 + 36字节填充 + 数据"""
+        data_bytes = data.encode("utf-8")
+        head = struct.pack("<I", len(data_bytes))
+        pad = bytes([0] * 36)
+        return head + pad + data_bytes
+
+    def send(self, data: str) -> Tuple[str, str]:
+        if not self.sock or not self.connected:
+            return "", "未连接"
         try:
-            stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
-            out = stdout.read().decode('utf-8', errors='ignore').strip()
-            err = stderr.read().decode('utf-8', errors='ignore').strip()
-            return out, err
-        except Exception as e:
-            err_msg = f"命令执行失败: {type(e).__name__}: {e}"
+            msg = self._encode_message(data)
+            self.sock.sendall(msg)
+            return data, ""
+        except (socket.timeout, ConnectionError, OSError) as e:
+            err_msg = f"发送失败: {type(e).__name__}: {e}"
             self._log(err_msg)
             return "", err_msg
 
     def disconnect(self):
-        if self.client:
+        if self.sock:
             try:
-                self.client.close()
+                self.sock.close()
             except Exception:
                 pass
-            self.client = None
+            self.sock = None
         self.connected = False
-        self._log("SSH连接已断开")
+        self._log("TCP连接已断开")
 
 
 # ==================== 主窗口 ====================
@@ -383,8 +390,8 @@ class AutoKinematicsWindow(QWidget):
         self.resize(1000, 760)
         self._center()
 
-        # SSH
-        self.ssh = SSHClient(log_callback=self._log)
+        # TCP
+        self.tcp = TcpClient(log_callback=self._log)
         self.connected = False
         self.waypoints: List[Tuple[str, List[float]]] = []
 
@@ -484,21 +491,10 @@ class AutoKinematicsWindow(QWidget):
         row.addWidget(self._labeled_widget("主机IP", self.ip_edit))
         row.addSpacing(2)
 
-        self.port_edit = QLineEdit("7788")
+        self.port_edit = QLineEdit("7866")
         self.port_edit.setFixedWidth(70)
         self.port_edit.setFont(QFont("Consolas", 9))
         row.addWidget(self._labeled_widget("端口", self.port_edit))
-        row.addSpacing(8)
-
-        self.user_edit = QLineEdit("codeit")
-        self.user_edit.setFixedWidth(120)
-        row.addWidget(self._labeled_widget("用户名", self.user_edit))
-        row.addSpacing(2)
-
-        self.pwd_edit = QLineEdit("1")
-        self.pwd_edit.setEchoMode(QLineEdit.Password)
-        self.pwd_edit.setFixedWidth(120)
-        row.addWidget(self._labeled_widget("密码", self.pwd_edit))
         row.addSpacing(10)
 
         self.connect_btn = QPushButton("🔗 连接")
@@ -770,37 +766,32 @@ class AutoKinematicsWindow(QWidget):
         has_data = len(self.waypoints) > 0
         self.exec_btn.setEnabled(self.connected and has_data)
         if self.mode == 0:
-            self.exec_btn.setText("▶  MtmMoveP 执行")
+            self.exec_btn.setText("▶ MtmMoveP执行")
         else:
-            self.exec_btn.setText("▶  MoveAbs 执行")
+            self.exec_btn.setText("▶ MoveAbs执行")
 
     def _do_connect(self):
         if self.connected:
-            self.ssh.disconnect()
+            self.tcp.disconnect()
             self.connected = False
             self.connect_btn.setText("🔗 连接")
             self.status_light.setStyleSheet(f"background: #CBD5E1; border-radius: 7px;")
             self.status_label.setText("未连接")
             self.status_label.setStyleSheet(f"color: {C['slate_lt']};")
             self._update_ui_state()
-            self._log("已断开SSH连接")
+            self._log("已断开连接")
             return
 
         ip = self.ip_edit.text().strip()
         port_str = self.port_edit.text().strip()
-        username = self.user_edit.text().strip()
-        password = self.pwd_edit.text()
 
         if not ip:
             QMessageBox.warning(self, "错误", "请输入IP地址")
             return
         try:
-            port = int(port_str) if port_str else 22
+            port = int(port_str) if port_str else 5866
         except ValueError:
             QMessageBox.warning(self, "错误", "端口号必须为数字")
-            return
-        if not username or not password:
-            QMessageBox.warning(self, "错误", "请完整填写用户名和密码")
             return
 
         self.connect_btn.setEnabled(False)
@@ -811,7 +802,7 @@ class AutoKinematicsWindow(QWidget):
         self._log(f"正在连接 {ip}:{port} ...")
 
         def task():
-            success = self.ssh.connect(ip, port, username, password)
+            success = self.tcp.connect(ip, port)
             self.signal_connect_result.emit(success)
 
         threading.Thread(target=task, daemon=True).start()
@@ -838,16 +829,35 @@ class AutoKinematicsWindow(QWidget):
 
     # ---------- 连接初始化 ----------
     def _send_connect_init(self):
-        """连接成功后发送初始化指令"""
+        """根据主从模式发送初始化指令"""
+        SLAVE_INIT = [
+            "{Clear}",
+            "{Mode}",
+            "{SetMaxToq}",
+            "{URecover}",
+            "{Idle||Idle||Enable||Enable||Enable||Enable||Enable}",
+            "{PsmSetPosExe --begin_motion_id=0 --num=4}",
+            "{Clear}",
+            "{URecover}",
+        ]
+        MASTER_INIT = [
+            "{Clear}",
+            "{Mode}",
+            "{SetMaxToq}",
+            "{URecover}",
+            "{Enable}",
+            "{MtmSetPos}",
+            "{MtmMoveP}",
+        ]
+
         def task():
-            stop_cmd = "{Stop}"
-            start_cmd = "{Strat}"
-            self._log("连接初始化:  stop")
-            self.ssh.exec_command(stop_cmd)
-            threading.Event().wait(0.5)
-            self._log("连接初始化:  start")
-            self.ssh.exec_command(start_cmd)
-            self._log("连接初始化完成")
+            cmds = SLAVE_INIT if self.mode == 1 else MASTER_INIT
+            for i, cmd in enumerate(cmds, 1):
+                self._log(f"初始化 [{i}/{len(cmds)}] {cmd}")
+                self.tcp.send(cmd)
+                threading.Event().wait(0.1)
+            self._log("初始化完成")
+
         threading.Thread(target=task, daemon=True).start()
 
     # ---------- 自动摆位（按下/松开） ----------
@@ -882,7 +892,7 @@ class AutoKinematicsWindow(QWidget):
                         self._log(f"从臂{arm_id} 序列已中断（第{i+1}条）")
                         return
                 self._log(f"[{i+1}/8] {cmd}")
-                stdout, stderr = self.ssh.exec_command(cmd)
+                stdout, stderr = self.tcp.send(cmd)
                 if stderr:
                     self._log(f"  错误: {stderr}")
                 threading.Event().wait(0.05)  # 50ms 间隔
@@ -902,11 +912,11 @@ class AutoKinematicsWindow(QWidget):
             release_cmds = _build_release_cmds()
             # Stop
             self._log(f"[释放] {release_cmds[0]}")
-            self.ssh.exec_command(release_cmds[0])
+            self.tcp.send(release_cmds[0])
             threading.Event().wait(0.5)  # 100ms
             # Start
             self._log(f"[释放] {release_cmds[1]}")
-            self.ssh.exec_command(release_cmds[1])
+            self.tcp.send(release_cmds[1])
 
             self.signal_auto_pos_done.emit(arm_id)
 
@@ -940,22 +950,28 @@ class AutoKinematicsWindow(QWidget):
         waypoints = []
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#') or line.startswith('//'):
-                        continue
-                    parts = line.split()
-                    if len(parts) < 2:
-                        continue
-                    name = parts[0]
-                    angles = []
-                    for val in parts[1:]:
-                        try:
-                            angles.append(float(val))
-                        except ValueError:
-                            break
-                    if angles:
-                        waypoints.append((name, angles))
+                lines = f.readlines()
+
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                # 跳过表头行（包含 J1,J2 等列名）
+                if i == 0 and ('J1' in line or 'name' in line.lower()):
+                    continue
+                # 按 Tab 切分
+                parts = line.split('\t')
+                if len(parts) < 2:
+                    continue
+                name = parts[0].rstrip(':')
+                angles = []
+                for val in parts[1:]:
+                    try:
+                        angles.append(float(val))
+                    except ValueError:
+                        break
+                if angles:
+                    waypoints.append((name, angles))
         except Exception as e:
             return [(f"错误: {e}", [])]
         return waypoints
@@ -1018,13 +1034,13 @@ class AutoKinematicsWindow(QWidget):
                 hand = self._get_selected_hand()
                 cmd = _build_master_exec_cmd(angles, hand)
                 self._log(f"执行 ({'左手' if hand==0 else '右手'}): {cmd}")
-                self.ssh.exec_command(cmd)
+                self.tcp.send(cmd)
             else:
                 arm_id = self._get_selected_arm()
                 cmds = _build_slave_exec_cmds(arm_id, angles)
                 for i, cmd in enumerate(cmds, 1):
                     self._log(f"[{i}/7] {cmd}")
-                    self.ssh.exec_command(cmd)
+                    self.tcp.send(cmd)
                     threading.Event().wait(0.05)
 
             self.signal_exec_done.emit()
@@ -1032,14 +1048,14 @@ class AutoKinematicsWindow(QWidget):
         threading.Thread(target=task, daemon=True).start()
 
     def _on_exec_done(self):
-        self.exec_btn.setText("▶  执行路点")
+        self.exec_btn.setText("▶执行路点")
         self._update_exec_btn()
         self._log("路点执行完成")
 
     # ---------- 退出 ----------
     def closeEvent(self, event):
         if self.connected:
-            self.ssh.disconnect()
+            self.tcp.disconnect()
         super().closeEvent(event)
 
 
