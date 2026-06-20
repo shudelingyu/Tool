@@ -81,7 +81,7 @@ def _slot_cmd(arm_id: int, cmd: str) -> str:
 # ==================== 自动摆位命令配置 ====================
 ARM_CFG_AUTOPOS = {
     1: {"pos": 2, "type": "DRAPING"},
-    2: {"pos": 3, "type": "ARM2IDENTIFY"},
+    2: {"pos": 3, "type": "WHOLE_STOWING"},
     3: {"pos": 4, "type": "ARM3IDENTIFY"},
     4: {"pos": 5, "type": "ARM4IDENTIFY"},
 }
@@ -352,6 +352,18 @@ class TcpClient:
         pad = bytes([0] * 36)
         return head + pad + data_bytes
 
+    @staticmethod
+    def _decode_message(buf: bytes) -> Tuple[Optional[str], bytes]:
+        """尝试从缓冲区解析一条协议消息，返回 (消息内容, 剩余数据)"""
+        if len(buf) < 40:
+            return None, buf
+        data_len = struct.unpack("<I", buf[:4])[0]
+        if len(buf) < 40 + data_len:
+            return None, buf
+        payload = buf[40:40 + data_len]
+        text = payload.decode("utf-8", errors="replace").strip("\x00").strip()
+        return text, buf[40 + data_len:]
+
     def send(self, data: str) -> Tuple[str, str]:
         if not self.sock or not self.connected:
             return "", "未连接"
@@ -361,6 +373,41 @@ class TcpClient:
             return data, ""
         except (socket.timeout, ConnectionError, OSError) as e:
             err_msg = f"发送失败: {type(e).__name__}: {e}"
+            self._log(err_msg)
+            return "", err_msg
+
+    def send_and_recv(self, data: str, timeout: float = 3.0, expected: int = 0) -> Tuple[str, str]:
+        """发送指令并等待全部 model 回复，返回 (全部回复, 错误信息)
+           expected: 期望回复条数，0 自动根据 || 数量推断"""
+        if not self.sock or not self.connected:
+            return "", "未连接"
+
+        if expected <= 0:
+            expected = data.count("||") + 1
+
+        try:
+            self.sock.sendall(self._encode_message(data))
+            self.sock.settimeout(timeout)
+            buf = b""
+            replies = []
+            while len(replies) < expected:
+                try:
+                    chunk = self.sock.recv(4096)
+                except socket.timeout:
+                    return "\n".join(replies), f"超时 (已收 {len(replies)}/{expected})"
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    msg, buf = self._decode_message(buf)
+                    if msg is None:
+                        break
+                    replies.append(msg)
+                if len(buf) > 1_000_000:
+                    return "\n".join(replies), "响应过大"
+            return "\n".join(replies), ""
+        except (ConnectionError, OSError) as e:
+            err_msg = f"接收失败: {type(e).__name__}: {e}"
             self._log(err_msg)
             return "", err_msg
 
@@ -876,10 +923,15 @@ class AutoKinematicsWindow(QWidget):
 
         def task():
             cmds = SLAVE_INIT if self.mode == 1 else MASTER_INIT
+            expected = 7 if self.mode == 1 else 2
             for i, cmd in enumerate(cmds, 1):
-                self._log(f"初始化 [{i}/{len(cmds)}] {cmd}")
-                self.tcp.send(cmd)
-                threading.Event().wait(0.1)
+                self._log(f"初始化 [{i}/{len(cmds)}] 发送: {cmd}")
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0, expected=expected)
+                if resp:
+                    for line in resp.split("\n"):
+                        self._log(f"  <- {line}")
+                if err:
+                    self._log(f"  -> {err}")
             self._log("初始化完成")
 
         threading.Thread(target=task, daemon=True).start()
@@ -915,11 +967,13 @@ class AutoKinematicsWindow(QWidget):
                     if not self.pos_running[arm_id]:
                         self._log(f"从臂{arm_id} 序列已中断（第{i+1}条）")
                         return
-                self._log(f"[{i+1}/8] {cmd}")
-                stdout, stderr = self.tcp.send(cmd)
-                if stderr:
-                    self._log(f"  错误: {stderr}")
-                threading.Event().wait(0.05)  # 50ms 间隔
+                self._log(f"[{i+1}/8] 发送: {cmd}")
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0)
+                if resp:
+                    for line in resp.split("\n"):
+                        self._log(f"  <- {line}")
+                if err:
+                    self._log(f"  -> {err}")
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -934,13 +988,14 @@ class AutoKinematicsWindow(QWidget):
 
         def task():
             release_cmds = _build_release_cmds()
-            # Stop
-            self._log(f"[释放] {release_cmds[0]}")
-            self.tcp.send(release_cmds[0])
-            threading.Event().wait(0.5)  # 100ms
-            # Start
-            self._log(f"[释放] {release_cmds[1]}")
-            self.tcp.send(release_cmds[1])
+            for cmd in release_cmds:
+                self._log(f"[释放] 发送: {cmd}")
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0)
+                if resp:
+                    for line in resp.split("\n"):
+                        self._log(f"  <- {line}")
+                if err:
+                    self._log(f"  -> {err}")
 
             self.signal_auto_pos_done.emit(arm_id)
 
@@ -1058,14 +1113,23 @@ class AutoKinematicsWindow(QWidget):
                 hand = self._get_selected_hand()
                 cmd = _build_master_exec_cmd(angles, hand)
                 self._log(f"执行 ({'左手' if hand==0 else '右手'}): {cmd}")
-                self.tcp.send(cmd)
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0)
+                if resp:
+                    for line in resp.split("\n"):
+                        self._log(f"  <- {line}")
+                if err:
+                    self._log(f"  -> {err}")
             else:
                 arm_id = self._get_selected_arm()
                 cmds = _build_slave_exec_cmds(arm_id, angles)
                 for i, cmd in enumerate(cmds, 1):
-                    self._log(f"[{i}/7] {cmd}")
-                    self.tcp.send(cmd)
-                    threading.Event().wait(0.05)
+                    self._log(f"[{i}/7] 发送: {cmd}")
+                    resp, err = self.tcp.send_and_recv(cmd, timeout=500.0)
+                    if resp:
+                        for line in resp.split("\n"):
+                            self._log(f"  <- {line}")
+                    if err:
+                        self._log(f"  -> {err}")
 
             self.signal_exec_done.emit()
 
@@ -1084,11 +1148,14 @@ class AutoKinematicsWindow(QWidget):
         self._log("🛑 急停触发")
 
         def task():
-            self._log("发送: {Stop}")
-            self.tcp.send("{Stop}")
-            threading.Event().wait(0.5)
-            self._log("发送: {Start}")
-            self.tcp.send("{Start}")
+            for cmd in ["{Stop}", "{Start}"]:
+                self._log(f"急停 发送: {cmd}")
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0, expected=7)
+                if resp:
+                    for line in resp.split("\n"):
+                        self._log(f"  <- {line}")
+                if err:
+                    self._log(f"  -> {err}")
             self._log("急停完成")
 
         threading.Thread(target=task, daemon=True).start()
