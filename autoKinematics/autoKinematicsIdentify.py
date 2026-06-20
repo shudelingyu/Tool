@@ -113,6 +113,8 @@ def _build_press_cmds(arm_id: int) -> List[str]:
     cmds.append("{" + "||".join(parts) + "}")
     cmds.append(_all("AutoPositionRunning"))                          # 6
     cmds.append(_all("URecover"))                                    # 7
+    cmds.append(_all("CommonPositionRunning"))
+    cmds.append(_all("URecover"))                                    # 7
     cmds.append(                                                      # 8
         f"{{Idle||Idle||UDisable --begin_motion_id=0 --num=4"
         f"||UDisable --begin_motion_id=0 --num=8"
@@ -126,7 +128,7 @@ def _build_press_cmds(arm_id: int) -> List[str]:
 def _build_release_cmds() -> List[str]:
     """构建松开时下发的指令"""
     all_stop = "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=0||PushStatus --mode_id=1 --motion_cmd=0||PushStatus --mode_id=2 --motion_cmd=0||PushStatus --mode_id=3 --motion_cmd=0||PushStatus --mode_id=4 --motion_cmd=0}"
-    all_start = "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=100||PushStatus --mode_id=1 --motion_cmd=100||PushStatus --mode_id=2 --motion_cmd=100||PushStatus --mode_id=3 --motion_cmd=100||PushStatus --mode_id=4 --motion_cmd=100}"
+    all_start = "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=1||PushStatus --mode_id=1 --motion_cmd=1||PushStatus --mode_id=2 --motion_cmd=1||PushStatus --mode_id=3 --motion_cmd=1||PushStatus --mode_id=4 --motion_cmd=1}"
     return [all_stop, all_start]
 
 
@@ -688,6 +690,16 @@ class AutoKinematicsWindow(QWidget):
         self.exec_btn.setEnabled(False)
         self.exec_btn.clicked.connect(self._execute_waypoint)
         exec_row.addWidget(self.exec_btn)
+        exec_row.addSpacing(6)
+
+        self.stop_btn = QPushButton("🛑 急停")
+        self.stop_btn.setStyleSheet(
+            f"background: {C['red']}; color: white; border-radius: 8px; "
+            f"padding: 9px 24px; font-size: 10pt; font-weight: bold;"
+        )
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._emergency_stop)
+        exec_row.addWidget(self.stop_btn)
         card.addLayout(exec_row)
 
         return card
@@ -765,10 +777,11 @@ class AutoKinematicsWindow(QWidget):
     def _update_exec_btn(self):
         has_data = len(self.waypoints) > 0
         self.exec_btn.setEnabled(self.connected and has_data)
-        if self.mode == 0:
-            self.exec_btn.setText("▶ MtmMoveP执行")
-        else:
-            self.exec_btn.setText("▶ MoveAbs执行")
+        self.stop_btn.setEnabled(self.connected)
+        # if self.mode == 0:
+        #     self.exec_btn.setText("▶ MtmMoveP执行")
+        # else:
+        #     self.exec_btn.setText("▶ MoveAbs执行")
 
     def _do_connect(self):
         if self.connected:
@@ -831,14 +844,25 @@ class AutoKinematicsWindow(QWidget):
     def _send_connect_init(self):
         """根据主从模式发送初始化指令"""
         SLAVE_INIT = [
-            "{Clear}",
-            "{Mode}",
-            "{SetMaxToq}",
-            "{URecover}",
-            "{Idle||Idle||Enable||Enable||Enable||Enable||Enable}",
-            "{PsmSetPosExe --begin_motion_id=0 --num=4}",
-            "{Clear}",
-            "{URecover}",
+        #     "{Clear}",
+        #     "{Idle||Idle||SetLimPos||SetLimPos||SetLimPos||SetLimPos||SetLimPos}",
+        #     "{ClearServoErr}",
+        #     "{SetMaxToq}",
+        #     "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}",
+        #     "{Clear}",
+        #     "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}",
+        #     "{UDisable --begin_motion_id=0 --num=2||UDisable --begin_motion_id=0 --num=2||UDisable --begin_motion_id=0 --num=4||UDisable --begin_motion_id=0 --num=9||UDisable --begin_motion_id=0 --num=9||UDisable --begin_motion_id=0 --num=9||UDisable --begin_motion_id=0 --num=9}",
+        #     "{Clear}",
+        #     "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}",
+        #     "{Mode}",
+        #     "{Idle||Idle||BoomSetPosExe||PsmSetPosExe||PsmSetPosExe||PsmSetPosExe||PsmSetPosExe}",
+        #     "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}",
+        #     "{SetRate}",
+        #     "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}",
+        #     "{Idle||Idle||Idle||UEnable --begin_motion_id=5 --num=4||UEnable --begin_motion_id=5 --num=4||UEnable --begin_motion_id=5 --num=4||UEnable --begin_motion_id=5 --num=4}",
+            "{Stop}",
+            "{Start}",
+            "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=1||PushStatus --mode_id=1 --motion_cmd=1||PushStatus --mode_id=2 --motion_cmd=1||PushStatus --mode_id=3 --motion_cmd=1||PushStatus --mode_id=4 --motion_cmd=1}",
         ]
         MASTER_INIT = [
             "{Clear}",
@@ -1051,6 +1075,23 @@ class AutoKinematicsWindow(QWidget):
         self.exec_btn.setText("▶执行路点")
         self._update_exec_btn()
         self._log("路点执行完成")
+
+    # ---------- 急停 ----------
+    def _emergency_stop(self):
+        """急停: Stop → 0.5s → Start"""
+        if not self.connected:
+            return
+        self._log("🛑 急停触发")
+
+        def task():
+            self._log("发送: {Stop}")
+            self.tcp.send("{Stop}")
+            threading.Event().wait(0.5)
+            self._log("发送: {Start}")
+            self.tcp.send("{Start}")
+            self._log("急停完成")
+
+        threading.Thread(target=task, daemon=True).start()
 
     # ---------- 退出 ----------
     def closeEvent(self, event):
