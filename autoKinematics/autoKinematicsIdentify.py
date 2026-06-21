@@ -80,8 +80,8 @@ def _slot_cmd(arm_id: int, cmd: str) -> str:
 
 # ==================== 自动摆位命令配置 ====================
 ARM_CFG_AUTOPOS = {
-    1: {"pos": 2, "type": "DRAPING"},
-    2: {"pos": 3, "type": "WHOLE_STOWING"},
+    1: {"pos": 2, "type": "ARM1IDENTIFY"},
+    2: {"pos": 3, "type": "ARM2IDENTIFY"},
     3: {"pos": 4, "type": "ARM3IDENTIFY"},
     4: {"pos": 5, "type": "ARM4IDENTIFY"},
 }
@@ -891,27 +891,13 @@ class AutoKinematicsWindow(QWidget):
     def _send_connect_init(self):
         """根据主从模式发送初始化指令"""
         SLAVE_INIT = [
-        #     "{Clear}",
-        #     "{Idle||Idle||SetLimPos||SetLimPos||SetLimPos||SetLimPos||SetLimPos}",
-        #     "{ClearServoErr}",
-        #     "{SetMaxToq}",
-        #     "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}",
-        #     "{Clear}",
-        #     "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}",
-        #     "{UDisable --begin_motion_id=0 --num=2||UDisable --begin_motion_id=0 --num=2||UDisable --begin_motion_id=0 --num=4||UDisable --begin_motion_id=0 --num=9||UDisable --begin_motion_id=0 --num=9||UDisable --begin_motion_id=0 --num=9||UDisable --begin_motion_id=0 --num=9}",
-        #     "{Clear}",
-        #     "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}",
-        #     "{Mode}",
-        #     "{Idle||Idle||BoomSetPosExe||PsmSetPosExe||PsmSetPosExe||PsmSetPosExe||PsmSetPosExe}",
-        #     "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}",
-        #     "{SetRate}",
-        #     "{Idle||Idle||URecover||URecover||URecover||URecover||URecover}",
-        #     "{Idle||Idle||Idle||UEnable --begin_motion_id=5 --num=4||UEnable --begin_motion_id=5 --num=4||UEnable --begin_motion_id=5 --num=4||UEnable --begin_motion_id=5 --num=4}",
             "{Stop}",
             "{Start}",
             "{PushStatus||PushStatus||PushStatus --mode_id=0 --motion_cmd=1||PushStatus --mode_id=1 --motion_cmd=1||PushStatus --mode_id=2 --motion_cmd=1||PushStatus --mode_id=3 --motion_cmd=1||PushStatus --mode_id=4 --motion_cmd=1}",
         ]
         MASTER_INIT = [
+            "{Stop}",
+            "{Start}",
             "{Clear}",
             "{Mode}",
             "{SetMaxToq}",

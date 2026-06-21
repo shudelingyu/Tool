@@ -14,7 +14,8 @@ log/
 
 # Documentation PDFs
 *.pdf
-
+*.txt
+*.csv
 # Photos directory
 photos/
 
