@@ -8,11 +8,12 @@
 """
 
 import os
+import sys
 import threading
 import socket
 import struct
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -79,17 +80,39 @@ def _slot_cmd(arm_id: int, cmd: str) -> str:
     return "{" + "||".join(parts) + "}"
 
 # ==================== 自动摆位命令配置 ====================
-ARM_CFG_AUTOPOS = {
-    1: {"pos": 2, "type": "ARM1IDENTIFY"},
-    2: {"pos": 3, "type": "ARM2IDENTIFY"},
-    3: {"pos": 4, "type": "ARM3IDENTIFY"},
-    4: {"pos": 5, "type": "ARM4IDENTIFY"},
-}
+
+# 从 Positioning 文件读取四臂的摆位数据
+def _load_positioning(path: str = None) -> Dict[int, List[float]]:
+    if path is None:
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base, "Positioning")
+    result = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or ":" not in line:
+                    continue
+                key, vals = line.split(":", 1)
+                if key.startswith("arm"):
+                    arm_id = int(key.replace("arm", ""))
+                    result[arm_id] = [float(v) for v in vals.strip().split()]
+    except Exception as e:
+        print(f"加载 Positioning 失败: {e}")
+    return result
+
+POS_DATA = _load_positioning()
+
+def _fmt_pos(arm_id: int) -> str:
+    """将 Positioning 数据格式化为 花括号包裹逗号分隔"""
+    data = POS_DATA.get(arm_id, [])
+    return "{" + ",".join(f"{v:.6f}" for v in data) + "}"
 
 def _build_press_cmds(arm_id: int) -> List[str]:
     """构建按住时下发的8条指令"""
-    cfg = ARM_CFG_AUTOPOS[arm_id]
-    pos, ptype = cfg["pos"], cfg["type"]
 
     def _all(cmd: str) -> str:
         """所有臂位置(2-6)设为相同命令"""
@@ -106,15 +129,14 @@ def _build_press_cmds(arm_id: int) -> List[str]:
         f"||UEnable --begin_motion_id=0 --num=8}}"
     )
     cmds.append(_all("URecover"))                                    # 4
-    # 5: 仅选中臂做规划，其余 UEmpty
-    parts = ["Idle", "Idle"]
-    for p in range(2, 7):
-        parts.append(f"AutoPositionPlanning --type={ptype}" if p == pos else "UEmpty")
-    cmds.append("{" + "||".join(parts) + "}")
+    # 5: 仅选中臂用 Positioning 数据，其余 UEmpty
+    cmds.append(f"{{Idle||Idle||AutoPositionPlanning --mode=2.0 --custom_pos={_fmt_pos(arm_id)}"
+        f"||UEmpty"
+        f"||UEmpty"
+        f"||UEmpty"
+        f"||UEmpty}}")
     cmds.append(_all("AutoPositionRunning"))                          # 6
-    cmds.append(_all("URecover"))                                    # 7
-    cmds.append(_all("CommonPositionRunning"))
-    cmds.append(_all("URecover"))                                    # 7
+    cmds.append(_all("URecover"))                                  # 7
     cmds.append(                                                      # 8
         f"{{Idle||Idle||UDisable --begin_motion_id=0 --num=4"
         f"||UDisable --begin_motion_id=0 --num=8"
@@ -364,18 +386,6 @@ class TcpClient:
         text = payload.decode("utf-8", errors="replace").strip("\x00").strip()
         return text, buf[40 + data_len:]
 
-    def send(self, data: str) -> Tuple[str, str]:
-        if not self.sock or not self.connected:
-            return "", "未连接"
-        try:
-            msg = self._encode_message(data)
-            self.sock.sendall(msg)
-            return data, ""
-        except (socket.timeout, ConnectionError, OSError) as e:
-            err_msg = f"发送失败: {type(e).__name__}: {e}"
-            self._log(err_msg)
-            return "", err_msg
-
     def send_and_recv(self, data: str, timeout: float = 3.0, expected: int = 0) -> Tuple[str, str]:
         """发送指令并等待全部 model 回复，返回 (全部回复, 错误信息)
            expected: 期望回复条数，0 自动根据 || 数量推断"""
@@ -446,6 +456,7 @@ class AutoKinematicsWindow(QWidget):
 
         # 模式: 0=主手, 1=从手
         self.mode = 1
+        self.model = 7
 
         # 自动摆位状态（每条臂一个线程标志）
         self.pos_running = {i: False for i in range(1, 5)}
@@ -732,14 +743,14 @@ class AutoKinematicsWindow(QWidget):
         exec_row.addWidget(self.wp_count_label)
         exec_row.addStretch()
 
-        self.exec_btn = QPushButton("▶  执行路点")
+        self.exec_btn = QPushButton("▶执行路点")
         self.exec_btn.setObjectName("execBtn")
         self.exec_btn.setEnabled(False)
         self.exec_btn.clicked.connect(self._execute_waypoint)
         exec_row.addWidget(self.exec_btn)
         exec_row.addSpacing(6)
 
-        self.stop_btn = QPushButton("🛑 急停")
+        self.stop_btn = QPushButton("🛑急停")
         self.stop_btn.setStyleSheet(
             f"background: {C['red']}; color: white; border-radius: 8px; "
             f"padding: 9px 24px; font-size: 10pt; font-weight: bold;"
@@ -801,6 +812,7 @@ class AutoKinematicsWindow(QWidget):
     def _set_mode(self, mode: int):
         """切换主手/从手模式"""
         self.mode = mode
+        self.model = 7 if self.mode == 1 else 2
         self.mode_btn_master.setChecked(mode == 0)
         self.mode_btn_slave.setChecked(mode == 1)
         self._style_mode_buttons()
@@ -812,7 +824,7 @@ class AutoKinematicsWindow(QWidget):
         self._refresh_target_visibility()
         self._update_exec_btn()
         mode_name = "主手" if mode == 0 else "从手"
-        self._log(f"切换至{mode_name}模式")
+        self._log(f"切换至{mode_name}模式,model:{self.model}")
 
     # ---------- 连接管理 ----------
     def _update_ui_state(self):
@@ -909,17 +921,15 @@ class AutoKinematicsWindow(QWidget):
 
         def task():
             cmds = SLAVE_INIT if self.mode == 1 else MASTER_INIT
-            expected = 7 if self.mode == 1 else 2
             for i, cmd in enumerate(cmds, 1):
                 self._log(f"初始化 [{i}/{len(cmds)}] 发送: {cmd}")
-                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0, expected=expected)
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0,expected=self.model)
                 if resp:
                     for line in resp.split("\n"):
                         self._log(f"  <- {line}")
                 if err:
                     self._log(f"  -> {err}")
             self._log("初始化完成")
-
         threading.Thread(target=task, daemon=True).start()
 
     # ---------- 自动摆位（按下/松开） ----------
@@ -954,7 +964,7 @@ class AutoKinematicsWindow(QWidget):
                         self._log(f"从臂{arm_id} 序列已中断（第{i+1}条）")
                         return
                 self._log(f"[{i+1}/8] 发送: {cmd}")
-                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0)
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0,expected=self.model)
                 if resp:
                     for line in resp.split("\n"):
                         self._log(f"  <- {line}")
@@ -976,7 +986,7 @@ class AutoKinematicsWindow(QWidget):
             release_cmds = _build_release_cmds()
             for cmd in release_cmds:
                 self._log(f"[释放] 发送: {cmd}")
-                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0)
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0,expected=self.model)
                 if resp:
                     for line in resp.split("\n"):
                         self._log(f"  <- {line}")
@@ -1099,7 +1109,7 @@ class AutoKinematicsWindow(QWidget):
                 hand = self._get_selected_hand()
                 cmd = _build_master_exec_cmd(angles, hand)
                 self._log(f"执行 ({'左手' if hand==0 else '右手'}): {cmd}")
-                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0)
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0,expected=self.model)
                 if resp:
                     for line in resp.split("\n"):
                         self._log(f"  <- {line}")
@@ -1110,7 +1120,7 @@ class AutoKinematicsWindow(QWidget):
                 cmds = _build_slave_exec_cmds(arm_id, angles)
                 for i, cmd in enumerate(cmds, 1):
                     self._log(f"[{i}/7] 发送: {cmd}")
-                    resp, err = self.tcp.send_and_recv(cmd, timeout=500.0)
+                    resp, err = self.tcp.send_and_recv(cmd, timeout=500.0 ,expected=self.model)
                     if resp:
                         for line in resp.split("\n"):
                             self._log(f"  <- {line}")
@@ -1131,12 +1141,13 @@ class AutoKinematicsWindow(QWidget):
         """急停: Stop → 0.5s → Start"""
         if not self.connected:
             return
-        self._log("🛑 急停触发")
+        self._log("🛑急停触发")
+        
 
         def task():
             for cmd in ["{Stop}", "{Start}"]:
                 self._log(f"急停 发送: {cmd}")
-                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0, expected=7)
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0, expected=self.model)
                 if resp:
                     for line in resp.split("\n"):
                         self._log(f"  <- {line}")
@@ -1155,7 +1166,6 @@ class AutoKinematicsWindow(QWidget):
 
 # ==================== 入口 ====================
 if __name__ == "__main__":
-    import sys
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
