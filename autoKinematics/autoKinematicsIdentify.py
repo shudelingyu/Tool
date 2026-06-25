@@ -7,11 +7,14 @@
 - 读取identifytrajectory路点文件并执行
 """
 
+import re
 import os
 import sys
 import threading
 import socket
 import struct
+import paramiko
+import math
 from datetime import datetime
 from typing import Optional, List, Tuple, Dict
 
@@ -50,6 +53,10 @@ ARM_COLORS = [
     {"bg": "#10B981", "hover": "#059669", "icon": "❹"},
 ]
 
+# ==================== SSH 凭证（硬编码） ====================
+SSH_USER = "codeit"
+SSH_PASS = "1"
+
 # ==================== 执行路点 ====================
 # 指令格式: {model0||model1||Boom||从臂1||从臂2||从臂3||从臂4}
 # 主手格式: {左手||右手}
@@ -66,7 +73,7 @@ SLAVE_EXEC_TEMPLATE = [
     "Mode",
     "UEnable --begin_motion_id=0 --num={num}",
     "URecover",
-    "MoveAbsolute --num={num} --pos={{{wp}}}",
+    "MoveAbsolute --num={num} --pos={{{wp}}} --vel={{0.05}} --acc={{0.05}} --jerk={{0.1}}",
     "URecover",
     "UDisable --begin_motion_id=0 --num={num}",
 ]
@@ -432,12 +439,172 @@ class TcpClient:
         self._log("TCP连接已断开")
 
 
+# ==================== SSH客户端（复刻 JointMonitor） ====================
+class SSHReader:
+    """通过 SSH 读取远程日志获取实际关节角（同 JointMonitor）"""
+
+    def __init__(self, log_callback=None):
+        self.slave_client: Optional[paramiko.SSHClient] = None
+        self.master_client: Optional[paramiko.SSHClient] = None
+        self.log_callback = log_callback
+
+    def _log(self, msg):
+        if self.log_callback:
+            self.log_callback(msg)
+
+    def connect_slave(self, ip: str, username: str, password: str, port: int = 22) -> bool:
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(hostname=ip, port=port, username=username, password=password, timeout=5)
+            self.slave_client = client
+            self._log(f"SSH从手连接成功 {ip}")
+            return True
+        except Exception as e:
+            self._log(f"SSH从手连接失败: {e}")
+            return False
+
+    def connect_master(self, ip: str, username: str, password: str, port: int = 22) -> bool:
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(hostname=ip, port=port, username=username, password=password, timeout=5)
+            self.master_client = client
+            self._log(f"SSH主手连接成功 {ip}")
+            return True
+        except Exception as e:
+            self._log(f"SSH主手连接失败: {e}")
+            return False
+
+    def get_last_line(self, client: paramiko.SSHClient, log_path: str) -> Optional[str]:
+        try:
+            _, stdout, stderr = client.exec_command(f'test -f "{log_path}" && echo "exists" || echo "not_exists"')
+            check_result = stdout.read().decode('utf-8', errors='ignore').strip()
+            if check_result != "exists":
+                self._log(f"日志文件不存在 - {log_path}")
+                return None
+
+            _, stdout, stderr = client.exec_command(f'tail -n 1 "{log_path}" 2>&1')
+            line = stdout.read().decode('utf-8', errors='ignore').strip()
+            error_msg = stderr.read().decode('utf-8', errors='ignore').strip()
+            if error_msg:
+                self._log(f"读取文件失败 {log_path}: {error_msg}")
+                return None
+
+            if not line or len(line) < 10:
+                _, stdout2, _ = client.exec_command(f'tail -n 2 "{log_path}" 2>&1 | head -n 1')
+                line2 = stdout2.read().decode('utf-8', errors='ignore').strip()
+                if line2 and len(line2) >= 10:
+                    return line2
+                else:
+                    self._log(f"警告：日志文件内容过短或为空 - {log_path}")
+                    return None
+            return line
+        except Exception as e:
+            self._log(f"读取文件异常 {log_path}: {type(e).__name__}: {e}")
+            return None
+
+    def parse_slave_log(self, log_line: str, arm_id: int) -> Optional[List[float]]:
+        """解析从臂日志，返回 12 个关节角或 None"""
+        if not log_line:
+            return None
+        parts = [p.strip() for p in log_line.split(',') if p.strip() != '']
+        if not parts:
+            return None
+        cur_pos = [0.0] * 12
+        if len(parts) < 100:
+            # 简化格式
+            if len(parts) >= 16:
+                try:
+                    for i, val in enumerate(parts[9:16]):
+                        cur_pos[5 + i] = float(val)
+                    self._log(f"从臂{arm_id} 简化格式 (关节5-12)")
+                    return cur_pos
+                except ValueError:
+                    pass
+            self._log(f"从臂{arm_id} 简化格式数据不足")
+        else:
+            # 完整格式
+            if len(parts) >= 26:
+                try:
+                    cur_pos = [float(v) for v in parts[14:26]]
+                    self._log(f"从臂{arm_id} 完整格式 (13个关节)")
+                    return cur_pos
+                except ValueError:
+                    pass
+            self._log(f"从臂{arm_id} 完整格式数据不足")
+        return None
+
+    def parse_master_log(self, log_line: str, arm_name: str) -> Tuple[Optional[List[float]], Optional[float]]:
+        """解析主手日志，返回 (7关节角, view_angle)"""
+        if not log_line:
+            return None, None
+        self._log(f"解析主手 {arm_name} 日志")
+
+        pattern_q = r'cur_q\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)'
+        pattern_qabs = r'cur_qabs\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)'
+
+        match_q = re.search(pattern_q, log_line)
+        match_qabs = re.search(pattern_qabs, log_line)
+
+        q_vals = [0.0] * 8
+        qabs_vals = [0.0] * 8
+        if match_q:
+            q_vals = [float(g) for g in match_q.groups()]
+        if match_qabs:
+            qabs_vals = [float(g) for g in match_qabs.groups()]
+
+        result = [0.0] * 7
+        for i in range(6):
+            result[i] = qabs_vals[i]
+        j7 = q_vals[6]
+        j7 = math.remainder(j7, 2 * math.pi)
+        result[6] = j7
+
+        view_angle = None
+        view_pattern = r'view_angle\s+([\d.-]+)'
+        match_view = re.search(view_pattern, log_line)
+        if match_view:
+            view_angle = float(match_view.group(1))
+
+        return result, view_angle
+
+    def read_slave(self, arm_id: int) -> Optional[List[float]]:
+        """读取从臂 arm_id 的当前关节角"""
+        if not self.slave_client:
+            return None
+        log_path = f"/data/log/rt/mmsArm{arm_id}/mmsArm{arm_id}"
+        line = self.get_last_line(self.slave_client, log_path)
+        if line:
+            return self.parse_slave_log(line, arm_id)
+        return None
+
+    def read_master(self, arm_name: str) -> Tuple[Optional[List[float]], Optional[float]]:
+        """读取主手的当前关节角和 view_angle"""
+        if not self.master_client:
+            return None, None
+        log_path = f"/data/log/rt/{arm_name}DataModel/{arm_name}DataModel"
+        line = self.get_last_line(self.master_client, log_path)
+        if line:
+            return self.parse_master_log(line, arm_name)
+        return None, None
+
+    def disconnect_all(self):
+        if self.slave_client:
+            self.slave_client.close()
+            self.slave_client = None
+        if self.master_client:
+            self.master_client.close()
+            self.master_client = None
+        self._log("SSH连接已断开")
+
+
 # ==================== 主窗口 ====================
 class AutoKinematicsWindow(QWidget):
     """运动学自动辨识工具主窗口"""
 
     # 线程安全信号
-    signal_connect_result = pyqtSignal(bool)
+    signal_connect_result = pyqtSignal(bool, bool, bool)  # tcp, ssh_slave, ssh_master
     signal_auto_pos_done = pyqtSignal(int)
     signal_file_loaded = pyqtSignal(list)
     signal_exec_done = pyqtSignal()
@@ -452,6 +619,12 @@ class AutoKinematicsWindow(QWidget):
         # TCP
         self.tcp = TcpClient(log_callback=self._log)
         self.connected = False
+
+        # SSH
+        self.ssh = SSHReader(log_callback=self._log)
+        self.ssh_slave_connected = False
+        self.ssh_master_connected = False
+
         self.waypoints: List[Tuple[str, List[float]]] = []
 
         # 模式: 0=主手, 1=从手
@@ -468,6 +641,9 @@ class AutoKinematicsWindow(QWidget):
         self.signal_file_loaded.connect(self._on_file_loaded)
         self.signal_exec_done.connect(self._on_exec_done)
         self.signal_log.connect(self._append_log)
+
+        self.data_dir = self._get_data_dir()
+        self.file_locks = {}
 
         self._setup_ui()
 
@@ -592,6 +768,7 @@ class AutoKinematicsWindow(QWidget):
         row.addStretch()
 
         card.addLayout(row)
+
         return card
 
     @staticmethod
@@ -758,6 +935,16 @@ class AutoKinematicsWindow(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._emergency_stop)
         exec_row.addWidget(self.stop_btn)
+        exec_row.addSpacing(6)
+
+        self.save_btn = QPushButton("💾 保存数据")
+        self.save_btn.setStyleSheet(
+            f"background: {C['indigo']}; color: white; border-radius: 8px; "
+            f"padding: 9px 18px; font-size: 10pt; font-weight: bold;"
+        )
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self._save_after_waypoint)
+        exec_row.addWidget(self.save_btn)
         card.addLayout(exec_row)
 
         return card
@@ -826,6 +1013,10 @@ class AutoKinematicsWindow(QWidget):
         mode_name = "主手" if mode == 0 else "从手"
         self._log(f"切换至{mode_name}模式,model:{self.model}")
 
+        # 如果已连接，自动重连对应模式的 SSH
+        if self.connected:
+            self._reconnect_ssh_for_mode()
+
     # ---------- 连接管理 ----------
     def _update_ui_state(self):
         for i, btn in enumerate(self.pos_btns):
@@ -837,15 +1028,48 @@ class AutoKinematicsWindow(QWidget):
         has_data = len(self.waypoints) > 0
         self.exec_btn.setEnabled(self.connected and has_data)
         self.stop_btn.setEnabled(self.connected)
+        self.save_btn.setEnabled(has_data)
         # if self.mode == 0:
         #     self.exec_btn.setText("▶ MtmMoveP执行")
         # else:
         #     self.exec_btn.setText("▶ MoveAbs执行")
 
+    def _reconnect_ssh_for_mode(self):
+        """根据当前模式重新连接 SSH（切模式时调用，复用 TCP IP + 硬编码凭证）"""
+        old_slave = self.ssh_slave_connected
+        old_master = self.ssh_master_connected
+        ip = self.ip_edit.text().strip()
+
+        # 断开旧 SSH
+        if self.mode == 1 and old_master:
+            self.ssh.master_client = None
+            self.ssh_master_connected = False
+        elif self.mode == 0 and old_slave:
+            self.ssh.slave_client = None
+            self.ssh_slave_connected = False
+
+        def task():
+            if self.mode == 1:
+                self._log("切换至从手模式，连接 SSH 从手...")
+                ok = self.ssh.connect_slave(ip, SSH_USER, SSH_PASS)
+                self.ssh_slave_connected = ok
+            else:
+                self._log("切换至主手模式，连接 SSH 主手...")
+                ok = self.ssh.connect_master(ip, SSH_USER, SSH_PASS)
+                self.ssh_master_connected = ok
+            s = "✓" if ok else "✗"
+            mode_name = "从手" if self.mode == 1 else "主手"
+            self._log(f"SSH{mode_name}重连{s}")
+
+        threading.Thread(target=task, daemon=True).start()
+
     def _do_connect(self):
         if self.connected:
             self.tcp.disconnect()
+            self.ssh.disconnect_all()
             self.connected = False
+            self.ssh_slave_connected = False
+            self.ssh_master_connected = False
             self.connect_btn.setText("🔗 连接")
             self.status_light.setStyleSheet(f"background: #CBD5E1; border-radius: 7px;")
             self.status_label.setText("未连接")
@@ -874,30 +1098,44 @@ class AutoKinematicsWindow(QWidget):
         self._log(f"正在连接 {ip}:{port} ...")
 
         def task():
-            success = self.tcp.connect(ip, port)
-            self.signal_connect_result.emit(success)
+            tcp_ok = self.tcp.connect(ip, port)
+            # SSH 复用 TCP 的 IP + 硬编码凭证
+            if self.mode == 1:  # 从手模式
+                ssh_slave_ok = self.ssh.connect_slave(ip, SSH_USER, SSH_PASS)
+                ssh_master_ok = False
+            else:  # 主手模式
+                ssh_slave_ok = False
+                ssh_master_ok = self.ssh.connect_master(ip, SSH_USER, SSH_PASS)
+            self.signal_connect_result.emit(tcp_ok, ssh_slave_ok, ssh_master_ok)
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _on_connect_result(self, success: bool):
+    def _on_connect_result(self, tcp_ok: bool, ssh_slave_ok: bool, ssh_master_ok: bool):
         self.connect_btn.setEnabled(True)
-        if success:
+        self.ssh_slave_connected = ssh_slave_ok
+        self.ssh_master_connected = ssh_master_ok
+
+        if tcp_ok:
             self.connected = True
             self.connect_btn.setText("🔌 断开")
             self.status_light.setStyleSheet(f"background: {C['green']}; border-radius: 7px;")
             self.status_label.setText("已连接")
             self.status_label.setStyleSheet(f"color: {C['green']}; font-weight: bold;")
             self._update_ui_state()
-            self._log("远程连接建立成功")
+            if self.mode == 1:
+                ssh_text = "SSH从手✓" if ssh_slave_ok else "SSH从手✗"
+            else:
+                ssh_text = "SSH主手✓" if ssh_master_ok else "SSH主手✗"
+            self._log(f"远程连接建立成功（{ssh_text}）")
             self._send_connect_init()
         else:
             self.connected = False
             self.connect_btn.setText("🔗 连接")
             self.status_light.setStyleSheet(f"background: {C['red']}; border-radius: 7px;")
-            self.status_label.setText("连接失败")
+            self.status_label.setText("TCP失败")
             self.status_label.setStyleSheet(f"color: {C['red']};")
             self._update_ui_state()
-            self._log("远程连接建立失败")
+            self._log("TCP连接失败，SSH也不会可用")
 
     # ---------- 连接初始化 ----------
     def _send_connect_init(self):
@@ -1127,14 +1365,208 @@ class AutoKinematicsWindow(QWidget):
                     if err:
                         self._log(f"  -> {err}")
 
+            # 所有返回已收到 → 直接保存关节角数据（同一线程）
+            
+            self._do_save_after_exec(wp_name)
             self.signal_exec_done.emit()
 
         threading.Thread(target=task, daemon=True).start()
 
+    # ---------- 路点执行完成回调 ----------
     def _on_exec_done(self):
         self.exec_btn.setText("▶执行路点")
         self._update_exec_btn()
         self._log("路点执行完成")
+
+    # ---------- 数据存储 ----------
+    def _get_data_dir(self) -> str:
+        """获取数据存储目录"""
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        data_dir = os.path.join(base_dir, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        return data_dir
+
+    def _write_joint_file(self, filepath: str, angle_vals: list, num_joints: int, prefix: str) -> int:
+        """将关节角数据写入.cst文件（同JointMonitor格式）
+        返回写入的行号（从1开始），失败返回-1"""
+        if filepath not in self.file_locks:
+            self.file_locks[filepath] = threading.Lock()
+
+        with self.file_locks[filepath]:
+            try:
+                file_exists = os.path.exists(filepath)
+                need_header = not file_exists or os.path.getsize(filepath) == 0
+
+                current_lines = 0
+                if file_exists and not need_header:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        current_lines = len(f.readlines()) - 1  # 减去表头
+                new_line_no = current_lines + 1
+
+                with open(filepath, 'a', encoding='utf-8') as f:
+                    if need_header:
+                        header_cols = ["name"] + [f"J{i+1}" for i in range(num_joints)]
+                        f.write(" ".join(header_cols) + "\n")
+                        self._log(f"创建文件并写入表头: {os.path.basename(filepath)}")
+                        new_line_no = 1
+
+                    values_str = " ".join([f"{v:.6f}" for v in angle_vals])
+                    f.write(f"{prefix}: {values_str}\n")
+
+                self._log(f"数据已追加到 {os.path.basename(filepath)} (第{new_line_no}个点)")
+                return new_line_no
+            except Exception as e:
+                self._log(f"写入文件失败 {filepath}: {e}")
+                return -1
+
+    def _do_save_after_exec(self, wp_name: str):
+        """执行线程中直接调用：收到所有返回后，立即 SSH 读取实际角度并保存"""
+        waypoint_angles = next((ang for n, ang in self.waypoints if n == wp_name), None)
+        if not waypoint_angles:
+            return
+
+        actual_angles = None
+        source = "waypoint"
+
+        try:
+            if self.mode == 1 and self.ssh_slave_connected:
+                arm_id = self._get_selected_arm()
+                ssh_angles = self.ssh.read_slave(arm_id)
+                if ssh_angles:
+                    actual_angles = ssh_angles
+                    source = "SSH"
+
+            elif self.mode == 0 and self.ssh_master_connected:
+                hand = self._get_selected_hand()
+                arm_name = "Left" if hand == 0 else "Right"
+                ssh_angles, view_angle = self.ssh.read_master(arm_name)
+                if ssh_angles:
+                    actual_angles = ssh_angles
+                    source = "SSH"
+                    if view_angle is not None:
+                        self._save_view_angle_to_file(view_angle)
+
+            if actual_angles is None:
+                actual_angles = waypoint_angles
+
+            if self.mode == 1:
+                arm_id = self._get_selected_arm()
+                front_8 = actual_angles[:8]
+                back_4 = actual_angles[8:12] if len(actual_angles) >= 12 else []
+                psm_file = os.path.join(self.data_dir, f"psm{arm_id}_joint.cst")
+                inst_file = os.path.join(self.data_dir, f"inst{arm_id}_joint.cst")
+                self._write_joint_file(psm_file, front_8, 8, "actpos")
+                if back_4:
+                    self._write_joint_file(inst_file, back_4, 4, "actpos")
+            elif self.mode == 0:
+                hand = self._get_selected_hand()
+                filename = "mtm1_joint.cst" if hand == 0 else "mtm2_joint.cst"
+                filepath = os.path.join(self.data_dir, filename)
+                self._write_joint_file(filepath, actual_angles, 7, "addlpos")
+
+            self._log(f"路点 [{wp_name}] 数据已保存 [{source}]")
+        except Exception as e:
+            self._log(f"执行后保存关节角失败: {e}")
+
+    def _save_after_waypoint(self, auto: bool = False):
+        """保存关节角数据到.cst文件
+        - SSH可用时：读取远程日志实际关节角再保存（同 JointMonitor）
+        - SSH不可用时：回退到保存路点目标角度"""
+        row = self.table.currentRow()
+        if row < 0:
+            if not auto:
+                QMessageBox.information(self, "提示", "请先在路点列表中选中一个路点")
+            return
+
+        wp_name = self.table.item(row, 0).text()
+
+        # 获取路点数据作为 fallback
+        waypoint_angles = None
+        for name, ang in self.waypoints:
+            if name == wp_name:
+                waypoint_angles = ang
+                break
+        if not waypoint_angles:
+            self._log("无法保存：未找到路点数据")
+            return
+
+        def task():
+            try:
+                actual_angles = None
+                source = "waypoint"
+
+                if self.mode == 1 and self.ssh_slave_connected:
+                    arm_id = self._get_selected_arm()
+                    ssh_angles = self.ssh.read_slave(arm_id)
+                    if ssh_angles:
+                        actual_angles = ssh_angles
+                        source = "SSH"
+                        self._log(f"从臂{arm_id} SSH读取实机关节角成功")
+                    else:
+                        self._log(f"从臂{arm_id} SSH读取失败")
+
+                elif self.mode == 0 and self.ssh_master_connected:
+                    hand = self._get_selected_hand()
+                    arm_name = "Left" if hand == 0 else "Right"
+                    ssh_angles, view_angle = self.ssh.read_master(arm_name)
+                    if ssh_angles:
+                        actual_angles = ssh_angles
+                        source = "SSH"
+                        self._log(f"主手{arm_name} SSH读取实机关节角成功")
+                        if view_angle is not None:
+                            self._save_view_angle_to_file(view_angle)
+                    else:
+                        self._log(f"主手{arm_name} SSH读取失败")
+
+                # Fallback: 使用路点目标角度
+                if actual_angles is None:
+                    if self.ssh_slave_connected or self.ssh_master_connected:
+                        self._log("SSH读取失败，回退到路点目标角度")
+                    actual_angles = waypoint_angles
+
+                # 保存角度到 .cst 文件
+                if self.mode == 1:
+                    arm_id = self._get_selected_arm()
+                    front_8 = actual_angles[:8]
+                    back_4 = actual_angles[8:12] if len(actual_angles) >= 12 else []
+                    psm_file = os.path.join(self.data_dir, f"psm{arm_id}_joint.cst")
+                    inst_file = os.path.join(self.data_dir, f"inst{arm_id}_joint.cst")
+
+                    line_no_psm = self._write_joint_file(psm_file, front_8, 8, "actpos")
+                    if back_4:
+                        line_no_inst = self._write_joint_file(inst_file, back_4, 4, "actpos")
+                        if line_no_inst > 0:
+                            self._log(f"从臂{arm_id} 后4关节保存完成 (第{line_no_inst}个点)")
+                    else:
+                        self._log(f"从臂{arm_id} 无后4关节数据，跳过")
+
+                    if line_no_psm > 0:
+                        self._log(f"从臂{arm_id} 前8关节保存完成 (第{line_no_psm}个点) [{source}]")
+
+                elif self.mode == 0:
+                    hand = self._get_selected_hand()
+                    filename = "mtm1_joint.cst" if hand == 0 else "mtm2_joint.cst"
+                    filepath = os.path.join(self.data_dir, filename)
+                    line_no = self._write_joint_file(filepath, actual_angles, 7, "addlpos")
+                    if line_no > 0:
+                        self._log(f"{'左手' if hand==0 else '右手'} 关节数据保存完成 (第{line_no}个点) [{source}]")
+
+                if auto:
+                    self._log(f"路点 [{wp_name}] 数据已保存 [{source}]")
+            except Exception as e:
+                self._log(f"保存数据失败: {e}")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _save_view_angle_to_file(self, view_angle: float):
+        """保存 view_angle 到文件（同 JointMonitor）"""
+        if view_angle is None:
+            return
+        filepath = os.path.join(self.data_dir, "view_angle.cst")
+        self._write_joint_file(filepath, [view_angle], 1, "view_angle")
 
     # ---------- 急停 ----------
     def _emergency_stop(self):
@@ -1161,6 +1593,8 @@ class AutoKinematicsWindow(QWidget):
     def closeEvent(self, event):
         if self.connected:
             self.tcp.disconnect()
+        if self.ssh_slave_connected or self.ssh_master_connected:
+            self.ssh.disconnect_all()
         super().closeEvent(event)
 
 
