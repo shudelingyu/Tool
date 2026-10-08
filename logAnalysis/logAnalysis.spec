@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
+"""LogAnalysis 打包配置
+
+要点：
+- upx=False：UPX 压缩 Qt / 原生 DLL 会导致在其他电脑上静默崩溃
+- datas 内置 configs/data_formats.json：exe 单独拷贝到其他电脑也能解析日志
+- 不再打包 pyarrow：缓存已改用 pickle，去掉该原生依赖可显著减小体积并消除崩溃面
+"""
 import sys
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
-
-# 收集 pyarrow 的数据文件（支持 parquet 读写）
-pyarrow_datas = collect_data_files('pyarrow')
-pyarrow_hiddenimports = collect_submodules('pyarrow')
 
 # 把数据格式配置一并打包，保证 exe 单独拷贝到其他电脑后仍能解析日志
 config_datas = [('configs/data_formats.json', 'configs')]
@@ -15,11 +17,9 @@ a = Analysis(
     ['logAnalysis.py'],
     pathex=[],
     binaries=[],
-    datas=config_datas + pyarrow_datas,
+    datas=config_datas,
     hiddenimports=[
-        'pyarrow',
         'json',
-        'pyarrow.lib',
         'paramiko',
         'paramiko.transport',
         'paramiko.client',
@@ -87,7 +87,7 @@ a = Analysis(
         'nacl.secret',
         'nacl.sign',
         'nacl.utils',
-    ] + pyarrow_hiddenimports,
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -108,7 +108,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=False,  # 关闭 UPX：压缩 Qt/pyarrow 的 DLL 会导致换机后静默崩溃
+    upx=False,  # 关闭 UPX：压缩 Qt/原生 DLL 会导致换机后静默崩溃
     runtime_tmpdir=None,
     console=False,  # 不显示控制台窗口（运行日志写入 logs/logAnalysis.log）
     disable_windowed_traceback=False,

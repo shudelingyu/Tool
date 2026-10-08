@@ -13,7 +13,7 @@ import faulthandler
 import paramiko
 import json
 from collections import deque
-# 注意：pandas/pyarrow 必须在 PyQt5 之前导入，否则 pyarrow C 扩展在 Python 3.14 上会崩溃
+# 注意：pandas 需在 PyQt5 之前导入，避免其 C 扩展与 Qt 的加载顺序问题
 import pandas as pd
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -25,6 +25,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QShortcut, QMenu, QAction, QToolButton, QTabBar)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QEvent, QSize
 from PyQt5.QtGui import QDrag, QFont, QIcon, QPixmap, QPainter, QPen, QColor
+try:
+    from PyQt5 import sip
+except ImportError:  # 兼容旧版本 PyQt5
+    import sip
 import pyqtgraph as pg
 
 # 设置 PyQtGraph 全局背景白色、前景黑色
@@ -209,6 +213,31 @@ def close_x_icon(size=11, color="#475569", hover="#DC2626", weight=1.5):
 # 并用 faulthandler 捕获原生崩溃（访问违例/非法指令）的 C 级堆栈。
 _LOG_HANDLE = None
 _LOG_PATH = None
+_LOG_FD = None
+_EXCEPTHOOK_BUSY = False
+
+
+def _show_error_dialog_later():
+    """在事件循环空闲时弹出错误提示（避免在异常抛出点嵌套事件循环）"""
+    try:
+        QMessageBox.critical(None, "程序错误",
+                             f"发生未处理的错误，详情请查看日志：\n{_LOG_PATH}")
+    except Exception:
+        pass
+
+
+def qt_alive(obj):
+    """判断 PyQt 包装对象底层 C++ 对象是否仍然有效。
+
+    PyQt 中 Python 包装对象可能比底层 C++ 对象存活更久（如控件被 deleteLater
+    销毁后），此时访问该对象会触发 access violation 导致进程崩溃。
+    """
+    if obj is None:
+        return False
+    try:
+        return not sip.isdeleted(obj)
+    except Exception:
+        return True  # 无法判断时按有效处理（非 PyQt 对象）
 
 
 def get_app_base_dir():
@@ -219,8 +248,12 @@ def get_app_base_dir():
 
 
 def _open_log_file():
-    """打开日志文件（进程内仅打开一次），返回文件句柄或 None"""
-    global _LOG_HANDLE, _LOG_PATH
+    """打开日志文件（进程内仅打开一次），返回文件句柄或 None
+
+    使用追加 + 每次写入单次系统调用的方式，避免与 faulthandler 的输出交错，
+    导致日志内容被写乱、掩盖崩溃线索。
+    """
+    global _LOG_HANDLE, _LOG_PATH, _LOG_FD
     if _LOG_HANDLE is not None:
         return _LOG_HANDLE
     for d in (os.path.join(get_app_base_dir(), 'logs'),
@@ -228,7 +261,9 @@ def _open_log_file():
         try:
             os.makedirs(d, exist_ok=True)
             path = os.path.join(d, 'logAnalysis.log')
-            _LOG_HANDLE = open(path, 'a', encoding='utf-8', errors='replace')
+            _LOG_FD = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            # faulthandler 需要一个文件对象，使用同一描述符的副本，语义一致
+            _LOG_HANDLE = os.fdopen(os.dup(_LOG_FD), 'a', encoding='utf-8', errors='replace')
             _LOG_PATH = path
             return _LOG_HANDLE
         except Exception:
@@ -237,17 +272,18 @@ def _open_log_file():
 
 
 def log(msg):
-    """写入带时间戳的运行日志（同时打印到控制台便于开发调试）"""
-    line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}"
-    fh = _open_log_file()
-    if fh is not None:
+    """写入带时间戳的运行日志（原子写入，避免与原生崩溃堆栈交错）"""
+    global _LOG_FD
+    if _LOG_FD is None:
+        _open_log_file()
+    line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}\n"
+    if _LOG_FD is not None:
         try:
-            fh.write(line + '\n')
-            fh.flush()
+            os.write(_LOG_FD, line.encode('utf-8', 'replace'))
         except Exception:
             pass
     try:
-        print(line)
+        print(line, end='')
     except Exception:
         pass
 
@@ -267,13 +303,22 @@ def setup_crash_logging():
     log(f"日志文件: {_LOG_PATH}")
 
     def _excepthook(exc_type, exc_value, exc_tb):
+        global _EXCEPTHOOK_BUSY
         text = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
         log('未捕获的 Python 异常:\n' + text)
+        # 绝不在异常抛出点（可能正处于 Qt 绘制/事件分发中）同步弹出模态对话框：
+        # 模态框会启动嵌套事件循环并再次触发绘制，一旦绘图区存在失效对象，
+        # 就会把可恢复的 Python 异常升级为致命 access violation。
+        if _EXCEPTHOOK_BUSY:
+            return
+        if 'prepareForPaint' in text or 'paintEvent' in text or 'pyqtgraph' in text:
+            log('（异常源自绘图控件内部，仅记录日志，不弹窗以避免二次崩溃）')
+            return
+        _EXCEPTHOOK_BUSY = True
         try:
-            QMessageBox.critical(None, "程序错误",
-                                 f"发生未处理的错误：\n{exc_value}\n\n详细日志：\n{_LOG_PATH}")
-        except Exception:
-            pass
+            QTimer.singleShot(0, _show_error_dialog_later)
+        finally:
+            _EXCEPTHOOK_BUSY = False
 
     sys.excepthook = _excepthook
 
@@ -285,6 +330,112 @@ def setup_crash_logging():
         threading.excepthook = _thread_excepthook
     except Exception:
         pass
+
+    _install_unhandled_filter()
+
+
+# 保持滤波函数引用，避免被垃圾回收后回调失效
+_UNHANDLED_HANDLER = None
+
+
+def module_of_address(addr):
+    """查询代码地址所属模块（DLL/exe）文件名。
+
+    崩溃地址落在哪个模块，能直接判断是 Qt、GPU 驱动、pandas/numpy 还是解释器本身。
+    """
+    if sys.platform != 'win32' or not addr:
+        return ''
+    try:
+        import ctypes
+
+        class _MEMORY_BASIC_INFORMATION(ctypes.Structure):
+            _fields_ = [("BaseAddress", ctypes.c_void_p),
+                        ("AllocationBase", ctypes.c_void_p),
+                        ("AllocationProtect", ctypes.c_ulong),
+                        ("RegionSize", ctypes.c_size_t),
+                        ("State", ctypes.c_ulong),
+                        ("Protect", ctypes.c_ulong),
+                        ("Type", ctypes.c_ulong)]
+
+        mbi = _MEMORY_BASIC_INFORMATION()
+        k32 = ctypes.windll.kernel32
+        k32.VirtualQuery.argtypes = [ctypes.c_void_p,
+                                     ctypes.POINTER(_MEMORY_BASIC_INFORMATION),
+                                     ctypes.c_size_t]
+        k32.VirtualQuery.restype = ctypes.c_size_t
+        if not k32.VirtualQuery(ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            return ''
+        buf = ctypes.create_unicode_buffer(512)
+        if k32.GetModuleFileNameW(ctypes.c_void_p(mbi.AllocationBase), buf, 512):
+            return os.path.basename(buf.value)
+    except Exception:
+        pass
+    return ''
+
+
+def _install_unhandled_filter():
+    """安装 Windows 未处理异常过滤器。
+
+    faulthandler 报告的是 first-chance 异常（可能被上层 SEH 处理掉、属良性），
+    这里捕获的是最终无人处理的致命异常，可记录异常代码与地址，
+    用于区分"良性 AV"和"真正的致命崩溃"。
+    """
+    if sys.platform != 'win32':
+        return
+    global _UNHANDLED_HANDLER
+    try:
+        import ctypes
+        from ctypes import wintypes  # noqa: F401
+
+        class _EXCEPTION_RECORD(ctypes.Structure):
+            _fields_ = [("ExceptionCode", ctypes.c_ulong),
+                        ("ExceptionFlags", ctypes.c_ulong),
+                        ("ExceptionRecord", ctypes.c_void_p),
+                        ("ExceptionAddress", ctypes.c_void_p),
+                        ("NumberParameters", ctypes.c_ulong),
+                        ("ExceptionInformation", ctypes.c_void_p * 15)]
+
+        class _EXCEPTION_POINTERS(ctypes.Structure):
+            _fields_ = [("ExceptionRecord", ctypes.POINTER(_EXCEPTION_RECORD)),
+                        ("ContextRecord", ctypes.c_void_p)]
+
+        EXCEPTION_CONTINUE_SEARCH = 0
+
+        def _filter(ptr):
+            try:
+                rec = ptr.contents.ExceptionRecord.contents
+                code = rec.ExceptionCode & 0xFFFFFFFF
+                addr = rec.ExceptionAddress or 0
+                names = {0xC0000005: 'access violation',
+                         0xC00000FD: 'stack overflow',
+                         0xC0000374: 'heap corruption',
+                         0xC0000409: 'stack buffer overrun / fail-fast'}
+                # 访问违例时，ExceptionInformation[1] 才是实际出错的内存地址
+                fault = 0
+                if code == 0xC0000005:
+                    try:
+                        fault = rec.ExceptionInformation[1] or 0
+                    except Exception:
+                        fault = 0
+                detail = (f"!! 致命原生异常: 代码=0x{code:08X} "
+                          f"({names.get(code, 'unknown')}) "
+                          f"指令地址=0x{addr:X} [{module_of_address(addr) or '未知模块'}]")
+                if fault:
+                    detail += f" 访问地址=0x{fault:X}"
+                log(detail)
+                try:
+                    faulthandler.dump_traceback(file=_open_log_file(), all_threads=True)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            return EXCEPTION_CONTINUE_SEARCH
+
+        _UNHANDLED_HANDLER = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.POINTER(_EXCEPTION_POINTERS))(_filter)
+        ctypes.windll.kernel32.SetUnhandledExceptionFilter(_UNHANDLED_HANDLER)
+    except Exception as e:
+        log(f"安装未处理异常过滤器失败: {e}")
 
 
 # ==================== 日志解析模块（配置文件驱动） ====================
@@ -828,11 +979,12 @@ class LiveThread(QThread):
         self.wait()
 
 # ==================== 后台加载线程（离线模式） ====================
-try:
-    import pyarrow
-    HAS_PARQUET = True
-except ImportError:
-    HAS_PARQUET = False
+# 文件夹缓存格式：使用 pickle，而非 parquet。
+# 原因：parquet 依赖 pyarrow 原生扩展，在部分电脑上（不同 CPU 指令集 / 运行库环境）
+# 会在写入、读取时发生原生崩溃，表现为程序静默退出且 Python 无法捕获。
+# pickle 只依赖 pandas/numpy（日志解析已验证其在目标机可用），稳定性更好。
+CACHE_FILENAME = '_combined_cache.pkl'
+LEGACY_CACHE_FILENAME = '_combined_cache.parquet'
 
 def is_compressed_file(filename):
     """判断是否为压缩文件（根据扩展名，不区分大小写）"""
@@ -860,11 +1012,9 @@ def get_file_first_timestamp(filepath):
     return None
 
 def convert_folder_to_cache(folder_path, cache_path, progress_callback=None, stop_event=None):
-    if not HAS_PARQUET:
-        return False
     files = [os.path.join(folder_path, f) for f in os.listdir(folder_path)
          if os.path.isfile(os.path.join(folder_path, f))
-         and f != '_combined_cache.parquet'
+         and f not in (CACHE_FILENAME, LEGACY_CACHE_FILENAME)
          and not is_compressed_file(f)]
     # 按文件第一行时间戳排序，确保多文件拼接顺序正确
     files.sort(key=lambda f: get_file_first_timestamp(f) or datetime.datetime.min)
@@ -890,22 +1040,22 @@ def convert_folder_to_cache(folder_path, cache_path, progress_callback=None, sto
     else:
         base_epoch = 0.0
     combined['timestamp'] = pd.to_datetime(base_epoch * 1000 + (combined['line_no'] - 1), unit='ms', utc=True)
-    log(f"写入 parquet 缓存: {cache_path} | 行数={len(combined)} | 列数={len(combined.columns)}")
+    log(f"写入缓存: {cache_path} | 行数={len(combined)} | 列数={len(combined.columns)}")
     try:
-        combined.to_parquet(cache_path, index=False, engine='pyarrow')
+        combined.to_pickle(cache_path)
     except Exception as e:
         # 缓存写入失败不应中断加载：调用方会回退为直接加载
-        log(f"parquet 写入失败: {e}")
+        log(f"缓存写入失败: {e}")
         return False
-    log("parquet 缓存写入完成")
+    log("缓存写入完成")
     if stop_event and stop_event.is_set():
         return False
     return True
 
 def load_cache(cache_path):
-    if not HAS_PARQUET or not os.path.exists(cache_path):
+    if not os.path.exists(cache_path):
         return pd.DataFrame()
-    return pd.read_parquet(cache_path, engine='pyarrow')
+    return pd.read_pickle(cache_path)
 
 # ...existing code...
 def load_single_log_file(filepath, progress_callback=None, stop_event=None):
@@ -1065,7 +1215,7 @@ class LoadThread(QThread):
         """不使用缓存直接加载文件夹内所有日志，返回 DataFrame（失败返回空表）"""
         files = [os.path.join(self.path, f) for f in os.listdir(self.path)
                  if os.path.isfile(os.path.join(self.path, f))
-                 and f != '_combined_cache.parquet'
+                 and f not in (CACHE_FILENAME, LEGACY_CACHE_FILENAME)
                  and not is_compressed_file(f)]
         files.sort(key=lambda f: get_file_first_timestamp(f) or datetime.datetime.min)
         total = len(files)
@@ -1124,12 +1274,12 @@ class LoadThread(QThread):
                 self.finished.emit(df, self._stop, "")
                 return
 
-            cache_path = os.path.join(self.path, "_combined_cache.parquet")
+            cache_path = os.path.join(self.path, CACHE_FILENAME)
             cache_exists = os.path.exists(cache_path)
 
             if cache_exists and not self.force_rebuild:
                 self.progress.emit(0.5)
-                log("读取 parquet 缓存...")
+                log("读取缓存...")
                 try:
                     df = load_cache(cache_path)
                 except Exception as e:
@@ -1146,6 +1296,15 @@ class LoadThread(QThread):
                     return
                 self.progress.emit(0)
 
+            # 清理历史版本的 parquet 缓存（现已改用 pickle，避免残留旧缓存干扰）
+            legacy = os.path.join(self.path, LEGACY_CACHE_FILENAME)
+            if os.path.exists(legacy):
+                try:
+                    os.remove(legacy)
+                    log("已删除旧版 parquet 缓存")
+                except Exception:
+                    pass
+
             def conv_progress(p):
                 self.progress.emit(p)
             success = convert_folder_to_cache(self.path, cache_path, conv_progress, self)
@@ -1153,13 +1312,13 @@ class LoadThread(QThread):
                 self.finished.emit(pd.DataFrame(), True, "")
                 return
             if not success:
-                # 缓存写入失败（pyarrow 不可用/磁盘不可写等）：回退为直接加载，保证功能可用
+                # 缓存写入失败（磁盘不可写等）：回退为直接加载，保证功能可用
                 log("缓存构建失败，回退为直接加载（不使用缓存）")
                 df = self._load_folder_direct()
                 log(f"回退加载完成 | 行数={len(df)}")
                 self.finished.emit(df, self._stop, "")
                 return
-            log("读取新建的 parquet 缓存...")
+            log("读取新建的缓存...")
             df = load_cache(cache_path)
             if 'timestamp' in df.columns:
                 df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
@@ -1493,7 +1652,7 @@ class PlotSubWidget(QWidget):
             if self.main.timestamp_epoch is not None:
                 x = self.main.timestamp_epoch
             elif 'timestamp' in self.main.df.columns:
-                x = np.array([t.to_pydatetime().timestamp() for t in self.main.df['timestamp']])
+                x = _timestamps_to_epoch(self.main.df['timestamp'])
             else:
                 x = self.main.df['line_no'].values
             mask = ~np.isnan(y)
@@ -1593,8 +1752,7 @@ class PlotSubWidget(QWidget):
                 self._remove_curve(key)
         # 再移除自身
         if col in self.plot_items:
-            self.plot_widget.removeItem(self.plot_items[col])
-            del self.plot_items[col]
+            self._safe_remove_item(self.plot_items.pop(col))
         # 在线模式：通知主窗口更新记录目标（该臂无曲线时自动停止记录）
         if hasattr(self.main, '_refresh_recording_targets'):
             self.main._refresh_recording_targets()
@@ -1603,6 +1761,10 @@ class PlotSubWidget(QWidget):
         if not self.main.x_buffers:
             return
         for col, curve in list(self.plot_items.items()):
+            if not qt_alive(curve):
+                # 曲线底层对象已销毁：清理悬空引用，避免后续访问触发原生崩溃
+                del self.plot_items[col]
+                continue
             if col.endswith('[diff]'):
                 # 差分曲线：与新增时调用同一算法，保证结果前后一致
                 # 仅剥离一层后缀：数据源可能是另一条差分曲线（嵌套差分）
@@ -1776,8 +1938,7 @@ class PlotSubWidget(QWidget):
                 if self.main.timestamp_epoch is not None:
                     x_arr = self.main.timestamp_epoch
                 elif 'timestamp' in self.main.df.columns:
-                    x_arr = np.array([t.to_pydatetime().timestamp()
-                                      for t in self.main.df['timestamp']])
+                    x_arr = _timestamps_to_epoch(self.main.df['timestamp'])
                 else:
                     x_arr = self.main.df['line_no'].values
                 y_arr = self.main.df[col].values
@@ -1860,17 +2021,30 @@ class PlotSubWidget(QWidget):
             self.plot_widget.removeItem(self.cursor_annotations.pop(key))
 
     def _remove_cursor_labels(self):
-        """移除所有数值标注和时间标注"""
+        """移除所有数值标注和时间标注（跳过已销毁的悬空引用）"""
         for label in self.cursor_annotations.values():
-            self.plot_widget.removeItem(label)
+            self._safe_remove_item(label)
         self.cursor_annotations.clear()
         for ci in range(2):
             if self.cursor_time_labels[ci] is not None:
-                self.plot_widget.removeItem(self.cursor_time_labels[ci])
+                self._safe_remove_item(self.cursor_time_labels[ci])
                 self.cursor_time_labels[ci] = None
         for label in self.cursor_labels:
-            self.plot_widget.removeItem(label)
+            self._safe_remove_item(label)
         self.cursor_labels.clear()
+
+    def _safe_remove_item(self, item):
+        """安全移除绘图项：底层 C++ 对象已销毁时跳过。
+
+        PyQt 的 Python 包装对象可能比底层 C++ 对象存活更久，此时对其调用
+        removeItem 会触发 access violation（原生崩溃，Python 无法捕获）。
+        """
+        if not qt_alive(item) or not qt_alive(self.plot_widget):
+            return
+        try:
+            self.plot_widget.removeItem(item)
+        except Exception:
+            pass
 
     def _add_cursor_time_label(self, x, cursor_idx=0):
         """在游标线左侧添加/更新时间标注（原地更新）"""
@@ -1896,7 +2070,7 @@ class PlotSubWidget(QWidget):
     def clear_all_curves(self):
         self._remove_cursor_labels()
         for curve in self.plot_items.values():
-            self.plot_widget.removeItem(curve)
+            self._safe_remove_item(curve)
         self.plot_items.clear()
         # 在线模式：曲线全部清除后停止所有臂的记录
         if hasattr(self.main, '_refresh_recording_targets'):
@@ -1959,10 +2133,19 @@ class PlotTab(QWidget):
         if len(self.sub_widgets) <= 1:
             QMessageBox.information(None, "提示", "至少需要保留一个子图")
             return
-        index = self.sub_widgets.index(sub_widget)
-        self.sub_widgets.pop(index)
-        widget_to_remove = self.splitter.widget(index)
-        widget_to_remove.deleteLater()
+        # 先清除该子图内的曲线与游标项，确保销毁前绘图场景中不残留引用，
+        # 否则底层图形对象被销毁后仍被场景/字典引用，绘制时会触发原生崩溃
+        try:
+            if qt_alive(sub_widget):
+                sub_widget.clear_all_curves()
+        except Exception:
+            pass
+        if sub_widget in self.sub_widgets:
+            self.sub_widgets.remove(sub_widget)
+        # 直接使用对象引用销毁，避免依赖索引（索引一旦错位会误删其他分栏）
+        if qt_alive(sub_widget):
+            sub_widget.setParent(None)
+            sub_widget.deleteLater()
         # 在线模式：分栏关闭后其曲线不再参与记录目标计算
         if hasattr(self.main, '_refresh_recording_targets'):
             self.main._refresh_recording_targets()
@@ -2253,6 +2436,46 @@ class PlotTab(QWidget):
                     self._update_cursor_position()
                     return
         super().keyPressEvent(event)
+
+# ==================== 时间戳换算（向量化） ====================
+def _wall_clock_to_epoch(values):
+    """把"墙上时间"(naive) 按本地时区解释为 Unix epoch，整批一次算完。
+
+    与 Python datetime.timestamp() 处理 naive 时间的行为一致，但避免了逐行调用：
+    逐行 to_pydatetime().timestamp() 在数十万行时既非常慢（数万次 Python 调用
+    与 CRT 时间转换），也是原生崩溃的高发点。
+    说明：本地偏移按当前时刻取一次，跨越夏令时切换的日志会有 1 小时偏差。
+    """
+    arr = np.asarray(values, dtype='datetime64[ns]')
+    offset = datetime.datetime.now().astimezone().utcoffset()
+    offset_s = offset.total_seconds() if offset is not None else 0.0
+    mask = np.isnat(arr)
+    epoch = arr.astype('int64').astype('float64') / 1e9 - offset_s
+    if mask.any():
+        epoch[mask] = np.nan
+    return epoch
+
+
+def _timestamps_to_epoch(ts_series):
+    """时间戳列 → epoch 数组（向量化）。带时区时先剥掉时区、保留墙上时间。"""
+    ts = pd.Series(pd.to_datetime(ts_series, errors='coerce'))
+    if getattr(ts.dtype, 'tz', None) is not None:
+        ts = ts.dt.tz_localize(None)
+    return _wall_clock_to_epoch(ts.to_numpy())
+
+
+def _first_timestamp_epoch(ts_series):
+    """只转换第一个有效时间戳（相对时间模式仅需一个基准值）
+
+    复用向量化实现，避免 datetime.timestamp() 在 1970 年之前会抛
+    OSError（Errno 22）的问题。
+    """
+    first = pd.Series(pd.to_datetime(ts_series, errors='coerce')).dropna()
+    if len(first) == 0:
+        return None
+    val = float(_timestamps_to_epoch(first.iloc[:1])[0])
+    return None if np.isnan(val) else val
+
 
 # ==================== 主窗口 ====================
 # 屏幕切换事件类型（窗口拖至副屏/DPI 变化时触发界面刷新）
@@ -2650,6 +2873,24 @@ class MainWindow(QMainWindow):
             if hasattr(tab, '_align_left_axes'):
                 tab._align_left_axes()
         self._update_decimation()
+
+    def _start_post_load_heartbeat(self):
+        """加载完成后启动短时心跳日志。
+
+        用于区分两种崩溃场景：若崩溃发生在加载完成后，心跳会戛然而止；
+        若进程能持续输出心跳，说明退出发生在用户后续操作阶段。
+        """
+        if not hasattr(self, '_hb_timer'):
+            self._hb_timer = QTimer(self)
+            self._hb_timer.timeout.connect(self._on_heartbeat)
+        self._hb_left = 10  # 10 次 × 2s，覆盖加载完成后的关键 20 秒
+        self._hb_timer.start(2000)
+
+    def _on_heartbeat(self):
+        log("心跳：程序运行中")
+        self._hb_left -= 1
+        if self._hb_left <= 0:
+            self._hb_timer.stop()
 
     def _refresh_ui_after_screen_change(self):
         """窗口移动到其他屏幕后：重算布局、对齐坐标轴并强制重绘绘图区"""
@@ -3359,9 +3600,16 @@ class MainWindow(QMainWindow):
         if not folder or not os.path.isdir(folder):
             QMessageBox.warning(self, "错误", "请先选择一个文件夹")
             return
-        cache_path = os.path.join(folder, "_combined_cache.parquet")
+        cache_path = os.path.join(folder, CACHE_FILENAME)
         if os.path.exists(cache_path):
             os.remove(cache_path)
+        # 同时清理旧版 parquet 缓存，避免与新缓存混用
+        legacy = os.path.join(folder, LEGACY_CACHE_FILENAME)
+        if os.path.exists(legacy):
+            try:
+                os.remove(legacy)
+            except Exception:
+                pass
         self.force_rebuild = True
         self.start_load()
 
@@ -3453,41 +3701,30 @@ class MainWindow(QMainWindow):
 
             self.df = df
             # 预计算时间戳 epoch
+            use_relative = self.relative_time_cb.isChecked() and 'line_no' in df.columns
             # DISPLAY 格式直接用 count 值作为时间轴
             if '__display_time__' in df.columns:
                 self.timestamp_epoch = df['__display_time__'].values.astype(float)
                 df = df.drop(columns=['__display_time__'])
                 self.df = df  # 同步移除内部辅助列，避免干扰曲线/差分数据源查找
             elif 'timestamp' in df.columns and df['timestamp'].notna().any():
-                try:
-                    def _ts_to_epoch(t):
-                        """转换为 Unix epoch，使得 fromtimestamp(result)
-                        显示日志文件中的原始壁钟时间。
-
-                        注意：pandas >= 2.0 的 Timestamp.timestamp()
-                        对 naive 时间戳当作 UTC 处理，但我们需要 Python
-                        datetime.timestamp() 的行为（当作本地时间）。"""
-                        if pd.isna(t):
-                            return np.nan
-                        if getattr(t, 'tz', None) is not None:
-                            # UTC-aware: 仅剥 tz 保留原始壁钟值，
-                            # 然后当作本地时间处理。
-                            # 日志是 UTC 时间（如 10:56 UTC），
-                            # 我们想显示 10:56（壁钟时间），
-                            # 所以把 10:56 当作本地时间即可。
-                            t = t.tz_localize(None)
-                        # 用 Python datetime.timestamp() 替代 pandas Timestamp.timestamp()
-                        # Python 的 datetime.timestamp() 把 naive 当作本地时间处理
-                        return t.to_pydatetime().timestamp()
-                    self.timestamp_epoch = np.array([_ts_to_epoch(t) for t in df['timestamp']])
-                except Exception as e:
-                    print(f"时间戳转换失败: {e}")
-                    self.timestamp_epoch = None
+                if use_relative:
+                    # 相对时间模式只用得到第一个时间戳作为基准，
+                    # 因此无需逐行转换。原先逐行调用 to_pydatetime().timestamp()
+                    # 在数万～数十万行时既极慢，又是原生崩溃的高发点。
+                    base0 = _first_timestamp_epoch(df['timestamp'])
+                    self.timestamp_epoch = np.array([base0]) if base0 is not None else None
+                else:
+                    try:
+                        self.timestamp_epoch = _timestamps_to_epoch(df['timestamp'])
+                    except Exception as e:
+                        log(f"时间戳转换失败: {e}")
+                        self.timestamp_epoch = None
             else:
                 self.timestamp_epoch = None
 
             # 如果勾选了相对时间，以第一个时间戳为基准，按行号生成时间轴（忽略原始时间戳间隔）
-            if self.relative_time_cb.isChecked() and 'line_no' in df.columns:
+            if use_relative:
                 if self.timestamp_epoch is not None and len(self.timestamp_epoch) > 0 and not np.isnan(self.timestamp_epoch[0]):
                     base = self.timestamp_epoch[0]
                 else:
@@ -3544,10 +3781,12 @@ class MainWindow(QMainWindow):
             self.info_label.setText(f"✅ 已加载 {len(df)} 行，共 {len(self.current_columns)} 个数据列{time_range}")
             self.statusBar().showMessage(f"加载成功：{len(df)} 行数据")
             log(f"load_finished 完成 | 列数={len(self.current_columns)} | 时间轴={self.timestamp_epoch is not None}")
+            self._start_post_load_heartbeat()
         except Exception as e:
             log('load_finished 异常:\n' + traceback.format_exc())
             QMessageBox.critical(self, "加载错误", f"发生异常：{str(e)}\n请检查日志文件格式或尝试减少文件数量。")
             self.info_label.setText("加载失败")
+        log("load_finished 返回（已回到事件循环）")
 
 def main():
     # 最先安装崩溃捕获：窗口程序无控制台，静默退出时靠日志定位原因
