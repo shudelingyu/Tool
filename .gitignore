@@ -11,11 +11,13 @@ log/
 
 # Log files
 *.log
+logs/
 
 # Documentation PDFs
 *.pdf
 *.txt
 *.csv
+*.cst
 # Photos directory
 photos/
 

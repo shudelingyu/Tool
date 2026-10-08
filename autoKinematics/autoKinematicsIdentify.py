@@ -935,16 +935,6 @@ class AutoKinematicsWindow(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._emergency_stop)
         exec_row.addWidget(self.stop_btn)
-        exec_row.addSpacing(6)
-
-        self.save_btn = QPushButton("💾 保存数据")
-        self.save_btn.setStyleSheet(
-            f"background: {C['indigo']}; color: white; border-radius: 8px; "
-            f"padding: 9px 18px; font-size: 10pt; font-weight: bold;"
-        )
-        self.save_btn.setEnabled(False)
-        self.save_btn.clicked.connect(self._save_after_waypoint)
-        exec_row.addWidget(self.save_btn)
         card.addLayout(exec_row)
 
         return card
@@ -1028,7 +1018,6 @@ class AutoKinematicsWindow(QWidget):
         has_data = len(self.waypoints) > 0
         self.exec_btn.setEnabled(self.connected and has_data)
         self.stop_btn.setEnabled(self.connected)
-        self.save_btn.setEnabled(has_data)
         # if self.mode == 0:
         #     self.exec_btn.setText("▶ MtmMoveP执行")
         # else:
@@ -1423,7 +1412,7 @@ class AutoKinematicsWindow(QWidget):
                 return -1
 
     def _do_save_after_exec(self, wp_name: str):
-        """执行线程中直接调用：收到所有返回后，立即 SSH 读取实际角度并保存"""
+        """执行线程中直接调用：收到所有返回后，等 1s 等待日志刷新，SSH 读取实际角度并保存"""
         waypoint_angles = next((ang for n, ang in self.waypoints if n == wp_name), None)
         if not waypoint_angles:
             return
@@ -1432,6 +1421,8 @@ class AutoKinematicsWindow(QWidget):
         source = "waypoint"
 
         try:
+            # 等待 1s 让机器人日志文件更新到最新位置
+            threading.Event().wait(1)
             if self.mode == 1 and self.ssh_slave_connected:
                 arm_id = self._get_selected_arm()
                 ssh_angles = self.ssh.read_slave(arm_id)
@@ -1471,96 +1462,6 @@ class AutoKinematicsWindow(QWidget):
         except Exception as e:
             self._log(f"执行后保存关节角失败: {e}")
 
-    def _save_after_waypoint(self, auto: bool = False):
-        """保存关节角数据到.cst文件
-        - SSH可用时：读取远程日志实际关节角再保存（同 JointMonitor）
-        - SSH不可用时：回退到保存路点目标角度"""
-        row = self.table.currentRow()
-        if row < 0:
-            if not auto:
-                QMessageBox.information(self, "提示", "请先在路点列表中选中一个路点")
-            return
-
-        wp_name = self.table.item(row, 0).text()
-
-        # 获取路点数据作为 fallback
-        waypoint_angles = None
-        for name, ang in self.waypoints:
-            if name == wp_name:
-                waypoint_angles = ang
-                break
-        if not waypoint_angles:
-            self._log("无法保存：未找到路点数据")
-            return
-
-        def task():
-            try:
-                actual_angles = None
-                source = "waypoint"
-
-                if self.mode == 1 and self.ssh_slave_connected:
-                    arm_id = self._get_selected_arm()
-                    ssh_angles = self.ssh.read_slave(arm_id)
-                    if ssh_angles:
-                        actual_angles = ssh_angles
-                        source = "SSH"
-                        self._log(f"从臂{arm_id} SSH读取实机关节角成功")
-                    else:
-                        self._log(f"从臂{arm_id} SSH读取失败")
-
-                elif self.mode == 0 and self.ssh_master_connected:
-                    hand = self._get_selected_hand()
-                    arm_name = "Left" if hand == 0 else "Right"
-                    ssh_angles, view_angle = self.ssh.read_master(arm_name)
-                    if ssh_angles:
-                        actual_angles = ssh_angles
-                        source = "SSH"
-                        self._log(f"主手{arm_name} SSH读取实机关节角成功")
-                        if view_angle is not None:
-                            self._save_view_angle_to_file(view_angle)
-                    else:
-                        self._log(f"主手{arm_name} SSH读取失败")
-
-                # Fallback: 使用路点目标角度
-                if actual_angles is None:
-                    if self.ssh_slave_connected or self.ssh_master_connected:
-                        self._log("SSH读取失败，回退到路点目标角度")
-                    actual_angles = waypoint_angles
-
-                # 保存角度到 .cst 文件
-                if self.mode == 1:
-                    arm_id = self._get_selected_arm()
-                    front_8 = actual_angles[:8]
-                    back_4 = actual_angles[8:12] if len(actual_angles) >= 12 else []
-                    psm_file = os.path.join(self.data_dir, f"psm{arm_id}_joint.cst")
-                    inst_file = os.path.join(self.data_dir, f"inst{arm_id}_joint.cst")
-
-                    line_no_psm = self._write_joint_file(psm_file, front_8, 8, "actpos")
-                    if back_4:
-                        line_no_inst = self._write_joint_file(inst_file, back_4, 4, "actpos")
-                        if line_no_inst > 0:
-                            self._log(f"从臂{arm_id} 后4关节保存完成 (第{line_no_inst}个点)")
-                    else:
-                        self._log(f"从臂{arm_id} 无后4关节数据，跳过")
-
-                    if line_no_psm > 0:
-                        self._log(f"从臂{arm_id} 前8关节保存完成 (第{line_no_psm}个点) [{source}]")
-
-                elif self.mode == 0:
-                    hand = self._get_selected_hand()
-                    filename = "mtm1_joint.cst" if hand == 0 else "mtm2_joint.cst"
-                    filepath = os.path.join(self.data_dir, filename)
-                    line_no = self._write_joint_file(filepath, actual_angles, 7, "addlpos")
-                    if line_no > 0:
-                        self._log(f"{'左手' if hand==0 else '右手'} 关节数据保存完成 (第{line_no}个点) [{source}]")
-
-                if auto:
-                    self._log(f"路点 [{wp_name}] 数据已保存 [{source}]")
-            except Exception as e:
-                self._log(f"保存数据失败: {e}")
-
-        threading.Thread(target=task, daemon=True).start()
-
     def _save_view_angle_to_file(self, view_angle: float):
         """保存 view_angle 到文件（同 JointMonitor）"""
         if view_angle is None:
@@ -1577,7 +1478,7 @@ class AutoKinematicsWindow(QWidget):
         
 
         def task():
-            for cmd in ["{Stop}", "{Start}"]:
+            for cmd in ["{Stop}", "{Start}", "{Clear}"]:
                 self._log(f"急停 发送: {cmd}")
                 resp, err = self.tcp.send_and_recv(cmd, timeout=500.0, expected=self.model)
                 if resp:

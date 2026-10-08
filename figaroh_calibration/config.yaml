@@ -1,0 +1,31 @@
+# config.yaml
+# UR机械运动学标定配置文件
+
+# 1. 机器人基本信息
+robot_name: "ur10"
+urdf_path: "robot.urdf"  # 你的URDF文件路径
+
+# 2. 运动学链定义
+start_frame: "base_link"    # 机器人基座坐标系
+end_frame: "tool0"          # 末端执行器坐标系
+
+# 3. 测量数据文件
+data_file: "measurements.csv"
+
+# 4. 标定参数类型
+# "full": 完整6自由度运动学参数 (x, y, z, rx, ry, rz)
+# "joint_offset": 仅关节偏移量
+calib_model: "full"
+
+# 5. 优化参数
+optimization:
+  method: "lm"                # Levenberg-Marquardt
+  max_iterations: 3           # 最大迭代轮数
+  outlier_threshold: 3.0      # 离群值判定阈值 (基于MAD)
+  plotting: true              # 绘制优化过程
+  save_results: true          # 保存结果
+
+# 6. 测量权重 (位置和姿态的单位不同，需要分别加权)
+measurement_weighting:
+  pos_weight: 1.0             # 位置权重 (米)
+  orient_weight: 0.1          # 姿态权重 (弧度)

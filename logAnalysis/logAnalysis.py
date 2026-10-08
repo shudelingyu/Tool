@@ -4,7 +4,12 @@
 import os
 import re
 import sys
+import time
 import datetime
+import threading
+import tempfile
+import traceback
+import faulthandler
 import paramiko
 import json
 from collections import deque
@@ -17,14 +22,270 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QAbstractItemView, QGroupBox, QCheckBox,
                              QTreeWidget, QTreeWidgetItem, QComboBox, QSizePolicy,
                              QRadioButton, QStackedWidget, QTabWidget, QHeaderView,
-                             QShortcut, QMenu, QAction)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QEvent
-from PyQt5.QtGui import QDrag
+                             QShortcut, QMenu, QAction, QToolButton, QTabBar)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QEvent, QSize
+from PyQt5.QtGui import QDrag, QFont, QIcon, QPixmap, QPainter, QPen, QColor
 import pyqtgraph as pg
 
 # 设置 PyQtGraph 全局背景白色、前景黑色
 pg.setConfigOptions(background='w', foreground='k')
 pg.setConfigOptions(antialias=True)
+
+# ==================== 全局设计系统（现代扁平化浅色主题） ====================
+# 色彩规范：主色 #2563EB（操作引导）/ 背景 #F1F5F9 / 卡片 #FFFFFF /
+# 文字 #1E293B·#475569·#64748B（三级层次）/ 语义色：危险 #DC2626、选中 #DBEAFE
+MODERN_QSS = """
+/* ---------- 基础容器 ---------- */
+QMainWindow, QDialog { background-color: #F1F5F9; }
+QMessageBox, QInputDialog { background-color: #FFFFFF; }
+QWidget { color: #1E293B; font-size: 9pt; }
+
+QToolTip {
+    background-color: #1E293B; color: #F8FAFC;
+    border: 1px solid #334155; border-radius: 4px;
+    padding: 5px 8px; font-size: 9pt;
+}
+QStatusBar { background-color: #FFFFFF; border-top: 1px solid #E2E8F0; color: #64748B; }
+QStatusBar::item { border: none; }
+
+/* ---------- 按钮（默认/主操作/危险/图标 四级） ---------- */
+QPushButton {
+    background-color: #FFFFFF; border: 1px solid #CBD5E1;
+    border-radius: 6px; padding: 5px 14px; color: #334155;
+}
+QPushButton:hover   { background-color: #F8FAFC; border-color: #94A3B8; }
+QPushButton:pressed { background-color: #E2E8F0; }
+QPushButton:focus   { border-color: #2563EB; }
+QPushButton:disabled { color: #94A3B8; background-color: #F8FAFC; border-color: #E2E8F0; }
+
+QPushButton[class="primary"] {
+    background-color: #2563EB; border-color: #2563EB; color: #FFFFFF; font-weight: 600;
+}
+QPushButton[class="primary"]:hover   { background-color: #1D4ED8; border-color: #1D4ED8; }
+QPushButton[class="primary"]:pressed { background-color: #1E40AF; border-color: #1E40AF; }
+QPushButton[class="primary"]:disabled{ background-color: #93C5FD; border-color: #93C5FD; color: #EFF6FF; }
+
+QPushButton[class="danger"] { color: #DC2626; border-color: #FECACA; }
+QPushButton[class="danger"]:hover   { background-color: #FEF2F2; border-color: #FCA5A5; }
+QPushButton[class="danger"]:pressed { background-color: #FEE2E2; }
+QPushButton[class="danger"]:disabled { color: #FCA5A5; border-color: #FEE2E2; }
+
+QPushButton[class="icon"] {
+    background-color: transparent; border: 1px solid transparent;
+    border-radius: 6px; padding: 3px 6px; color: #475569;
+}
+QPushButton[class="icon"]:hover   { background-color: #E2E8F0; border-color: #CBD5E1; }
+QPushButton[class="icon"]:pressed { background-color: #CBD5E1; }
+QPushButton[class="icon"]:checked { background-color: #DBEAFE; border-color: #93C5FD; color: #1D4ED8; }
+QPushButton[class="icon"]:disabled { color: #CBD5E1; }
+
+/* ---------- 输入控件 ---------- */
+QLineEdit, QSpinBox, QComboBox {
+    background-color: #FFFFFF; border: 1px solid #CBD5E1;
+    border-radius: 6px; padding: 4px 8px;
+    selection-background-color: #2563EB; selection-color: #FFFFFF;
+}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: #2563EB; }
+QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {
+    background-color: #F8FAFC; color: #94A3B8; border-color: #E2E8F0;
+}
+QComboBox::drop-down { border: none; width: 20px; }
+QComboBox QAbstractItemView {
+    background-color: #FFFFFF; border: 1px solid #E2E8F0;
+    border-radius: 6px; padding: 4px; outline: none;
+    selection-background-color: #DBEAFE; selection-color: #1D4ED8;
+}
+QCheckBox, QRadioButton { background-color: transparent; color: #334155; spacing: 6px; }
+
+/* ---------- 分组卡片 ---------- */
+QGroupBox {
+    background-color: #FFFFFF; border: 1px solid #E2E8F0;
+    border-radius: 8px; margin-top: 11px; padding: 6px;
+    font-weight: 600; color: #334155;
+}
+QGroupBox::title {
+    subcontrol-origin: margin; subcontrol-position: top left;
+    left: 10px; padding: 0 4px; color: #475569;
+}
+
+/* ---------- 进度条 ---------- */
+QProgressBar {
+    background-color: #E2E8F0; border: none; border-radius: 6px;
+    text-align: center; color: #1E293B; font-size: 8pt;
+}
+QProgressBar::chunk { background-color: #2563EB; border-radius: 6px; }
+
+/* ---------- 标签页（胶囊式） ---------- */
+QTabWidget::pane { border: 1px solid #E2E8F0; border-radius: 8px; background-color: #FFFFFF; }
+QTabBar { background-color: transparent; }
+QTabBar::tab {
+    background-color: #E2E8F0; color: #475569;
+    padding: 5px 5px; margin: 6px 4px 2px 0;
+    border-radius: 6px; border: 1px solid transparent;
+}
+QTabBar::tab:hover { background-color: #CBD5E1; color: #1E293B; }
+QTabBar::tab:selected { background-color: #2563EB; color: #FFFFFF; font-weight: 600; }
+
+/* ---------- 数据列树 ---------- */
+QTreeWidget {
+    background-color: #FFFFFF; border: 1px solid #E2E8F0;
+    border-radius: 8px; padding: 2px;
+    alternate-background-color: #F8FAFC; outline: none;
+}
+QTreeWidget::item { height: 24px; border-radius: 4px; }
+QTreeWidget::item:hover { background-color: #F1F5F9; }
+QTreeWidget::item:selected { background-color: #DBEAFE; color: #1D4ED8; }
+QHeaderView::section {
+    background-color: #F8FAFC; border: none;
+    border-bottom: 1px solid #E2E8F0; padding: 5px 6px;
+    color: #64748B; font-weight: 600;
+}
+
+/* ---------- 滚动条 / 分栏手柄 ---------- */
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: #CBD5E1; border-radius: 5px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: #94A3B8; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal { background: #CBD5E1; border-radius: 5px; min-width: 30px; }
+QScrollBar::handle:horizontal:hover { background: #94A3B8; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+QSplitter::handle { background-color: #E2E8F0; }
+QSplitter::handle:horizontal { width: 2px; }
+QSplitter::handle:vertical { height: 2px; }
+QSplitter::handle:hover { background-color: #93C5FD; }
+
+/* ---------- 右键菜单 ---------- */
+QMenu {
+    background-color: #FFFFFF; border: 1px solid #E2E8F0;
+    border-radius: 8px; padding: 6px;
+}
+QMenu::item { padding: 6px 24px 6px 12px; border-radius: 4px; color: #334155; }
+QMenu::item:selected { background-color: #DBEAFE; color: #1D4ED8; }
+QMenu::separator { height: 1px; background-color: #E2E8F0; margin: 4px 8px; }
+
+/* ---------- 语义标签 ---------- */
+QLabel#appTitle { color: #1D4ED8; font-size: 15pt; font-weight: bold; }
+QLabel#sectionLabel { color: #64748B; font-weight: 600; }
+QLabel#logoLabel { color: #94A3B8; font-size: 8pt; padding: 4px 0; }
+QLabel[class="card"] {
+    background-color: #F8FAFC; border: 1px solid #E2E8F0;
+    border-radius: 6px; padding: 8px; color: #475569;
+}
+"""
+
+
+def close_x_icon(size=11, color="#475569", hover="#DC2626", weight=1.5):
+    """矢量 ✕ 关闭图标：4 倍超采样后交给 Qt 缩放，100%~400% 缩放下都锐利。
+
+    不用 "✖"/"✕" 字符——字体回退后会变成又粗又黑的大叉，和扁平风格打架。
+    悬停时 Qt 自动切到 Active 那张（变红），无需额外事件处理。
+    """
+    ss = 4.0                       # 超采样倍数
+    icon = QIcon()
+    for state, col in ((QIcon.Normal, color), (QIcon.Active, hover), (QIcon.Selected, hover)):
+        edge = int(size * ss)
+        pm = QPixmap(edge, edge)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(QColor(col), weight * ss)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        m = int(edge * 0.15)        # 端点内缩，否则圆头会被裁掉
+        p.drawLine(m, m, edge - m, edge - m)
+        p.drawLine(edge - m, m, m, edge - m)
+        p.end()
+        # 必须画完再设：DPR 会让 QPainter 的坐标一起放大，先设的话第二笔会画出画布
+        pm.setDevicePixelRatio(ss)
+        icon.addPixmap(pm, state)
+    return icon
+
+
+# ==================== 崩溃诊断与日志 ====================
+# 打包为窗口程序（console=False）后 stdout/stderr 不可见，静默崩溃时没有任何线索。
+# 这里把日志写到 exe 同级的 logs 目录（不可写时回退系统临时目录），
+# 并用 faulthandler 捕获原生崩溃（访问违例/非法指令）的 C 级堆栈。
+_LOG_HANDLE = None
+_LOG_PATH = None
+
+
+def get_app_base_dir():
+    """返回程序基准目录：打包后为 exe 所在目录，开发环境为脚本所在目录"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _open_log_file():
+    """打开日志文件（进程内仅打开一次），返回文件句柄或 None"""
+    global _LOG_HANDLE, _LOG_PATH
+    if _LOG_HANDLE is not None:
+        return _LOG_HANDLE
+    for d in (os.path.join(get_app_base_dir(), 'logs'),
+              os.path.join(tempfile.gettempdir(), 'logAnalysis_logs')):
+        try:
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, 'logAnalysis.log')
+            _LOG_HANDLE = open(path, 'a', encoding='utf-8', errors='replace')
+            _LOG_PATH = path
+            return _LOG_HANDLE
+        except Exception:
+            continue
+    return None
+
+
+def log(msg):
+    """写入带时间戳的运行日志（同时打印到控制台便于开发调试）"""
+    line = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {msg}"
+    fh = _open_log_file()
+    if fh is not None:
+        try:
+            fh.write(line + '\n')
+            fh.flush()
+        except Exception:
+            pass
+    try:
+        print(line)
+    except Exception:
+        pass
+
+
+def setup_crash_logging():
+    """安装崩溃捕获：Python 异常 + 子线程异常 + 原生崩溃（faulthandler）"""
+    fh = _open_log_file()
+    if fh is not None:
+        try:
+            faulthandler.enable(fh)  # 原生崩溃也会写入 C 级堆栈
+        except Exception:
+            pass
+
+    log('=' * 70)
+    log(f"程序启动 | frozen={getattr(sys, 'frozen', False)} | Python={sys.version.split()[0]}")
+    log(f"可执行文件: {sys.executable}")
+    log(f"日志文件: {_LOG_PATH}")
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        text = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        log('未捕获的 Python 异常:\n' + text)
+        try:
+            QMessageBox.critical(None, "程序错误",
+                                 f"发生未处理的错误：\n{exc_value}\n\n详细日志：\n{_LOG_PATH}")
+        except Exception:
+            pass
+
+    sys.excepthook = _excepthook
+
+    def _thread_excepthook(args):
+        text = ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        log(f"子线程 [{getattr(args.thread, 'name', '?')}] 未捕获异常:\n" + text)
+
+    try:
+        threading.excepthook = _thread_excepthook
+    except Exception:
+        pass
+
 
 # ==================== 日志解析模块（配置文件驱动） ====================
 TIMESTAMP_PAT = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]\s*')
@@ -222,21 +483,35 @@ def parse_timestamp(line: str):
     return None, line
 
 def get_config_path():
+    """定位数据格式配置文件，按优先级返回第一个存在的路径：
+    1) exe/脚本同级 configs  —— 便于用户现场覆盖配置
+    2) 打包内置资源(_MEIPASS)/configs —— 保证 exe 单独拷贝到其他电脑也能用
+    """
     if getattr(sys, 'frozen', False):
-        # 打包成 exe 时，配置文件放在 exe 同级目录下的 configs 文件夹
-        base_dir = os.path.dirname(sys.executable)
+        candidates = [os.path.join(os.path.dirname(sys.executable), 'configs', 'data_formats.json')]
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            candidates.append(os.path.join(meipass, 'configs', 'data_formats.json'))
     else:
-        # 开发环境，使用脚本所在目录
-        base_dir = os.path.dirname(__file__)
-    return os.path.join(base_dir, 'configs', 'data_formats.json')
+        candidates = [os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs', 'data_formats.json')]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]  # 均不存在时返回首选路径，便于日志提示
 
-# 加载配置文件（与 .py 同目录下的 configs/data_formats.json）
+
+# 加载配置文件（可能位于 exe 同级目录，或打包内置的 configs 资源中）
 _CONFIG_PATH = get_config_path()
-if os.path.exists(_CONFIG_PATH):
-    config = FormatConfig(_CONFIG_PATH)
-else:
-    config = None
-    print(f"警告：配置文件未找到，路径 {_CONFIG_PATH}")
+config = None
+try:
+    if os.path.exists(_CONFIG_PATH):
+        config = FormatConfig(_CONFIG_PATH)
+        log(f"配置文件加载成功: {_CONFIG_PATH}")
+    else:
+        log(f"警告：配置文件未找到，路径 {_CONFIG_PATH}（将无法解析日志格式）")
+except Exception as _cfg_err:
+    # 配置损坏不应导致程序无法启动
+    log(f"警告：配置文件解析失败（{_CONFIG_PATH}）：{_cfg_err}")
 
 def parse_slave_line_fast(data_part: str):
     return config.parse_values('slave', data_part) if config else (None, None)
@@ -370,103 +645,153 @@ def parse_log_line(line: str):
     return [(ts_str, None, None)]
 
 # ==================== 实时监控线程 ====================
+# 无数据超时（秒）：激活记录后超过该时长未读到任何数据，自动停止该臂的读取与记录
+NO_DATA_TIMEOUT = 10.0
+
 class LiveThread(QThread):
-    new_data = pyqtSignal(float, dict)
-    error = pyqtSignal(str)
+    new_batch = pyqtSignal(list)     # 批量数据 [(epoch, {col: val}), ...]（已按需过滤列）
+    error = pyqtSignal(str, str)     # (臂前缀, 错误信息)
     status = pyqtSignal(str)
 
-    def __init__(self, host, port, username, password, remote_path):
+    def __init__(self, host, port, username, password, remote_path, arm_prefix=''):
         super().__init__()
         self.host = host
         self.port = port
         self.username = username
         self.password = password
         self.remote_path = remote_path
+        self.arm_prefix = arm_prefix
         self._running = False
         self.ssh = None
         self.sftp = None
         self.file = None
         self.paused = False
+        # ---- 按需记录控制 ----
+        self.recording_enabled = False  # False=空闲：不读取数据行，仅监控文件状态
+        self.active_cols_bare = None    # None=记录全部列（动态格式）；set=仅记录这些裸列名
+        self.decimation = 1             # 抽稀间隔：每 N 行记录 1 行（按窗口大小动态调整）
+        self._need_seek_end = False     # 激活记录时先跳到文件末尾，只记录最新数据
+        self._decim_counter = 0
+        self._last_data_time = None     # 最近一次读到数据的时间（monotonic）
 
     def set_paused(self, paused):
         self.paused = paused
 
     def run(self):
+        batch = []
         try:
             self.ssh = paramiko.SSHClient()
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             self.ssh.connect(self.host, port=self.port, username=self.username,
-                            password=self.password, timeout=5)
+                             password=self.password, timeout=5)
             self.sftp = self.ssh.open_sftp()
             self.file = self.sftp.open(self.remote_path, 'r')
             self.file.seek(0, 2)
             self._running = True
-            self.status.emit("已连接，开始实时监控...")
+            self._last_data_time = time.monotonic()
+            if self.recording_enabled:
+                self.status.emit(f"[{self.arm_prefix}] 已连接，开始实时监控...")
+            else:
+                self.status.emit(f"[{self.arm_prefix}] 已连接（空闲，拖入曲线后开始记录）")
 
-            last_stat = self.sftp.stat(self.remote_path)
-            last_size = last_stat.st_size
-            last_mtime = last_stat.st_mtime
+            last_size = self.sftp.stat(self.remote_path).st_size
             check_counter = 0
-
             last_ts_str = None  # 保存最近一个有时间戳的字符串
+            last_flush = time.monotonic()
 
             while self._running:
+                # 激活记录时跳到文件末尾：只记录拖入曲线之后的最新数据
+                if self._need_seek_end:
+                    try:
+                        self.file.seek(0, 2)
+                    except Exception:
+                        pass
+                    self._need_seek_end = False
+                    self._last_data_time = time.monotonic()
+                    if batch:
+                        self.new_batch.emit(batch)
+                        batch = []
+                        last_flush = time.monotonic()
+
+                # 空闲模式：该臂当前无活动曲线，不读取数据行（节省 CPU/带宽）
+                if not self.recording_enabled:
+                    check_counter += 1
+                    if check_counter >= 20:  # ~2s 检查一次文件轮转
+                        check_counter = 0
+                        last_size = self._check_rotation(last_size)
+                    self.msleep(100)
+                    continue
+
                 line = self.file.readline()
                 if line:
                     line = line.strip()
                     if line:
-                        results = parse_log_line(line)
-                        for ts_str, cols, vals in results:
-                            if cols is None or vals is None:
-                                continue
-                            # 优先使用本片段的 ts_str；若没有则使用上一次有时间戳的字符串
-                            ts_use = ts_str if ts_str else last_ts_str
-                            # 若本片段带时间戳，更新 last_ts_str
-                            if ts_str:
-                                last_ts_str = ts_str
-
-                            # 解析为 epoch（若没有可用时间戳则回退到系统时间）
-                            if not ts_use:
-                                epoch = datetime.datetime.now().timestamp()
-                            else:
-                                try:
-                                    dt = datetime.datetime.strptime(ts_use, '%Y-%m-%d %H:%M:%S.%f')
-                                    epoch = dt.timestamp()
-                                except Exception:
-                                    try:
-                                        dt = datetime.datetime.strptime(ts_use, '%Y-%m-%d %H:%M:%S')
-                                        epoch = dt.timestamp()
-                                    except Exception:
+                        self._last_data_time = time.monotonic()
+                        check_counter = 0
+                        if not self.paused:
+                            # 按窗口大小抽稀，动态调整记录的数据量与详细程度
+                            skip = False
+                            if self.decimation > 1:
+                                self._decim_counter += 1
+                                if self._decim_counter % self.decimation:
+                                    skip = True
+                            if not skip:
+                                results = parse_log_line(line)
+                                for ts_str, cols, vals in results:
+                                    if cols is None or vals is None:
+                                        continue
+                                    # 优先使用本片段的时间戳；否则沿用上一次的
+                                    ts_use = ts_str if ts_str else last_ts_str
+                                    if ts_str:
+                                        last_ts_str = ts_str
+                                    if not ts_use:
                                         epoch = datetime.datetime.now().timestamp()
-
-                            data_dict = dict(zip(cols, vals))
-                            if not self.paused:
-                                self.new_data.emit(epoch, data_dict)
+                                    else:
+                                        try:
+                                            dt = datetime.datetime.strptime(ts_use, '%Y-%m-%d %H:%M:%S.%f')
+                                            epoch = dt.timestamp()
+                                        except Exception:
+                                            try:
+                                                dt = datetime.datetime.strptime(ts_use, '%Y-%m-%d %H:%M:%S')
+                                                epoch = dt.timestamp()
+                                            except Exception:
+                                                epoch = datetime.datetime.now().timestamp()
+                                    data_dict = dict(zip(cols, vals))
+                                    # 针对性记录：仅记录当前操作的臂上已绘制的列
+                                    if self.active_cols_bare is not None:
+                                        data_dict = {c: v for c, v in data_dict.items()
+                                                     if c in self.active_cols_bare}
+                                    if data_dict:
+                                        batch.append((epoch, data_dict))
                 else:
+                    if batch:
+                        self.new_batch.emit(batch)
+                        batch = []
+                        last_flush = time.monotonic()
                     check_counter += 1
                     if check_counter >= 5:
                         check_counter = 0
-                        try:
-                            new_stat = self.sftp.stat(self.remote_path)
-                            if new_stat.st_size < last_size or new_stat.st_mtime > last_mtime:
-                                self.file.close()
-                                self.file = self.sftp.open(self.remote_path, 'r')
-                                self.file.seek(0, 2)
-                                last_stat = new_stat
-                                last_size = new_stat.st_size
-                                last_mtime = new_stat.st_mtime
-                                self.status.emit("检测到日志轮转，已重新连接")
-                                continue
-                            last_size = new_stat.st_size
-                            last_mtime = new_stat.st_mtime
-                        except FileNotFoundError:
-                            pass
-                        except Exception as e:
-                            self.error.emit(f"检查文件状态出错: {e}")
+                        last_size = self._check_rotation(last_size)
+                    # 无数据超时：该臂没有数据时自动停止其读取与记录
+                    if self._last_data_time is not None and (
+                            time.monotonic() - self._last_data_time > NO_DATA_TIMEOUT):
+                        self.status.emit(f"[{self.arm_prefix}] 无数据（超过 {NO_DATA_TIMEOUT:.0f}s），自动停止该臂读取")
+                        break
                     self.msleep(10)
+
+                # 批量上报：攒批大幅降低跨线程信号开销（相比逐行发送）
+                if batch and (len(batch) >= 200 or time.monotonic() - last_flush >= 0.1):
+                    self.new_batch.emit(batch)
+                    batch = []
+                    last_flush = time.monotonic()
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(self.arm_prefix, str(e))
         finally:
+            if batch:
+                try:
+                    self.new_batch.emit(batch)
+                except Exception:
+                    pass
             if self.file:
                 self.file.close()
             if self.sftp:
@@ -474,6 +799,28 @@ class LiveThread(QThread):
             if self.ssh:
                 self.ssh.close()
             self._running = False
+
+    def _check_rotation(self, last_size):
+        """检查远程文件是否被截断/轮转，返回新的 last_size。
+        仅以"文件变小"判定轮转；mtime 变化属于正常追加，不重开文件
+        （旧逻辑按 mtime 重开会 seek 到末尾，丢失刚写入的数据）。"""
+        try:
+            new_stat = self.sftp.stat(self.remote_path)
+            if new_stat.st_size < last_size:
+                # 文件被截断或轮转：重新打开并从新文件末尾继续跟踪
+                try:
+                    self.file.close()
+                except Exception:
+                    pass
+                self.file = self.sftp.open(self.remote_path, 'r')
+                self.file.seek(0, 2)
+                self.status.emit(f"[{self.arm_prefix}] 检测到日志轮转，已重新连接")
+            return new_stat.st_size
+        except FileNotFoundError:
+            return last_size  # 文件暂时不存在（可能正在轮转），等待重建
+        except Exception as e:
+            self.error.emit(self.arm_prefix, f"检查文件状态出错: {e}")
+            return last_size
 
     def stop(self):
         self._running = False
@@ -543,7 +890,14 @@ def convert_folder_to_cache(folder_path, cache_path, progress_callback=None, sto
     else:
         base_epoch = 0.0
     combined['timestamp'] = pd.to_datetime(base_epoch * 1000 + (combined['line_no'] - 1), unit='ms', utc=True)
-    combined.to_parquet(cache_path, index=False, engine='pyarrow')
+    log(f"写入 parquet 缓存: {cache_path} | 行数={len(combined)} | 列数={len(combined.columns)}")
+    try:
+        combined.to_parquet(cache_path, index=False, engine='pyarrow')
+    except Exception as e:
+        # 缓存写入失败不应中断加载：调用方会回退为直接加载
+        log(f"parquet 写入失败: {e}")
+        return False
+    log("parquet 缓存写入完成")
     if stop_event and stop_event.is_set():
         return False
     return True
@@ -628,6 +982,8 @@ def load_single_log_file(filepath, progress_callback=None, stop_event=None):
 
             # 非 ADS：格式已知后用缓存避免重复 detect_format
             cols = vals = None
+            if config is None:
+                continue  # 配置缺失：跳过非 ADS 行（已在启动日志中提示）
             if cached_fmt is not None:
                 cols, vals = config.parse_values(cached_fmt, rest, cached_variant)
             if cols is None:
@@ -705,8 +1061,34 @@ class LoadThread(QThread):
     def stop_load(self):
         self._stop = True
 
+    def _load_folder_direct(self):
+        """不使用缓存直接加载文件夹内所有日志，返回 DataFrame（失败返回空表）"""
+        files = [os.path.join(self.path, f) for f in os.listdir(self.path)
+                 if os.path.isfile(os.path.join(self.path, f))
+                 and f != '_combined_cache.parquet'
+                 and not is_compressed_file(f)]
+        files.sort(key=lambda f: get_file_first_timestamp(f) or datetime.datetime.min)
+        total = len(files)
+        dfs = []
+        for i, fpath in enumerate(files):
+            if self._stop:
+                return pd.DataFrame()
+            self.progress.emit(i / total)
+            df = load_single_log_file(fpath, stop_event=self)
+            if not df.empty:
+                dfs.append(df)
+        if not dfs:
+            return pd.DataFrame()
+        df = pd.concat(dfs, ignore_index=True)
+        if 'timestamp' in df.columns and not self.use_relative_time:
+            df = df.sort_values('timestamp').reset_index(drop=True)
+        df['line_no'] = range(1, len(df) + 1)
+        return df
+
     def run(self):
         try:
+            log(f"开始加载 | 路径={self.path} | 多文件={self.files is not None} "
+                f"| 缓存={self.use_cache} | 重建={self.force_rebuild}")
             if self.files is not None:
                 # 多文件模式：已按时间戳排序
                 total = len(self.files)
@@ -737,28 +1119,8 @@ class LoadThread(QThread):
                 return
 
             if not self.use_cache:
-                files = [os.path.join(self.path, f) for f in os.listdir(self.path)
-                    if os.path.isfile(os.path.join(self.path, f))
-                    and f != '_combined_cache.parquet'
-                    and not is_compressed_file(f)]
-                files.sort(key=lambda f: get_file_first_timestamp(f) or datetime.datetime.min)
-                total = len(files)
-                dfs = []
-                for i, fpath in enumerate(files):
-                    if self._stop:
-                        self.finished.emit(pd.DataFrame(), True, "")
-                        return
-                    self.progress.emit(i / total)
-                    df = load_single_log_file(fpath, stop_event=self)
-                    if not df.empty:
-                        dfs.append(df)
-                if not dfs:
-                    df = pd.DataFrame()
-                else:
-                    df = pd.concat(dfs, ignore_index=True)
-                    if 'timestamp' in df.columns and not self.use_relative_time:
-                        df = df.sort_values('timestamp').reset_index(drop=True)
-                    df['line_no'] = range(1, len(df)+1)
+                df = self._load_folder_direct()
+                log(f"文件夹直接加载完成 | 行数={len(df)}")
                 self.finished.emit(df, self._stop, "")
                 return
 
@@ -767,12 +1129,19 @@ class LoadThread(QThread):
 
             if cache_exists and not self.force_rebuild:
                 self.progress.emit(0.5)
-                df = load_cache(cache_path)
+                log("读取 parquet 缓存...")
+                try:
+                    df = load_cache(cache_path)
+                except Exception as e:
+                    # 缓存文件损坏/版本不兼容：忽略并重建，避免整个加载失败
+                    log(f"缓存读取失败，将重建: {e}")
+                    df = pd.DataFrame()
                 if df is not None and not df.empty:
                     if 'timestamp' in df.columns:
                         # utc=True 确保 timezone 不被剥离，
                         # 否则 _ts_to_epoch 无法区分 naive UTC 和 naive 本地时间
                         df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+                    log(f"缓存命中 | 行数={len(df)}")
                     self.finished.emit(df, False, "")
                     return
                 self.progress.emit(0)
@@ -780,14 +1149,24 @@ class LoadThread(QThread):
             def conv_progress(p):
                 self.progress.emit(p)
             success = convert_folder_to_cache(self.path, cache_path, conv_progress, self)
-            if not success or self._stop:
+            if self._stop:
                 self.finished.emit(pd.DataFrame(), True, "")
                 return
+            if not success:
+                # 缓存写入失败（pyarrow 不可用/磁盘不可写等）：回退为直接加载，保证功能可用
+                log("缓存构建失败，回退为直接加载（不使用缓存）")
+                df = self._load_folder_direct()
+                log(f"回退加载完成 | 行数={len(df)}")
+                self.finished.emit(df, self._stop, "")
+                return
+            log("读取新建的 parquet 缓存...")
             df = load_cache(cache_path)
             if 'timestamp' in df.columns:
                 df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+            log(f"加载完成 | 行数={len(df)} | 列数={len(df.columns)}")
             self.finished.emit(df, False, "")
         except Exception as e:
+            log('加载线程异常:\n' + traceback.format_exc())
             self.finished.emit(pd.DataFrame(), False, str(e))
 
 class TimeAxis(pg.AxisItem):
@@ -955,13 +1334,19 @@ class PlotSubWidget(QWidget):
         ctrl_layout.addStretch()
         self.follow_btn = QPushButton("🔘")
         self.follow_btn.setFixedSize(30, 25)
+        self.follow_btn.setProperty("class", "icon")
+        self.follow_btn.setToolTip("跟随最新数据（双击绘图区可同步全部子图）")
+        self.follow_btn.setAccessibleName("跟随最新数据")
         self.follow_btn.setCheckable(True)
         self.follow_btn.setChecked(self.follow_latest)
         self.follow_btn.clicked.connect(self.toggle_follow)
         ctrl_layout.addWidget(self.follow_btn)
-        self.close_btn = QPushButton("✖")
+        self.close_btn = QPushButton(close_x_icon(10), "")
+        self.close_btn.setIconSize(QSize(10, 10))
         self.close_btn.setFixedSize(25, 25)
+        self.close_btn.setProperty("class", "icon")
         self.close_btn.setToolTip("关闭此分栏")
+        self.close_btn.setAccessibleName("关闭此分栏")
         self.close_btn.clicked.connect(self.request_close)
         ctrl_layout.addWidget(self.close_btn)
 
@@ -1011,6 +1396,11 @@ class PlotSubWidget(QWidget):
     def request_close(self):
         self.parent_tab.request_remove_subwidget(self)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 分栏/窗口尺寸变化后重新对齐左轴，保证各子图网格线垂直对齐
+        self.parent_tab._align_left_axes()
+
     def _get_x_buffer(self, col):
         """从列名提取臂前缀，获取对应 x 轴数据"""
         if ':' not in col:
@@ -1018,74 +1408,86 @@ class PlotSubWidget(QWidget):
         prefix = col.split(':', 1)[0]
         return self.main.x_buffers.get(prefix, deque())
 
+    def _compute_diff_data(self, base_col):
+        """计算 base_col 的差分序列（相邻采样点差值）。
+        新增曲线与实时刷新统一调用本方法，保证前后结果一致：
+        - 在线模式：从 x/y 缓冲区按末尾对齐后求差分
+        - 离线模式：先剔除 NaN 再对相邻有效采样点求差分（避免 NaN 传播造成漏判）
+        - 嵌套差分：基于已有曲线数据再求差分
+        返回 (x, dy) 或 None（数据未就绪）。"""
+        main = self.main
+        # 在线缓冲区
+        if base_col in main.y_buffers:
+            ybuf = main.y_buffers[base_col]
+            xbuf = self._get_x_buffer(base_col)
+            if not xbuf:
+                return None
+            n = min(len(xbuf), len(ybuf))
+            if n < 2:
+                return None
+            y_orig = np.array(ybuf)[-n:]
+            x_orig = np.array(xbuf)[-n:]
+            return x_orig[1:], np.diff(y_orig)
+        # 离线 DataFrame
+        if main.df is not None and base_col in main.df.columns:
+            y_all = np.asarray(main.df[base_col].values, dtype=float)
+            if main.timestamp_epoch is not None and len(main.timestamp_epoch) == len(y_all):
+                x_all = main.timestamp_epoch
+            elif 'line_no' in main.df.columns:
+                x_all = (main.df['line_no'].values - 1) * 0.001
+            else:
+                x_all = np.arange(len(y_all), dtype=float)
+            # 与普通曲线一致：先剔除 NaN，再对相邻有效采样点求差分
+            mask = np.isfinite(y_all)
+            x_m, y_m = x_all[mask], y_all[mask]
+            if len(y_m) < 2:
+                return None
+            return x_m[1:], np.diff(y_m)
+        # 嵌套差分：基于已有曲线数据再求差分
+        if base_col in self.plot_items:
+            ox, oy = self.plot_items[base_col].getOriginalDataset()
+            if ox is None or oy is None:
+                return None
+            n = min(len(ox), len(oy))
+            if n < 2:
+                return None
+            ox = np.asarray(ox[:n])
+            oy = np.asarray(oy[:n])
+            return ox[1:], np.diff(oy)
+        return None
+
     def add_curve(self, col):
         if col in self.plot_items:
             return
         is_diff = col.endswith('[diff]')
+        # 差分的数据源：仅剥离一层后缀（支持对差分曲线再差分）
         base_col = col[:-6] if is_diff else col
-        xbuf = self._get_x_buffer(base_col if is_diff else col)
-        if xbuf:
-            x = np.array(xbuf)
-        else:
-            x = np.array([])
 
+        allow_empty = False  # 在线模式按需记录：允许先创建空曲线，数据到达后自动填充
         if is_diff:
-            # 差分模式：从原始曲线数据计算
-            if base_col in self.main.y_buffers:
-                y_orig = np.array(self.main.y_buffers[base_col])
-                if len(y_orig) < 2:
-                    return
-                y = np.diff(y_orig)
-                if len(x) > len(y_orig):
-                    x_arr = x[-len(y_orig):]
-                else:
-                    x_arr = x
-                x = x_arr[1:] if len(x_arr) > 1 else x_arr
-                if len(x) > len(y):
-                    x = x[-len(y):]
-            elif self.main.df is not None and base_col in self.main.df.columns:
-                y_orig = self.main.df[base_col].values
-                if len(y_orig) < 2:
-                    return
-                y = np.diff(y_orig)  # 先 diff，NaN 自然传播
-                if base_col in self.plot_items:
-                    orig_curve = self.plot_items[base_col]
-                    orig_x, _ = orig_curve.getOriginalDataset()
-                    if orig_x is not None and len(orig_x) > 1:
-                        x = orig_x[1:]
-                else:
-                    if self.main.timestamp_epoch is not None:
-                        x = self.main.timestamp_epoch[1:]
-                    elif 'line_no' in self.main.df.columns:
-                        x = self.main.df['line_no'].values[1:]
-                min_len = min(len(x), len(y))
-                if min_len == 0:
-                    return
-                x = x[-min_len:]
-                y = y[-min_len:]
-            elif base_col in self.plot_items:
-                # 对已有曲线（含差分曲线）再次差分
-                orig_curve = self.plot_items[base_col]
-                orig_x, orig_y = orig_curve.getOriginalDataset()
-                if orig_y is None or len(orig_y) < 2:
-                    return
-                y = np.diff(orig_y)
-                x = orig_x[1:] if orig_x is not None and len(orig_x) > 1 else x
-                if len(x) > len(y):
-                    x = x[-len(y):]
-                elif len(y) > len(x):
-                    y = y[-len(x):]
-            # 相对时间模式：差分除以采样周期 0.001s，得到每秒变化率
-            if getattr(self.main, 'relative_time_cb', None) and self.main.relative_time_cb.isChecked():
-                y = y / 0.001
-            else:
+            # 差分曲线：数据源必须存在（在线缓冲区 / 离线数据 / 已有曲线）
+            src_ok = (base_col in self.main.y_buffers
+                      or (self.main.df is not None and base_col in self.main.df.columns)
+                      or base_col in self.plot_items)
+            if not src_ok:
                 return
+            result = self._compute_diff_data(base_col)
+            if result is not None:
+                x, y = result
+            else:
+                x, y = np.array([]), np.array([])
+                allow_empty = True
         elif col in self.main.y_buffers:
-            y = np.array(self.main.y_buffers[col])
-            if len(x) > len(y):
-                x = x[-len(y):]
-            elif len(y) > len(x):
-                y = y[-len(x):]
+            # 在线模式：与 x 轴按末尾对齐（允许为空）
+            y_arr = np.array(self.main.y_buffers[col])
+            xbuf = self._get_x_buffer(col)
+            x_arr = np.array(xbuf) if xbuf else np.array([])
+            n = min(len(x_arr), len(y_arr))
+            if n:
+                x, y = x_arr[-n:], y_arr[-n:]
+            else:
+                x, y = np.array([]), np.array([])
+                allow_empty = True
         elif self.main.df is not None and col in self.main.df.columns:
             y = self.main.df[col].values
             if self.main.timestamp_epoch is not None:
@@ -1099,10 +1501,12 @@ class PlotSubWidget(QWidget):
             y = y[mask]
         else:
             return
-        if len(y) == 0 or np.all(np.isnan(y)):
+
+        if not allow_empty and (len(y) == 0 or np.all(np.isnan(y))):
             return
 
         if is_diff and base_col in self.plot_items:
+            # 差分曲线沿用其基曲线的颜色，便于对应识别
             orig_pen = self.plot_items[base_col].opts.get('pen')
             if orig_pen is not None:
                 try:
@@ -1115,6 +1519,8 @@ class PlotSubWidget(QWidget):
             color = self._next_color()
         pen = pg.mkPen(color=color, width=2.0, style=Qt.DashLine if is_diff else Qt.SolidLine)
         opts = {'pen': pen, 'name': col, 'antialias': False, 'downsample': 300, 'autoDownsample': True}
+        if is_diff or col in self.main.y_buffers:
+            opts['connect'] = 'finite'  # NaN 处断开，避免误连线造成误判
         curve = self.plot_widget.plot(x, y, **opts)
         self.plot_items[col] = curve
         # 如果游标已激活，为新曲线添加标注
@@ -1124,6 +1530,9 @@ class PlotSubWidget(QWidget):
         if self.follow_latest and self.main.x_buffers:
             self.scroll_to_latest()
         self.parent_tab._align_left_axes()
+        # 在线模式：通知主窗口按需启动该臂的数据记录（仅记录当前操作的臂）
+        if hasattr(self.main, '_refresh_recording_targets'):
+            self.main._refresh_recording_targets()
 
     def _get_legend_col_at_scene_pos(self, scene_pos):
         """如果 scene_pos 落在图例标签上，返回对应的 col 名，否则返回 None"""
@@ -1152,7 +1561,7 @@ class PlotSubWidget(QWidget):
         if diff_col in self.plot_items:
             action = QAction("隐藏差分", self)
         else:
-            action = QAction("显示差分", self)
+            action = QAction("显示差分（相邻采样点差值）", self)
         action.triggered.connect(lambda: self._toggle_diff(col))
         menu.addAction(action)
         menu.addSeparator()
@@ -1166,10 +1575,15 @@ class PlotSubWidget(QWidget):
         """切换差分曲线的显示/隐藏"""
         diff_col = f"{col}[diff]"
         if diff_col in self.plot_items:
-            self.plot_widget.removeItem(self.plot_items[diff_col])
-            del self.plot_items[diff_col]
+            self._remove_curve(diff_col)
         else:
             self.add_curve(diff_col)
+            if diff_col in self.plot_items:
+                try:
+                    self.main.statusBar().showMessage(
+                        f"已显示 {col} 的差分曲线（相邻采样点差值，虚线显示）")
+                except Exception:
+                    pass
 
     def _remove_curve(self, col):
         """从绘图区域移除曲线及其依赖曲线（嵌套差分）"""
@@ -1181,63 +1595,33 @@ class PlotSubWidget(QWidget):
         if col in self.plot_items:
             self.plot_widget.removeItem(self.plot_items[col])
             del self.plot_items[col]
+        # 在线模式：通知主窗口更新记录目标（该臂无曲线时自动停止记录）
+        if hasattr(self.main, '_refresh_recording_targets'):
+            self.main._refresh_recording_targets()
 
     def update_curves(self):
         if not self.main.x_buffers:
             return
         for col, curve in list(self.plot_items.items()):
             if col.endswith('[diff]'):
+                # 差分曲线：与新增时调用同一算法，保证结果前后一致
+                # 仅剥离一层后缀：数据源可能是另一条差分曲线（嵌套差分）
                 base_col = col[:-6]
-                if base_col in self.main.y_buffers:
-                    y_orig = np.array(self.main.y_buffers[base_col])
-                    if len(y_orig) < 2:
-                        continue
-                    y_arr = np.diff(y_orig)
-                    xbuf = self._get_x_buffer(base_col)
-                    if xbuf:
-                        x_arr = np.array(xbuf)
-                        if len(x_arr) > len(y_orig):
-                            x_arr = x_arr[-len(y_orig):]
-                        x_use = x_arr[1:] if len(x_arr) > 1 else x_arr
-                        if len(x_use) > len(y_arr):
-                            x_use = x_use[-len(y_arr):]
-                        elif len(y_arr) > len(x_use):
-                            y_arr = y_arr[-len(x_use):]
-                    else:
-                        continue
-                    # if getattr(self.main, 'relative_time_cb', None) and self.main.relative_time_cb.isChecked():
-                    #     y_arr = y_arr / 0.001
-                    curve.setData(x_use, y_arr)
-                elif base_col in self.plot_items:
-                    # 嵌套差分（diff of diff）：从已有曲线数据再差分
-                    orig_curve = self.plot_items[base_col]
-                    ox, oy = orig_curve.getOriginalDataset()
-                    if oy is None or len(oy) < 2:
-                        continue
-                    y_arr = np.diff(oy)
-                    x_use = ox[1:] if ox is not None and len(ox) > 1 else np.array([])
-                    if len(x_use) > len(y_arr):
-                        x_use = x_use[-len(y_arr):]
-                    elif len(y_arr) > len(x_use):
-                        y_arr = y_arr[-len(x_use):]
-                    # if getattr(self.main, 'relative_time_cb', None) and self.main.relative_time_cb.isChecked():
-                    #     y_arr = y_arr / 0.001
-                    curve.setData(x_use, y_arr)
-                continue  # diff 曲线跳过常规更新
+                result = self._compute_diff_data(base_col)
+                if result is not None:
+                    curve.setData(result[0], result[1])
+                continue
             if col in self.main.y_buffers:
+                # 在线模式：x/y 按末尾对齐（保持同步追加）
                 y_arr = np.array(self.main.y_buffers[col])
                 xbuf = self._get_x_buffer(col)
                 if not xbuf:
                     continue
                 x_arr = np.array(xbuf)
-                if len(x_arr) > len(y_arr):
-                    x_use = x_arr[-len(y_arr):]
-                elif len(y_arr) > len(x_arr):
-                    y_arr = y_arr[-len(x_arr):]
-                    x_use = x_arr
-                else:
-                    x_use = x_arr
-                curve.setData(x_use, y_arr)
+                n = min(len(x_arr), len(y_arr))
+                if n == 0:
+                    continue
+                curve.setData(x_arr[-n:], y_arr[-n:])
         if self.follow_latest and self.main.x_buffers:
             self.scroll_to_latest()
 
@@ -1514,6 +1898,9 @@ class PlotSubWidget(QWidget):
         for curve in self.plot_items.values():
             self.plot_widget.removeItem(curve)
         self.plot_items.clear()
+        # 在线模式：曲线全部清除后停止所有臂的记录
+        if hasattr(self.main, '_refresh_recording_targets'):
+            self.main._refresh_recording_targets()
 
 class PlotTab(QWidget):
     def __init__(self, main_window, tab_name="Tab"):
@@ -1576,6 +1963,9 @@ class PlotTab(QWidget):
         self.sub_widgets.pop(index)
         widget_to_remove = self.splitter.widget(index)
         widget_to_remove.deleteLater()
+        # 在线模式：分栏关闭后其曲线不再参与记录目标计算
+        if hasattr(self.main, '_refresh_recording_targets'):
+            self.main._refresh_recording_targets()
 
     def sync_scroll_to_latest(self, source_width=None):
         """同步所有子图的 X 轴到最新数据点，并开启跟随"""
@@ -1865,10 +2255,13 @@ class PlotTab(QWidget):
         super().keyPressEvent(event)
 
 # ==================== 主窗口 ====================
+# 屏幕切换事件类型（窗口拖至副屏/DPI 变化时触发界面刷新）
+_SCREEN_CHANGE_TYPE = getattr(QEvent, 'ScreenChangeInternal', None)
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-         # 设置窗口初始大小：宽度为屏幕宽度的 70%，高度为屏幕高度的 80%
+        # 设置窗口初始大小：宽度为屏幕宽度的 70%，高度为屏幕高度的 80%
         # 获取屏幕可用尺寸（排除任务栏）
         screen = QApplication.primaryScreen()
         screen_geometry = screen.availableGeometry()
@@ -1876,14 +2269,14 @@ class MainWindow(QMainWindow):
         screen_height = screen_geometry.height()
 
         # 设置窗口初始大小：宽度为屏幕宽度的 70%，高度为屏幕高度的 80%
-        win_width = int(screen_width * 0.7)
-        win_height = int(screen_height * 0.8)
-        # 确保最小尺寸，避免界面元素挤压
-        win_width = max(win_width, 1000)
-        win_height = max(win_height, 800)
+        win_width = max(int(screen_width * 0.7), 1000)
+        win_height = max(int(screen_height * 0.8), 800)
+        # 不超过屏幕可用区域，避免低分辨率/小屏下窗口被截断
+        win_width = min(win_width, screen_width)
+        win_height = min(win_height, screen_height)
 
         self.resize(win_width, win_height)
-        self.setMinimumSize(1000, 800)   # 允许用户手动缩小但不能小于此尺寸
+        self.setMinimumSize(min(1000, screen_width), min(800, screen_height))   # 允许用户手动缩小但不能小于此尺寸
         self.setWindowTitle("YC日志分析平台")
         self.setAcceptDrops(True)
         self.df = None
@@ -1900,6 +2293,10 @@ class MainWindow(QMainWindow):
         self.x_buffers = {}  # arm_prefix → deque(epoch)
         self.y_buffers = {}
         self._tree_prebuilt = False
+        # ---- 在线按需记录状态 ----
+        self._arm_active_cols = {}    # 臂前缀 → 该臂当前已绘制列（裸列名）集合
+        self._current_decimation = 1  # 当前抽稀间隔（按窗口大小动态调整）
+        self._live_conn = None        # 最近一次在线连接参数（用于按臂重启线程）
         self.update_timer = QTimer()
         self.update_timer.setInterval(50)
         self.update_timer.timeout.connect(self.update_plots_from_buffer)
@@ -1915,14 +2312,16 @@ class MainWindow(QMainWindow):
 
         # ========== 左侧控制面板 ==========
         left_panel = QWidget()
-        left_panel.setFixedWidth(480)
-        left_panel.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        # 宽度自适应内容：不同分辨率/DPI/窗口大小下文字不会被压缩截断，也不会过宽
+        left_panel.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
+        left_panel.setMinimumWidth(320)
+        left_panel.setMaximumWidth(520)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setSpacing(8)
         left_layout.setContentsMargins(10, 10, 10, 10)
 
         title = QLabel("📊 YC日志分析平台")
-        title.setStyleSheet("font-size: 16pt; font-weight: bold; margin-bottom: 5px;")
+        title.setObjectName("appTitle")
         left_layout.addWidget(title)
 
         # 模式选择
@@ -1957,6 +2356,8 @@ class MainWindow(QMainWindow):
         self.folder_btn = QPushButton("选择文件夹")
         self.folder_btn.clicked.connect(self.select_folder)
         self.load_btn = QPushButton("加载")
+        self.load_btn.setProperty("class", "primary")
+        self.load_btn.setToolTip("解析并加载日志数据（也可直接将文件/文件夹拖入窗口）")
         self.load_btn.clicked.connect(self.start_load)
         btn_layout.addWidget(self.file_btn)
         btn_layout.addWidget(self.folder_btn)
@@ -1987,6 +2388,7 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
         self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setToolTip("中止当前加载任务")
         self.cancel_btn.clicked.connect(self.cancel_load)
         self.cancel_btn.setEnabled(False)
         offline_layout.addWidget(self.progress_bar)
@@ -1994,6 +2396,8 @@ class MainWindow(QMainWindow):
 
         self.info_label = QLabel("未加载数据")
         self.info_label.setWordWrap(True)
+        self.info_label.setProperty("class", "card")
+        self.info_label.setMinimumHeight(54)  # 预留多行高度，窗口变小时文字不被裁剪
         offline_layout.addWidget(self.info_label)
 
         offline_layout.addStretch()
@@ -2048,8 +2452,12 @@ class MainWindow(QMainWindow):
 
         monitor_layout = QHBoxLayout()
         self.connect_btn = QPushButton("连接并开始监控")
+        self.connect_btn.setProperty("class", "primary")
+        self.connect_btn.setToolTip("通过 SSH 连接远程设备并实时监控日志")
         self.connect_btn.clicked.connect(self.start_live)
         self.stop_live_btn = QPushButton("停止监控")
+        self.stop_live_btn.setProperty("class", "danger")
+        self.stop_live_btn.setToolTip("断开所有 SSH 连接并停止记录")
         self.stop_live_btn.setEnabled(False)
         self.stop_live_btn.clicked.connect(self.stop_live)
         monitor_layout.addWidget(self.connect_btn)
@@ -2058,9 +2466,11 @@ class MainWindow(QMainWindow):
 
         pause_layout = QHBoxLayout()
         self.pause_btn = QPushButton("⏸️ 暂停")
+        self.pause_btn.setToolTip("暂停实时数据记录（快捷键 P）")
         self.pause_btn.clicked.connect(self.pause_live)
         self.pause_btn.setEnabled(False)
         self.resume_btn = QPushButton("▶️ 继续")
+        self.resume_btn.setToolTip("继续实时数据记录（快捷键 P）")
         self.resume_btn.clicked.connect(self.resume_live)
         self.resume_btn.setEnabled(False)
         # P 键切换暂停/继续
@@ -2077,6 +2487,7 @@ class MainWindow(QMainWindow):
         self.buffer_spin.setSingleStep(1)
         self.buffer_spin.setValue(self.buffer_seconds)
         self.buffer_spin.setSuffix(" s")
+        self.buffer_spin.setToolTip("缓冲区保留时长：决定绘图区可回看的数据范围")
         self.buffer_spin.valueChanged.connect(self.on_buffer_size_changed)
         buffer_layout.addWidget(self.buffer_spin)
         buffer_group.setLayout(buffer_layout)
@@ -2084,27 +2495,38 @@ class MainWindow(QMainWindow):
 
         self.online_info_label = QLabel("未连接")
         self.online_info_label.setWordWrap(True)
+        self.online_info_label.setProperty("class", "card")
+        self.online_info_label.setMinimumHeight(40)  # 预留多行高度，窗口变小时文字不被裁剪
         online_layout.addWidget(self.online_info_label)
 
         online_layout.addStretch()
         self.stacked_widget.addWidget(online_widget)
 
         # 数据列树（支持拖拽）
-        left_layout.addWidget(QLabel("📋 数据列"))
+        section_label = QLabel("📋 数据列")
+        section_label.setObjectName("sectionLabel")
+        left_layout.addWidget(section_label)
         self.tree = DragTreeWidget()
         self.tree.setHeaderLabel("数据列")
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.setIndentation(20)
-        self.tree.setMinimumHeight(400)
+        self.tree.setMinimumHeight(150)  # 允许在矮窗口下收缩，避免挤压其他控件文字
+        self.tree.setAlternatingRowColors(True)   # 斑马纹提升长列表可读性
+        self.tree.setAnimated(True)               # 展开/折叠平滑动画
+        self.tree.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)  # 平滑滚动
+        self.tree.setAccessibleName("数据列树，可将数据列拖入绘图区")
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         left_layout.addWidget(self.tree)
 
         # 清除当前页所有曲线按钮
         clear_btn = QPushButton("🗑️ 清除当前页所有曲线")
+        clear_btn.setProperty("class", "danger")
+        clear_btn.setToolTip("移除当前标签页内的全部曲线")
         clear_btn.clicked.connect(self.clear_current_tab_curves)
         left_layout.addWidget(clear_btn)
 
         self.save_btn = QPushButton("💾 保存当前页图像")
+        self.save_btn.setToolTip("将当前标签页导出为 PNG/JPEG/BMP 图像")
         self.save_btn.clicked.connect(self.save_current_figure)
         left_layout.addWidget(self.save_btn)
 
@@ -2112,8 +2534,8 @@ class MainWindow(QMainWindow):
 
         # logo（与 launcher 风格一致）
         logo_label = QLabel("Made with TC❤️")
+        logo_label.setObjectName("logoLabel")
         logo_label.setAlignment(Qt.AlignCenter)
-        logo_label.setStyleSheet("color: #9ca3af; font-size: 8pt; padding: 4px 0px;")
         left_layout.addWidget(logo_label)
 
         main_layout.addWidget(left_panel)
@@ -2125,8 +2547,8 @@ class MainWindow(QMainWindow):
         right_layout.setSpacing(2)
 
         self.tab_widget = QTabWidget()
-        self.tab_widget.setTabsClosable(True)
-        self.tab_widget.tabCloseRequested.connect(self.close_tab)
+        # 关闭按钮由 _install_tab_close_button 自绘（Qt 默认那个在自定义 QSS 下很丑）
+        self.tab_widget.setTabsClosable(False)
 
         # 右上角工具栏按钮组
         corner_widget = QWidget()
@@ -2139,6 +2561,8 @@ class MainWindow(QMainWindow):
         # self.h_split_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
         self.h_split_btn.setToolTip("水平分栏")
         self.h_split_btn.setFixedSize(30, 30)
+        self.h_split_btn.setProperty("class", "icon")
+        self.h_split_btn.setAccessibleName("水平分栏")
         self.h_split_btn.clicked.connect(self.split_current_tab_horizontal)
         corner_layout.addWidget(self.h_split_btn)
 
@@ -2147,12 +2571,17 @@ class MainWindow(QMainWindow):
         # self.v_split_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMinButton))
         self.v_split_btn.setToolTip("垂直分栏")
         self.v_split_btn.setFixedSize(30, 30)
+        self.v_split_btn.setProperty("class", "icon")
+        self.v_split_btn.setAccessibleName("垂直分栏")
         self.v_split_btn.clicked.connect(self.split_current_tab_vertical)
         corner_layout.addWidget(self.v_split_btn)
 
         # 新建标签页按钮
         self.new_tab_btn = QPushButton("+")
         self.new_tab_btn.setFixedSize(30, 30)
+        self.new_tab_btn.setProperty("class", "icon")
+        self.new_tab_btn.setToolTip("新建标签页")
+        self.new_tab_btn.setAccessibleName("新建标签页")
         self.new_tab_btn.clicked.connect(self.new_plot_tab)
         corner_layout.addWidget(self.new_tab_btn)
 
@@ -2160,6 +2589,8 @@ class MainWindow(QMainWindow):
         self.cursor_btn = QPushButton("I")
         self.cursor_btn.setToolTip("切换游标A (Tab键切换活动游标, 左右箭头移动)")
         self.cursor_btn.setFixedSize(30, 30)
+        self.cursor_btn.setProperty("class", "icon")
+        self.cursor_btn.setAccessibleName("切换游标A")
         self.cursor_btn.setCheckable(True)
         self.cursor_btn.clicked.connect(lambda: self.toggle_current_tab_cursor(0))
         corner_layout.addWidget(self.cursor_btn)
@@ -2167,6 +2598,8 @@ class MainWindow(QMainWindow):
         self.cursor2_btn = QPushButton("II")
         self.cursor2_btn.setToolTip("切换游标B (Tab键切换活动游标, 左右箭头移动)")
         self.cursor2_btn.setFixedSize(30, 30)
+        self.cursor2_btn.setProperty("class", "icon")
+        self.cursor2_btn.setAccessibleName("切换游标B")
         self.cursor2_btn.setCheckable(True)
         self.cursor2_btn.clicked.connect(lambda: self.toggle_current_tab_cursor(1))
         corner_layout.addWidget(self.cursor2_btn)
@@ -2175,6 +2608,8 @@ class MainWindow(QMainWindow):
         self.time_jump_btn = QPushButton("⏱")
         self.time_jump_btn.setToolTip("跳转到指定时间 (J)")
         self.time_jump_btn.setFixedSize(30, 30)
+        self.time_jump_btn.setProperty("class", "icon")
+        self.time_jump_btn.setAccessibleName("跳转到指定时间")
         self.time_jump_btn.clicked.connect(self._jump_cursor_to_time)
         corner_layout.addWidget(self.time_jump_btn)
 
@@ -2185,25 +2620,126 @@ class MainWindow(QMainWindow):
 
         self.default_tab = PlotTab(self, "绘图1")
         self.tab_widget.addTab(self.default_tab, "绘图1")
+        self._install_tab_close_button(0)
         self.tab_widget.currentChanged.connect(self._on_plot_tab_changed)
         right_layout.addWidget(self.tab_widget, stretch=1)
 
         main_layout.addWidget(right_container, stretch=1)
 
+    # ========== 屏幕切换 / 窗口尺寸 ==========
+    def event(self, e):
+        # 窗口切换屏幕（如拖至副屏）后刷新界面布局，修复网格错位、元素错乱
+        if _SCREEN_CHANGE_TYPE is not None and e.type() == _SCREEN_CHANGE_TYPE:
+            QTimer.singleShot(150, self._refresh_ui_after_screen_change)
+        return super().event(e)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not hasattr(self, 'tab_widget'):
+            return
+        if not hasattr(self, '_resize_timer'):
+            self._resize_timer = QTimer(self)
+            self._resize_timer.setSingleShot(True)
+            self._resize_timer.timeout.connect(self._after_resize)
+        self._resize_timer.start(300)  # 去抖：拖动结束后才刷新
+
+    def _after_resize(self):
+        """窗口尺寸调整完成后：重新对齐各子图左轴（网格对齐）并更新记录密度"""
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if hasattr(tab, '_align_left_axes'):
+                tab._align_left_axes()
+        self._update_decimation()
+
+    def _refresh_ui_after_screen_change(self):
+        """窗口移动到其他屏幕后：重算布局、对齐坐标轴并强制重绘绘图区"""
+        if not hasattr(self, 'tab_widget'):
+            return
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if hasattr(tab, 'sub_widgets'):
+                tab._align_left_axes()
+                for sub in tab.sub_widgets:
+                    pw = sub.plot_widget
+                    pw.updateGeometry()
+                    pw.getViewBox().update()
+                    pw.getPlotItem().update()
+                    pw.repaint()
+        # 重新自适应树表头宽度（DPI 变化后字体尺寸会变）
+        self.tree.header().resizeSections(QHeaderView.ResizeToContents)
+        self._update_decimation()
+        self.statusBar().showMessage("已切换显示设备，界面布局已刷新")
+
+    def _update_decimation(self):
+        """根据当前窗口/绘图区大小动态调整在线记录密度（抽稀间隔）：
+        窗口越大记录越密集（保留更多细节），窗口越小记录越稀疏（更流畅）"""
+        if not self.live_threads:
+            return
+        width_px = 0
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if hasattr(tab, 'sub_widgets'):
+                for sub in tab.sub_widgets:
+                    width_px += sub.plot_widget.width()
+        if width_px <= 0:
+            return
+        POINTS_PER_PX = 4  # 每像素保留的数据点数（兼顾曲线平滑度与性能）
+        est_points = self.buffer_seconds * 1000  # 缓冲区内估计总点数（按 1kHz 采样）
+        decim = max(1, min(100, int(est_points / (width_px * POINTS_PER_PX))))
+        if decim == self._current_decimation:
+            return
+        self._current_decimation = decim
+        for t in self.live_threads:
+            if t and t.isRunning():
+                t.decimation = decim
+        if decim > 1:
+            self.statusBar().showMessage(f"已按窗口大小调整记录密度：每 {decim} 点取 1 点")
+
     # ========== 标签页管理 ==========
+    def _install_tab_close_button(self, index):
+        """给第 index 个标签页装一个自绘 ✕ 按钮"""
+        btn = QToolButton()
+        btn.setAutoRaise(True)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setIconSize(QSize(9, 9))
+        btn.setFixedSize(16, 16)
+        btn.setToolTip("关闭此页")
+        btn.setAccessibleName("关闭此页")
+        btn.setStyleSheet(
+            "QToolButton{background:transparent;border-radius:8px;}"
+            "QToolButton:hover{background:rgba(255,255,255,0.35);}"
+            "QToolButton:pressed{background:rgba(255,255,255,0.55);}")
+        # 用 widget 反查下标，删掉前面的页后索引会平移
+        tab = self.tab_widget.widget(index)
+        btn.clicked.connect(
+            lambda _=False, t=tab: self.close_tab(self.tab_widget.indexOf(t)))
+        self.tab_widget.tabBar().setTabButton(index, QTabBar.RightSide, btn)
+        self._refresh_tab_close_icons()
+
+    def _refresh_tab_close_icons(self):
+        """选中的标签页是蓝底，✕ 得换成白色才看得清"""
+        for i in range(self.tab_widget.count()):
+            btn = self.tab_widget.tabBar().tabButton(i, QTabBar.RightSide)
+            if btn is not None:
+                white = (i == self.tab_widget.currentIndex())
+                btn.setIcon(close_x_icon(9, "#FFFFFF" if white else "#475569"))
+
     def new_plot_tab(self):
         count = self.tab_widget.count() + 1
         new_tab = PlotTab(self, f"绘图{count}")
         self.tab_widget.addTab(new_tab, f"绘图{count}")
+        self._install_tab_close_button(self.tab_widget.count() - 1)
         self.tab_widget.setCurrentWidget(new_tab)
 
     def close_tab(self, index):
-        if self.tab_widget.count() <= 1:
+        if index < 0 or self.tab_widget.count() <= 1:
             QMessageBox.information(self, "提示", "至少需要保留一个标签页")
             return
         widget = self.tab_widget.widget(index)
         self.tab_widget.removeTab(index)
         widget.deleteLater()
+        # 在线模式：标签页关闭后其曲线不再参与记录目标计算
+        self._refresh_recording_targets()
 
     def clear_current_tab_curves(self):
         current_tab = self.tab_widget.currentWidget()
@@ -2230,6 +2766,7 @@ class MainWindow(QMainWindow):
 
     def _on_plot_tab_changed(self, index):
         """切换标签页时同步游标按钮状态"""
+        self._refresh_tab_close_icons()
         tab = self.tab_widget.widget(index)
         if isinstance(tab, PlotTab):
             self.cursor_btn.setChecked(tab.cursor_enabled[0])
@@ -2310,6 +2847,7 @@ class MainWindow(QMainWindow):
                 for sub in tab.sub_widgets:
                     sub.view_width = float(new_seconds)
         self.statusBar().showMessage(f"保留时间已调整为 {new_seconds} s")
+        self._update_decimation()
 
     def _get_remote_paths(self):
         """返回 [(arm_prefix, remote_path), ...] 列表，从配置读取"""
@@ -2434,6 +2972,7 @@ class MainWindow(QMainWindow):
         self.y_buffers.clear()
         self.current_columns.clear()
         self._tree_prebuilt = False
+        self._arm_active_cols = {}
         self.tree.clear()
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
@@ -2468,6 +3007,7 @@ class MainWindow(QMainWindow):
     # ========== 在线监控 ==========
     def start_live(self):
         self.clear_online_data()
+        self._arm_active_cols = {}
         ip = self.ip_edit.text().strip()
         port = int(self.port_edit.text().strip())
         user = self.user_edit.text().strip()
@@ -2478,10 +3018,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "错误", "请填写完整的主机、用户名")
             return
 
-        # 预构建树和预分配 y_buffers（已知格式，ADS除外）
+        # 预构建树和预分配 y_buffers（已知格式；ADS 等动态格式除外）
         dev_type = self.device_type.currentText()
         if dev_type != "ADS" and config is not None:
             self._pre_build_tree_and_buffers(dev_type)
+            if not self.y_buffers:
+                self._tree_prebuilt = False  # 未知设备类型：回退为动态发现模式
         else:
             self._tree_prebuilt = False
 
@@ -2492,15 +3034,22 @@ class MainWindow(QMainWindow):
                     sub.follow_latest = False
                     sub.follow_btn.setChecked(False)
 
+        # 保存连接参数：支持某臂线程停止后（如无数据超时）按臂重启
+        self._live_conn = {'ip': ip, 'port': port, 'user': user, 'pwd': pwd,
+                           'paths': {p: path for p, path in paths}}
         self.live_threads = []
         self._start_next_thread(0, paths, ip, port, user, pwd)
 
         self.connect_btn.setEnabled(False)
         self.stop_live_btn.setEnabled(True)
         self.update_timer.start()
-        self.online_info_label.setText("正在监控中...")
+        if self._tree_prebuilt:
+            self.online_info_label.setText("监控中（空闲）：将左侧数据列拖入绘图窗口后，才开始记录对应臂的数据")
+        else:
+            self.online_info_label.setText("正在监控中...")
         self.pause_btn.setEnabled(True)
         self.resume_btn.setEnabled(False)
+        self._update_decimation()
 
     def stop_live(self):
         if hasattr(self, 'live_threads'):
@@ -2508,6 +3057,8 @@ class MainWindow(QMainWindow):
                 if t:
                     t.stop()
             self.live_threads = []
+        self._live_conn = None  # 阻止错峰启动流程继续创建新线程
+        self._arm_active_cols = {}
         self.update_timer.stop()
         self.connect_btn.setEnabled(True)
         self.stop_live_btn.setEnabled(False)
@@ -2520,43 +3071,167 @@ class MainWindow(QMainWindow):
         """递归错峰启动 SSH 线程，间隔 300ms"""
         if idx >= len(paths):
             return
+        if self._live_conn is None:
+            return  # 已停止监控：不再创建新线程
         prefix, remote_path = paths[idx]
-        thread = LiveThread(ip, port, user, pwd, remote_path)
-        thread.new_data.connect(lambda epoch, d, p=prefix: self.on_new_data(epoch, d, p))
+        thread = LiveThread(ip, port, user, pwd, remote_path, arm_prefix=prefix)
+        # 动态格式（如 ADS）需持续读取以发现数据列；已知格式默认空闲，拖入曲线后按需记录
+        thread.recording_enabled = (not self._tree_prebuilt)
+        thread.decimation = self._current_decimation
+        thread.new_batch.connect(lambda batch, p=prefix: self.on_new_batch(batch, p))
         thread.error.connect(self.on_live_error)
         thread.status.connect(self.statusBar().showMessage)
         thread.start()
         self.live_threads.append(thread)
+        # 应用当前已绘制曲线对应的记录目标（处理启动期间用户已拖入曲线的情况）
+        self._refresh_recording_targets()
         if idx + 1 < len(paths):
             QTimer.singleShot(300, lambda: self._start_next_thread(idx + 1, paths, ip, port, user, pwd))
 
-    def on_new_data(self, epoch, data_dict, arm_prefix):
-        """接收来自某臂的数据"""
-        # 快速路径：树和 buffers 已预构建，仅追数据
-        if self._tree_prebuilt:
-            self.x_buffers[arm_prefix].append(epoch)
-            for col, val in data_dict.items():
-                self.y_buffers[f"{arm_prefix}:{col}"].append(val)
+    def _find_live_thread(self, arm_prefix):
+        """查找指定臂的运行中线程"""
+        for t in self.live_threads:
+            if t and getattr(t, 'arm_prefix', '') == arm_prefix and t.isRunning():
+                return t
+        return None
+
+    def _spawn_live_thread(self, arm_prefix):
+        """为指定臂重新启动读取线程（该臂线程此前因无数据等原因自动停止）"""
+        conn = getattr(self, '_live_conn', None)
+        if not conn or arm_prefix not in conn['paths']:
+            return None
+        thread = LiveThread(conn['ip'], conn['port'], conn['user'], conn['pwd'],
+                            conn['paths'][arm_prefix], arm_prefix=arm_prefix)
+        thread.decimation = self._current_decimation
+        thread.new_batch.connect(lambda batch, p=arm_prefix: self.on_new_batch(batch, p))
+        thread.error.connect(self.on_live_error)
+        thread.status.connect(self.statusBar().showMessage)
+        thread.start()
+        self.live_threads.append(thread)
+        # 清理已停止的旧线程引用
+        self.live_threads = [t for t in self.live_threads if t.isRunning()]
+        return thread
+
+    def _refresh_recording_targets(self):
+        """根据当前各标签页已绘制的曲线，动态调整在线数据记录目标：
+        - 仅记录有曲线绘制的臂（用户正在操作的臂）及其已绘制的列
+        - 无曲线的臂进入空闲（停止读取），重新拖入曲线时自动恢复记录
+        - 切换操作对象（增删曲线）时自动切换记录目标"""
+        if not getattr(self, 'live_threads', None):
+            return
+        # 收集所有已绘制曲线（差分曲线映射回其基列）
+        plotted_bases = set()
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if hasattr(tab, 'sub_widgets'):
+                for sub in tab.sub_widgets:
+                    for key in sub.plot_items:
+                        k = key
+                        while k.endswith('[diff]'):
+                            k = k[:-6]
+                        if k:
+                            plotted_bases.add(k)
+        # 按臂分组（在线模式列名带 "臂:" 前缀）
+        arm_cols = {}
+        for key in plotted_bases:
+            if ':' in key:
+                p, c = key.split(':', 1)
+                arm_cols.setdefault(p, set()).add(c)
+        self._arm_active_cols = arm_cols
+        dynamic_mode = not self._tree_prebuilt
+
+        if dynamic_mode:
+            # 动态格式（如 ADS）：需持续读取以发现数据列，不做列过滤
+            for t in list(self.live_threads):
+                if t and t.isRunning():
+                    t.active_cols_bare = None
+                    if not t.recording_enabled:
+                        t.recording_enabled = True
+            # 已停止的动态线程在有活动曲线时重启
+            if arm_cols:
+                conn = getattr(self, '_live_conn', None)
+                if conn:
+                    for p in conn['paths']:
+                        if self._find_live_thread(p) is None:
+                            t = self._spawn_live_thread(p)
+                            if t is not None:
+                                t.active_cols_bare = None
+                                t.recording_enabled = True
             return
 
-        # 慢速路径（ADS 模式）：动态树构建 + 惰性 buffer 创建
-        prefixed = {}
-        for col, val in data_dict.items():
-            prefixed[f"{arm_prefix}:{col}"] = val
+        # 已知格式：按臂针对性记录
+        for t in list(self.live_threads):
+            if not t or not t.isRunning():
+                continue
+            p = getattr(t, 'arm_prefix', '')
+            if p in arm_cols:
+                t.active_cols_bare = arm_cols[p]
+                if not t.recording_enabled:
+                    t.recording_enabled = True
+                    t._need_seek_end = True  # 从最新数据开始记录
+                    self.statusBar().showMessage(f"[{p}] 开始记录数据")
+            else:
+                if t.recording_enabled:
+                    self.statusBar().showMessage(f"[{p}] 无活动曲线，停止读取")
+                t.recording_enabled = False
+                t.active_cols_bare = set()
+        # 已绘制曲线的臂若线程已停止（如无数据超时自动停止），重新启动
+        for p in arm_cols:
+            if self._find_live_thread(p) is None:
+                t = self._spawn_live_thread(p)
+                if t is not None:
+                    t.active_cols_bare = arm_cols[p]
+                    t.recording_enabled = True
+                    self.statusBar().showMessage(f"[{p}] 重新连接并开始记录数据")
 
-        self.x_buffers.setdefault(arm_prefix, deque(maxlen=self.buffer_size)).append(epoch)
-        for col, val in prefixed.items():
-            if col not in self.y_buffers:
-                self.y_buffers[col] = deque(maxlen=self.buffer_size)
-            self.y_buffers[col].append(val)
+    def on_new_batch(self, batch, arm_prefix):
+        """接收某臂的批量数据，按需记录（仅记录当前操作的臂/列）"""
+        if not batch:
+            return
+        if self._tree_prebuilt:
+            # 已知格式：x 与已绘制列的 y 同步追加（缺失列以 NaN 占位保持对齐）
+            xbuf = self.x_buffers.get(arm_prefix)
+            active = self._arm_active_cols.get(arm_prefix)
+            if xbuf is None or not active:
+                return  # 该臂当前没有活动曲线：不记录
+            yb = self.y_buffers
+            pk = f"{arm_prefix}:"
+            col_bufs = []
+            for c in active:
+                b = yb.get(pk + c)
+                if b is not None:
+                    col_bufs.append((c, b))
+            if not col_bufs:
+                return
+            for epoch, data_dict in batch:
+                xbuf.append(epoch)
+                for c, b in col_bufs:
+                    v = data_dict.get(c)
+                    b.append(v if v is not None else float('nan'))
+        else:
+            # 动态格式（如 ADS）：动态建树 + 惰性 buffer 创建
+            new_cols = []
+            for epoch, data_dict in batch:
+                xbuf = self.x_buffers.setdefault(arm_prefix, deque(maxlen=self.buffer_size))
+                xbuf.append(epoch)
+                for col, val in data_dict.items():
+                    full = f"{arm_prefix}:{col}"
+                    buf = self.y_buffers.get(full)
+                    if buf is None:
+                        buf = deque(maxlen=self.buffer_size)
+                        self.y_buffers[full] = buf
+                        new_cols.append(col)
+                    buf.append(val)
+            if new_cols:
+                self._ensure_tree_items(arm_prefix, new_cols)
 
-        for col in prefixed.keys():
+    def _ensure_tree_items(self, arm_prefix, bare_cols):
+        """动态模式：为首次出现的列创建树节点"""
+        for var_full in bare_cols:
+            col = f"{arm_prefix}:{var_full}"
             if col in self.current_columns:
                 continue
             self.current_columns.append(col)
-            parts = col.split(":", 1)
-            arm_name = parts[0]
-            var_full = parts[1]
             if '[' in var_full and ']' in var_full:
                 var = var_full.split('[')[0]
             elif '_' in var_full and var_full.split('_')[-1].isdigit():
@@ -2565,12 +3240,12 @@ class MainWindow(QMainWindow):
                 var = var_full
             arm_item = None
             for i in range(self.tree.topLevelItemCount()):
-                if self.tree.topLevelItem(i).text(0) == arm_name:
+                if self.tree.topLevelItem(i).text(0) == arm_prefix:
                     arm_item = self.tree.topLevelItem(i)
                     break
             if not arm_item:
                 arm_item = QTreeWidgetItem(self.tree)
-                arm_item.setText(0, arm_name)
+                arm_item.setText(0, arm_prefix)
             var_item = None
             for i in range(arm_item.childCount()):
                 if arm_item.child(i).text(0) == var:
@@ -2592,9 +3267,18 @@ class MainWindow(QMainWindow):
             if hasattr(tab, 'update_curves'):
                 tab.update_curves()
 
-    def on_live_error(self, err):
-        QMessageBox.critical(self, "实时监控错误", err)
-        self.stop_live()
+    def on_live_error(self, arm_prefix, msg):
+        """单臂错误：仅停止该臂的读取，不影响其他臂的监控"""
+        stopped = [t for t in self.live_threads
+                   if t and getattr(t, 'arm_prefix', '') == arm_prefix]
+        for t in stopped:
+            t.stop()
+        if stopped:
+            self.live_threads = [t for t in self.live_threads if t not in stopped]
+        self.statusBar().showMessage(f"[{arm_prefix}] 读取失败: {msg}")
+        if not self._is_any_thread_running():
+            self.stop_live()
+            self.online_info_label.setText("监控已停止（所有臂均无数据或连接失败）")
 
     # ========== 拖放加载 ==========
     def dragEnterEvent(self, event):
@@ -2718,6 +3402,7 @@ class MainWindow(QMainWindow):
                 tab.clear_all_curves()
 
     def load_finished(self, df, cancelled, error):
+        log(f"load_finished 开始 | 行数={len(df)} | 取消={cancelled} | 错误={error!r}")
         try:
             self.load_btn.setEnabled(True)
             self.cancel_btn.setEnabled(False)
@@ -2735,7 +3420,14 @@ class MainWindow(QMainWindow):
                 self.info_label.setText("加载失败")
                 return
             if df.empty:
-                QMessageBox.warning(self, "警告", "未找到有效日志数据")
+                # 区分"日志格式不识别"与"确实没有数据"，给出可操作的提示
+                if config is None:
+                    QMessageBox.warning(
+                        self, "警告",
+                        "未找到数据格式配置文件 configs/data_formats.json，无法解析日志。\n\n"
+                        "请将 configs 文件夹与程序放在同一目录后重试。")
+                else:
+                    QMessageBox.warning(self, "警告", "未找到有效日志数据")
                 self.info_label.setText("未加载数据")
                 return
 
@@ -2765,6 +3457,7 @@ class MainWindow(QMainWindow):
             if '__display_time__' in df.columns:
                 self.timestamp_epoch = df['__display_time__'].values.astype(float)
                 df = df.drop(columns=['__display_time__'])
+                self.df = df  # 同步移除内部辅助列，避免干扰曲线/差分数据源查找
             elif 'timestamp' in df.columns and df['timestamp'].notna().any():
                 try:
                     def _ts_to_epoch(t):
@@ -2850,14 +3543,36 @@ class MainWindow(QMainWindow):
 
             self.info_label.setText(f"✅ 已加载 {len(df)} 行，共 {len(self.current_columns)} 个数据列{time_range}")
             self.statusBar().showMessage(f"加载成功：{len(df)} 行数据")
+            log(f"load_finished 完成 | 列数={len(self.current_columns)} | 时间轴={self.timestamp_epoch is not None}")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            log('load_finished 异常:\n' + traceback.format_exc())
             QMessageBox.critical(self, "加载错误", f"发生异常：{str(e)}\n请检查日志文件格式或尝试减少文件数量。")
             self.info_label.setText("加载失败")
 
 def main():
+    # 最先安装崩溃捕获：窗口程序无控制台，静默退出时靠日志定位原因
+    setup_crash_logging()
+    # 高 DPI / 多显示器支持：必须在 QApplication 创建之前设置，
+    # 否则主副屏缩放比例不一致时会出现网格错位、控件错乱、坐标偏移
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            # PER_MONITOR_DPI_AWARE：窗口跨屏移动时按各屏实际 DPI 渲染
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    if hasattr(Qt, 'HighDpiScaleFactorRoundingPolicy'):
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
+    # Fusion 风格作为基底：QSS 渲染跨平台一致，配合全局样式表实现现代外观
+    app.setStyle("Fusion")
+    font = QFont("Microsoft YaHei UI", 9)
+    font.setStyleStrategy(QFont.PreferAntialias)
+    app.setFont(font)
+    app.setStyleSheet(MODERN_QSS)
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())

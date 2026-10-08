@@ -8,11 +8,14 @@ block_cipher = None
 pyarrow_datas = collect_data_files('pyarrow')
 pyarrow_hiddenimports = collect_submodules('pyarrow')
 
+# 把数据格式配置一并打包，保证 exe 单独拷贝到其他电脑后仍能解析日志
+config_datas = [('configs/data_formats.json', 'configs')]
+
 a = Analysis(
     ['logAnalysis.py'],
     pathex=[],
     binaries=[],
-    datas=pyarrow_datas,
+    datas=config_datas + pyarrow_datas,
     hiddenimports=[
         'pyarrow',
         'json',
@@ -105,9 +108,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,  # 使用UPX压缩
+    upx=False,  # 关闭 UPX：压缩 Qt/pyarrow 的 DLL 会导致换机后静默崩溃
     runtime_tmpdir=None,
-    console=False,  # 不显示控制台窗口
+    console=False,  # 不显示控制台窗口（运行日志写入 logs/logAnalysis.log）
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -121,7 +124,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,  # 同上：避免 UPX 压缩导致换机后崩溃
     upx_exclude=[],
     name='LogAnalysis',  # 文件夹名称
 )
