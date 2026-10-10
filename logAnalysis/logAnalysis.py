@@ -34,6 +34,8 @@ import pyqtgraph as pg
 # 设置 PyQtGraph 全局背景白色、前景黑色
 pg.setConfigOptions(background='w', foreground='k')
 pg.setConfigOptions(antialias=True)
+# 左键拖动改为框选放大（RectMode）；默认为 PanMode（左键平移），可随时在绘图区右键菜单 Mouse Mode 里切换
+pg.setConfigOptions(leftButtonPan=False)
 
 # ==================== 全局设计系统（现代扁平化浅色主题） ====================
 # 色彩规范：主色 #2563EB（操作引导）/ 背景 #F1F5F9 / 卡片 #FFFFFF /
