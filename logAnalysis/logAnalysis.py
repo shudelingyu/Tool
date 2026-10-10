@@ -34,7 +34,7 @@ import pyqtgraph as pg
 # 设置 PyQtGraph 全局背景白色、前景黑色
 pg.setConfigOptions(background='w', foreground='k')
 pg.setConfigOptions(antialias=True)
-# 左键拖动改为框选放大（RectMode）；默认为 PanMode（左键平移），可随时在绘图区右键菜单 Mouse Mode 里切换
+# 左键拖动=框选放大（RectMode），中键拖动=平移（MiddlePanViewBox），右键菜单 Mouse Mode 可切换
 pg.setConfigOptions(leftButtonPan=False)
 
 # ==================== 全局设计系统（现代扁平化浅色主题） ====================
@@ -1368,6 +1368,25 @@ class TimeAxis(pg.AxisItem):
             return [""] * len(values)
 
 # ==================== 支持拖拽的绘图控件 ====================
+class MiddlePanViewBox(pg.ViewBox):
+    """自定义交互：左键=框选放大（RectMode），中键拖动=平移，右键拖动=缩放（默认）"""
+    def mouseDragEvent(self, ev, axis=None):
+        if ev.button() != Qt.MiddleButton or axis is not None:
+            super().mouseDragEvent(ev, axis)
+            return
+        ev.accept()
+        # 中键平移：与 PyQtGraph 默认 PanMode 左键平移逻辑一致
+        mask = np.array(self.state['mouseEnabled'], dtype=np.float64)
+        dif = (ev.pos() - ev.lastPos()) * -1
+        tr = pg.functions.invertQTransform(self.childGroup.transform())
+        tr = tr.map(dif * mask) - tr.map(pg.Point(0, 0))
+        x = tr.x() if mask[0] == 1 else None
+        y = tr.y() if mask[1] == 1 else None
+        self._resetTarget()
+        if x is not None or y is not None:
+            self.translateBy(x=x, y=y)
+        self.sigRangeChangedManually.emit(self.state['mouseEnabled'])
+
 class DropPlotWidget(pg.PlotWidget):
     drop_signal = pyqtSignal(str)
 
@@ -1472,7 +1491,7 @@ class PlotSubWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         # 绘图区域
-        self.plot_widget = DropPlotWidget()
+        self.plot_widget = DropPlotWidget(viewBox=MiddlePanViewBox())
         self.plot_widget.setAxisItems({'bottom': TimeAxis(orientation='bottom')})
         self.plot_widget.setBackground('w')
         self.plot_widget.setLabel('left', '数值')
