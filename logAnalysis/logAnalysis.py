@@ -22,9 +22,11 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QAbstractItemView, QGroupBox, QCheckBox,
                              QTreeWidget, QTreeWidgetItem, QComboBox, QSizePolicy,
                              QRadioButton, QStackedWidget, QTabWidget, QHeaderView,
-                             QShortcut, QMenu, QAction, QToolButton, QTabBar)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QEvent, QSize
-from PyQt5.QtGui import QDrag, QFont, QIcon, QPixmap, QPainter, QPen, QColor
+                             QShortcut, QMenu, QAction, QToolButton, QTabBar,
+                             QScrollArea, QFrame)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QEvent, QSize, QRectF, QPointF
+from PyQt5.QtGui import (QDrag, QFont, QIcon, QPixmap, QPainter, QPen, QColor,
+                         QPainterPath, QCursor)
 try:
     from PyQt5 import sip
 except ImportError:  # 兼容旧版本 PyQt5
@@ -34,7 +36,7 @@ import pyqtgraph as pg
 # 设置 PyQtGraph 全局背景白色、前景黑色
 pg.setConfigOptions(background='w', foreground='k')
 pg.setConfigOptions(antialias=True)
-# 左键拖动=框选放大（RectMode），中键拖动=平移（MiddlePanViewBox），右键菜单 Mouse Mode 可切换
+# 左键拖动=平移，中键拖动=框选放大（RectMode），右键拖动=缩放；右键菜单 Mouse Mode 可切换
 pg.setConfigOptions(leftButtonPan=False)
 
 # ==================== 全局设计系统（现代扁平化浅色主题） ====================
@@ -44,7 +46,22 @@ MODERN_QSS = """
 /* ---------- 基础容器 ---------- */
 QMainWindow, QDialog { background-color: #F1F5F9; }
 QMessageBox, QInputDialog { background-color: #FFFFFF; }
-QWidget { color: #1E293B; font-size: 9pt; }
+/* 不在此处指定 font-size：全局字号由 app.setFont() 统一设置，
+   否则会覆盖子控件继承来的字号，导致局部字号调整失效 */
+QWidget { color: #1E293B; }
+
+/* ---------- 左侧控制面板：紧凑字号与内边距，避免窄栏内元素拥挤 ----------
+   注：Qt 样式表的 font-size 不会自动向下继承，必须逐个控件类型显式指定 */
+QWidget#leftPanel QLabel, QWidget#leftPanel QGroupBox,
+QWidget#leftPanel QLineEdit, QWidget#leftPanel QSpinBox,
+QWidget#leftPanel QComboBox, QWidget#leftPanel QPushButton,
+QWidget#leftPanel QCheckBox, QWidget#leftPanel QRadioButton,
+QWidget#leftPanel QTreeWidget { font-size: 8pt; }
+/* 面板标题保持醒目（需比上面的选择器更具体才能覆盖） */
+QWidget#leftPanel QLabel#appTitle { font-size: 15pt; font-weight: bold; color: #1D4ED8; }
+QWidget#leftPanel QLineEdit, QWidget#leftPanel QSpinBox, QWidget#leftPanel QComboBox {
+    padding: 3px 6px; min-height: 18px;
+}
 
 QToolTip {
     background-color: #1E293B; color: #F8FAFC;
@@ -88,7 +105,7 @@ QPushButton[class="icon"]:disabled { color: #CBD5E1; }
 /* ---------- 输入控件 ---------- */
 QLineEdit, QSpinBox, QComboBox {
     background-color: #FFFFFF; border: 1px solid #CBD5E1;
-    border-radius: 6px; padding: 4px 8px;
+    border-radius: 6px; padding: 4px 8px; min-height: 20px;
     selection-background-color: #2563EB; selection-color: #FFFFFF;
 }
 QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: #2563EB; }
@@ -172,7 +189,8 @@ QMenu::item:selected { background-color: #DBEAFE; color: #1D4ED8; }
 QMenu::separator { height: 1px; background-color: #E2E8F0; margin: 4px 8px; }
 
 /* ---------- 语义标签 ---------- */
-QLabel#appTitle { color: #1D4ED8; font-size: 15pt; font-weight: bold; }
+/* 标题样式定义在左侧面板规则处（QWidget#leftPanel QLabel#appTitle），
+   以保证不被面板的紧凑字号规则覆盖 */
 QLabel#sectionLabel { color: #64748B; font-weight: 600; }
 QLabel#logoLabel { color: #94A3B8; font-size: 8pt; padding: 4px 0; }
 QLabel[class="card"] {
@@ -209,6 +227,173 @@ def close_x_icon(size=11, color="#475569", hover="#DC2626", weight=1.5):
     return icon
 
 
+def split_icon(divider="vertical", size=16, color="#475569", weight=1.25, fill_alpha=42):
+    """矢量分栏图标：圆角外框 + 中间分隔线，新分栏一侧淡填充以表明方向。
+
+    divider="vertical"   竖线分隔 → 左右两栏（对应"水平分栏"）
+    divider="horizontal" 横线分隔 → 上下两栏（对应"垂直分栏"）
+    与 close_x_icon 一样用 4 倍超采样，保证高 DPI 下锐利。
+    """
+    ss = 4.0
+    icon = QIcon()
+    for state, col in ((QIcon.Normal, color), (QIcon.Active, color), (QIcon.Selected, color)):
+        edge = int(size * ss)
+        pm = QPixmap(edge, edge)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        m = edge * 0.13                 # 外边距
+        w = edge - 2 * m
+        r = w * 0.22                    # 圆角半径
+        rect = QRectF(m, m, w, w)
+        c = QColor(col)
+
+        # 用裁剪路径填充"新分栏"一侧，保证圆角与外框吻合
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, r, r)
+        p.setClipPath(clip)
+        tint = QColor(c.red(), c.green(), c.blue(), fill_alpha)
+        if divider == "vertical":
+            p.fillRect(QRectF(rect.center().x(), rect.top(), rect.width() / 2, rect.height()), tint)
+        else:
+            p.fillRect(QRectF(rect.left(), rect.center().y(), rect.width(), rect.height() / 2), tint)
+
+        # 外框 + 分隔线
+        pen = QPen(c, weight * ss)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(rect, r, r)
+        if divider == "vertical":
+            x = rect.center().x()
+            p.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+        else:
+            y = rect.center().y()
+            p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+        p.end()
+        pm.setDevicePixelRatio(ss)
+        icon.addPixmap(pm, state)
+    return icon
+
+
+def _stroke_pen(color, width):
+    """统一的圆头圆角笔画，保证整套图标视觉一致。"""
+    pen = QPen(QColor(color), width)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    return pen
+
+
+def plus_icon(size=16, color="#475569", weight=1.5):
+    """矢量“新建”图标：圆角加号，与分栏图标同一套笔画风格。"""
+    ss = 4.0
+    icon = QIcon()
+    edge = int(size * ss)
+    for state in (QIcon.Normal, QIcon.Active, QIcon.Selected):
+        pm = QPixmap(edge, edge)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        m = edge * 0.20
+        c = edge / 2.0
+        p.setPen(_stroke_pen(color, weight * ss))
+        p.drawLine(QPointF(c, m), QPointF(c, edge - m))
+        p.drawLine(QPointF(m, c), QPointF(edge - m, c))
+        p.end()
+        pm.setDevicePixelRatio(ss)
+        icon.addPixmap(pm, state)
+    return icon
+
+
+def cursor_icon(index=0, size=16, color=None, weight=1.4):
+    """矢量游标图标：顶端向下三角（播放头/游标）+ 竖线。
+
+    index=0 → 游标A（红），index=1 → 游标B（蓝），与绘图区游标颜色一致，
+    便于在工具栏上快速区分两个游标。
+    """
+    color = color or ("#DC2626" if index == 0 else "#2563EB")
+    ss = 4.0
+    icon = QIcon()
+    edge = int(size * ss)
+    for state in (QIcon.Normal, QIcon.Active, QIcon.Selected):
+        pm = QPixmap(edge, edge)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        c = edge / 2.0
+        top = edge * 0.16
+        bot = edge * 0.88
+        hw = edge * 0.16      # 三角半宽
+        th = edge * 0.24      # 三角高
+        # 竖线（从三角内部起，避免圆头端点外露）
+        p.setPen(_stroke_pen(color, weight * ss))
+        p.drawLine(QPointF(c, top + th * 0.6), QPointF(c, bot))
+        # 顶端向下三角
+        tri = QPainterPath()
+        tri.moveTo(c, top + th)
+        tri.lineTo(c - hw, top)
+        tri.lineTo(c + hw, top)
+        tri.closeSubpath()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(color))
+        p.drawPath(tri)
+        p.end()
+        pm.setDevicePixelRatio(ss)
+        icon.addPixmap(pm, state)
+    return icon
+
+
+def clock_icon(size=16, color="#475569", weight=1.5):
+    """矢量时间跳转图标：圆环 + 时针分针。"""
+    ss = 4.0
+    icon = QIcon()
+    edge = int(size * ss)
+    for state in (QIcon.Normal, QIcon.Active, QIcon.Selected):
+        pm = QPixmap(edge, edge)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        m = edge * 0.16
+        rect = QRectF(m, m, edge - 2 * m, edge - 2 * m)
+        p.setPen(_stroke_pen(color, weight * ss))
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(rect)
+        cc = rect.center()
+        p.drawLine(QPointF(cc.x(), cc.y()), QPointF(cc.x(), cc.y() - rect.height() * 0.30))
+        p.drawLine(QPointF(cc.x(), cc.y()), QPointF(cc.x() + rect.width() * 0.22, cc.y()))
+        p.end()
+        pm.setDevicePixelRatio(ss)
+        icon.addPixmap(pm, state)
+    return icon
+
+
+def follow_icon(size=16, color="#475569", weight=1.5):
+    """矢量“跟随最新数据”图标：双右箭头（»），表示视图持续推进到最新数据"""
+    ss = 4.0
+    icon = QIcon()
+    edge = int(size * ss)
+    for state in (QIcon.Normal, QIcon.Active, QIcon.Selected):
+        pm = QPixmap(edge, edge)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(_stroke_pen(color, weight * ss))
+        for dx in (0.0, 0.30):
+            x0 = edge * (0.22 + dx)
+            x1 = edge * (0.46 + dx)
+            chevron = QPainterPath()
+            chevron.moveTo(x0, edge * 0.26)
+            chevron.lineTo(x1, edge * 0.50)
+            chevron.lineTo(x0, edge * 0.74)
+            p.drawPath(chevron)
+        p.end()
+        pm.setDevicePixelRatio(ss)
+        icon.addPixmap(pm, state)
+    return icon
+
+
 # ==================== 崩溃诊断与日志 ====================
 # 打包为窗口程序（console=False）后 stdout/stderr 不可见，静默崩溃时没有任何线索。
 # 这里把日志写到 exe 同级的 logs 目录（不可写时回退系统临时目录），
@@ -216,7 +401,14 @@ def close_x_icon(size=11, color="#475569", hover="#DC2626", weight=1.5):
 _LOG_HANDLE = None
 _LOG_PATH = None
 _LOG_FD = None
-_EXCEPTHOOK_BUSY = False
+# 异常去重与弹窗限流：定时器/绘图回调里反复抛错时，
+# 若无限制地弹模态框会把程序卡死（"弹窗风暴"）
+_EXC_SEEN = {}
+_EXC_MAX_LOGS = 3     # 同一异常最多记录的堆栈次数
+_STACK_LOG_COUNT = 0
+_STACK_LOG_MAX = 20   # 单次运行最多记录的堆栈总数，防止日志被刷爆
+_DIALOG_COUNT = 0
+_DIALOG_MAX = 3       # 单次运行最多弹出的错误框数量
 
 
 def _show_error_dialog_later():
@@ -305,22 +497,28 @@ def setup_crash_logging():
     log(f"日志文件: {_LOG_PATH}")
 
     def _excepthook(exc_type, exc_value, exc_tb):
-        global _EXCEPTHOOK_BUSY
+        global _DIALOG_COUNT, _STACK_LOG_COUNT
         text = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        log('未捕获的 Python 异常:\n' + text)
-        # 绝不在异常抛出点（可能正处于 Qt 绘制/事件分发中）同步弹出模态对话框：
-        # 模态框会启动嵌套事件循环并再次触发绘制，一旦绘图区存在失效对象，
-        # 就会把可恢复的 Python 异常升级为致命 access violation。
-        if _EXCEPTHOOK_BUSY:
+        # 去重计数：避免反复抛错时日志刷屏
+        key = (getattr(exc_type, '__name__', '?'), str(exc_value)[:200])
+        n = _EXC_SEEN.get(key, 0) + 1
+        _EXC_SEEN[key] = n
+        if n == 1 and _STACK_LOG_COUNT >= _STACK_LOG_MAX:
+            log(f'已记录 {_STACK_LOG_MAX} 条异常堆栈，后续异常仅计数、不再输出')
+        if n <= _EXC_MAX_LOGS and _STACK_LOG_COUNT < _STACK_LOG_MAX:
+            _STACK_LOG_COUNT += 1
+            log(f'未捕获的 Python 异常（第 {n} 次）:\n{text}')
+        if n > _EXC_MAX_LOGS:
             return
-        if 'prepareForPaint' in text or 'paintEvent' in text or 'pyqtgraph' in text:
+        # 弹窗限流：反复抛错（如定时器回调中）时，大量模态框会启动嵌套事件循环
+        # 把程序卡死，因此总量封顶，且不在 Qt 绘制上下文中弹窗
+        if _DIALOG_COUNT >= _DIALOG_MAX:
+            return
+        if 'pyqtgraph' in text or 'prepareForPaint' in text or 'paintEvent' in text:
             log('（异常源自绘图控件内部，仅记录日志，不弹窗以避免二次崩溃）')
             return
-        _EXCEPTHOOK_BUSY = True
-        try:
-            QTimer.singleShot(0, _show_error_dialog_later)
-        finally:
-            _EXCEPTHOOK_BUSY = False
+        _DIALOG_COUNT += 1
+        QTimer.singleShot(0, _show_error_dialog_later)
 
     sys.excepthook = _excepthook
 
@@ -822,9 +1020,7 @@ class LiveThread(QThread):
         # ---- 按需记录控制 ----
         self.recording_enabled = False  # False=空闲：不读取数据行，仅监控文件状态
         self.active_cols_bare = None    # None=记录全部列（动态格式）；set=仅记录这些裸列名
-        self.decimation = 1             # 抽稀间隔：每 N 行记录 1 行（按窗口大小动态调整）
         self._need_seek_end = False     # 激活记录时先跳到文件末尾，只记录最新数据
-        self._decim_counter = 0
         self._last_data_time = None     # 最近一次读到数据的时间（monotonic）
 
     def set_paused(self, paused):
@@ -882,40 +1078,34 @@ class LiveThread(QThread):
                         self._last_data_time = time.monotonic()
                         check_counter = 0
                         if not self.paused:
-                            # 按窗口大小抽稀，动态调整记录的数据量与详细程度
-                            skip = False
-                            if self.decimation > 1:
-                                self._decim_counter += 1
-                                if self._decim_counter % self.decimation:
-                                    skip = True
-                            if not skip:
-                                results = parse_log_line(line)
-                                for ts_str, cols, vals in results:
-                                    if cols is None or vals is None:
-                                        continue
-                                    # 优先使用本片段的时间戳；否则沿用上一次的
-                                    ts_use = ts_str if ts_str else last_ts_str
-                                    if ts_str:
-                                        last_ts_str = ts_str
-                                    if not ts_use:
-                                        epoch = datetime.datetime.now().timestamp()
-                                    else:
+                            # 不做抽稀：只解析被拖动绘制的列，数据量已足够小
+                            results = parse_log_line(line)
+                            for ts_str, cols, vals in results:
+                                if cols is None or vals is None:
+                                    continue
+                                # 优先使用本片段的时间戳；否则沿用上一次的
+                                ts_use = ts_str if ts_str else last_ts_str
+                                if ts_str:
+                                    last_ts_str = ts_str
+                                if not ts_use:
+                                    epoch = datetime.datetime.now().timestamp()
+                                else:
+                                    try:
+                                        dt = datetime.datetime.strptime(ts_use, '%Y-%m-%d %H:%M:%S.%f')
+                                        epoch = dt.timestamp()
+                                    except Exception:
                                         try:
-                                            dt = datetime.datetime.strptime(ts_use, '%Y-%m-%d %H:%M:%S.%f')
+                                            dt = datetime.datetime.strptime(ts_use, '%Y-%m-%d %H:%M:%S')
                                             epoch = dt.timestamp()
                                         except Exception:
-                                            try:
-                                                dt = datetime.datetime.strptime(ts_use, '%Y-%m-%d %H:%M:%S')
-                                                epoch = dt.timestamp()
-                                            except Exception:
-                                                epoch = datetime.datetime.now().timestamp()
-                                    data_dict = dict(zip(cols, vals))
-                                    # 针对性记录：仅记录当前操作的臂上已绘制的列
-                                    if self.active_cols_bare is not None:
-                                        data_dict = {c: v for c, v in data_dict.items()
-                                                     if c in self.active_cols_bare}
-                                    if data_dict:
-                                        batch.append((epoch, data_dict))
+                                            epoch = datetime.datetime.now().timestamp()
+                                data_dict = dict(zip(cols, vals))
+                                # 针对性记录：仅记录当前操作的臂上已绘制的列
+                                if self.active_cols_bare is not None:
+                                    data_dict = {c: v for c, v in data_dict.items()
+                                                 if c in self.active_cols_bare}
+                                if data_dict:
+                                    batch.append((epoch, data_dict))
                 else:
                     if batch:
                         self.new_batch.emit(batch)
@@ -1368,14 +1558,16 @@ class TimeAxis(pg.AxisItem):
             return [""] * len(values)
 
 # ==================== 支持拖拽的绘图控件 ====================
-class MiddlePanViewBox(pg.ViewBox):
-    """自定义交互：左键=框选放大（RectMode），中键拖动=平移，右键拖动=缩放（默认）"""
+class LeftPanViewBox(pg.ViewBox):
+    """自定义交互：左键拖动=平移，中键拖动=框选放大（RectMode），右键拖动=缩放"""
     def mouseDragEvent(self, ev, axis=None):
-        if ev.button() != Qt.MiddleButton or axis is not None:
+        # 仅“左键 + 非坐标轴”走自定义平移，其余交给 pyqtgraph 默认处理：
+        # 默认逻辑把左键与中键同等对待，mouseMode=RectMode 时即框选放大
+        if ev.button() != Qt.LeftButton or axis is not None:
             super().mouseDragEvent(ev, axis)
             return
         ev.accept()
-        # 中键平移：与 PyQtGraph 默认 PanMode 左键平移逻辑一致
+        # 左键平移：与 PyQtGraph 默认 PanMode 的平移逻辑一致
         mask = np.array(self.state['mouseEnabled'], dtype=np.float64)
         dif = (ev.pos() - ev.lastPos()) * -1
         tr = pg.functions.invertQTransform(self.childGroup.transform())
@@ -1391,8 +1583,66 @@ class DropPlotWidget(pg.PlotWidget):
     drop_signal = pyqtSignal(str)
 
     def __init__(self, parent=None, **kwargs):
+        # 必须在 super().__init__() 之前赋值：pyqtgraph 构造过程中就会触发 resizeEvent，
+        # 而 PlotWidget 重写了 __getattr__，未定义的属性会直接抛 AttributeError
+        self.overlay = None  # 悬浮在右上角的按钮条（跟随/关闭）
+        self._overlay_timer = None  # 悬停显隐去抖定时器
         super().__init__(parent, **kwargs)
         self.setAcceptDrops(True)
+
+    def attach_overlay(self, ov):
+        """登记右上角悬浮按钮条：默认隐藏，鼠标移到该子视图上时才显示"""
+        self.overlay = ov
+        ov.hide()
+        # 监听本控件、viewport 及按钮条自身/子按钮的进入与离开
+        for w in (self, self.viewport(), ov):
+            w.installEventFilter(self)
+        for btn in ov.findChildren(QPushButton):
+            btn.installEventFilter(self)
+        self.place_overlay()
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.Enter, QEvent.Leave):
+            self._schedule_overlay_update()
+        return super().eventFilter(obj, event)
+
+    def _schedule_overlay_update(self):
+        """延后判断显隐：从绘图区移到悬浮按钮的瞬间会有 Leave 事件，需稍等再确认"""
+        if self._overlay_timer is None:
+            self._overlay_timer = QTimer(self)
+            self._overlay_timer.setSingleShot(True)
+            self._overlay_timer.setInterval(80)
+            self._overlay_timer.timeout.connect(self._update_overlay_visibility)
+        self._overlay_timer.start()
+
+    def _update_overlay_visibility(self):
+        ov = getattr(self, 'overlay', None)
+        if ov is None:
+            return
+        if self._cursor_inside():
+            if not ov.isVisible():
+                ov.show()
+            self.place_overlay()
+        else:
+            ov.hide()
+
+    def _cursor_inside(self):
+        """鼠标是否位于本子视图内（含悬浮按钮）"""
+        w = QApplication.widgetAt(QCursor.pos())
+        return w is not None and (w is self or self.isAncestorOf(w))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.place_overlay()
+
+    def place_overlay(self):
+        """把悬浮按钮条贴到绘图区右上角（窗口/分栏尺寸变化时重新定位）"""
+        ov = getattr(self, 'overlay', None)
+        if ov is None:
+            return
+        ov.adjustSize()
+        ov.move(max(0, self.width() - ov.width() - 8), 6)
+        ov.raise_()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasText():
@@ -1480,6 +1730,9 @@ class PlotSubWidget(QWidget):
         self.cursor_labels = []
         self.cursor_annotations = {}  # (col, cursor_idx) -> TextItem（标注原地更新）
         self.cursor_time_labels = [None, None]  # 每个游标一个时间标签
+        # 鼠标悬浮取值
+        self.hover_label = None   # 悬浮提示（坐标值）
+        self.hover_dot = None     # 悬浮点标记
         self._cursor_debounce_timer = QTimer()
         self._cursor_debounce_timer.setSingleShot(True)
         self._cursor_debounce_timer.timeout.connect(self.flush_cursor_annotations)
@@ -1491,7 +1744,7 @@ class PlotSubWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         # 绘图区域
-        self.plot_widget = DropPlotWidget(viewBox=MiddlePanViewBox())
+        self.plot_widget = DropPlotWidget(viewBox=LeftPanViewBox())
         self.plot_widget.setAxisItems({'bottom': TimeAxis(orientation='bottom')})
         self.plot_widget.setBackground('w')
         self.plot_widget.setLabel('left', '数值')
@@ -1500,19 +1753,25 @@ class PlotSubWidget(QWidget):
         self.plot_widget.addLegend()
         self.plot_widget.setClipToView(True)
         self.plot_widget.scene().installEventFilter(self)
+        # 鼠标悬浮在曲线上时显示该点的横纵坐标值
+        self.plot_widget.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.plot_widget.drop_signal.connect(self.add_curve)
         self.plot_widget.installEventFilter(self)
+        # 鼠标移出绘图区时结束悬浮显示（enter/leave 事件落在 viewport 上）
+        self.plot_widget.viewport().installEventFilter(self)
         self.plot_widget.mouseDoubleClickEvent = self.on_double_click
         self.plot_widget.getViewBox().sigRangeChangedManually.connect(self.on_view_range_changed)
 
         layout.addWidget(self.plot_widget, stretch=1)
 
-        # 下方工具栏：跟随按钮 + 关闭按钮（靠右）
-        ctrl_frame = QWidget()
+        # 跟随/关闭按钮做成绘图区右上角的悬浮控件，不再单独占一行，
+        # 否则每个子图下方都会多出一条约 35px 的空白带
+        ctrl_frame = QWidget(self.plot_widget)
         ctrl_layout = QHBoxLayout(ctrl_frame)
-        ctrl_layout.setContentsMargins(0, 5, 0, 5)
-        ctrl_layout.addStretch()
-        self.follow_btn = QPushButton("🔘")
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        ctrl_layout.setSpacing(4)
+        self.follow_btn = QPushButton(follow_icon(), "")
+        self.follow_btn.setIconSize(QSize(14, 14))
         self.follow_btn.setFixedSize(30, 25)
         self.follow_btn.setProperty("class", "icon")
         self.follow_btn.setToolTip("跟随最新数据（双击绘图区可同步全部子图）")
@@ -1530,10 +1789,13 @@ class PlotSubWidget(QWidget):
         self.close_btn.clicked.connect(self.request_close)
         ctrl_layout.addWidget(self.close_btn)
 
-        layout.addWidget(ctrl_frame)
+        self.plot_widget.attach_overlay(ctrl_frame)
 
     def eventFilter(self, obj, event):
         """拦截绘图控件的键盘事件和场景右键事件"""
+        # 鼠标移出绘图区：结束悬浮取值显示
+        if obj is self.plot_widget.viewport() and event.type() == QEvent.Leave:
+            self._hide_hover()
         # 场景级：拦截图例右键（在事件到达任何 item 之前）
         if obj is self.plot_widget.scene():
             if event.type() == QEvent.GraphicsSceneMousePress and event.button() == Qt.RightButton:
@@ -1838,10 +2100,13 @@ class PlotSubWidget(QWidget):
                 if not xbuf:
                     continue
                 x_full = np.array(xbuf)
-                if len(x_full) > len(y_full):
-                    x_full = x_full[-len(y_full):]
-                elif len(y_full) > len(x_full):
-                    y_full = y_full[-len(x_full):]
+                # 用 min() 对齐长度：注意不能用 [-len(空数组):]，
+                # 那等价于 [0:] 会取到全长，导致后面长度不一致而报错
+                n = min(len(x_full), len(y_full))
+                if n == 0:
+                    continue
+                x_full = x_full[-n:]
+                y_full = y_full[-n:]
                 mask = (x_full >= x_min) & (x_full <= x_max) & np.isfinite(y_full)
                 if np.any(mask):
                     y_vals = y_full[mask]
@@ -1946,12 +2211,12 @@ class PlotSubWidget(QWidget):
                 y_arr = np.array(self.main.y_buffers[col])
                 xbuf = self._get_x_buffer(col)
                 x_arr = np.array(xbuf) if xbuf else np.array([])
-                if len(x_arr) > len(y_arr):
-                    x_arr = x_arr[-len(y_arr):]
-                elif len(y_arr) > len(x_arr):
-                    y_arr = y_arr[-len(x_arr):]
-                if len(x_arr) > 0:
-                    i = np.clip(np.searchsorted(x_arr, x), 0, len(x_arr)-1)
+                # 同 _auto_range_y：空数组不能用 [-len():] 截取，否则会取到全长
+                n = min(len(x_arr), len(y_arr))
+                if n > 0:
+                    x_arr = x_arr[-n:]
+                    y_arr = y_arr[-n:]
+                    i = np.clip(np.searchsorted(x_arr, x), 0, n - 1)
                     if i > 0 and abs(x_arr[i-1] - x) < abs(x_arr[i] - x):
                         i = i - 1
                     y_val = y_arr[i]
@@ -2088,7 +2353,140 @@ class PlotSubWidget(QWidget):
             self.plot_widget.addItem(label)
             self.cursor_time_labels[cursor_idx] = label
 
+    # ==================== 鼠标悬浮取值 ====================
+    HOVER_PICK_RADIUS_PX = 12.0   # 距曲线多少像素内才算“悬浮在曲线上”
+
+    def _format_x_value(self, x, col):
+        """按当前数据源格式化横坐标：有时间轴时显示时刻，否则显示行号"""
+        main = self.main
+        base_col = col
+        while base_col.endswith('[diff]'):
+            base_col = base_col[:-6]
+        # 在线模式的 x 是 epoch 秒；离线则取决于是否解析出时间戳
+        is_time = base_col in main.y_buffers or main.timestamp_epoch is not None
+        if not is_time:
+            return f"行 {int(round(x))}"
+        try:
+            return datetime.datetime.fromtimestamp(x).strftime("%H:%M:%S.%f")[:-3]
+        except Exception:
+            return f"{x:.3f}"
+
+    def _curve_color(self, curve):
+        """取曲线当前颜色，用于悬浮标记点与文字"""
+        try:
+            pen = curve.opts.get('pen')
+            if pen is not None:
+                return pg.mkPen(pen).color()
+        except Exception:
+            pass
+        return QColor('#1f77b4')
+
+    def _on_mouse_moved(self, pos):
+        """鼠标移动：找出拾取半径内的所有曲线，显示各自 (x, y)。
+
+        两条曲线重合时两条都会列出（按各自颜色区分），而不是只显示其中一条。
+        """
+        try:
+            if not self.plot_items or not qt_alive(self.plot_widget):
+                self._hide_hover()
+                return
+            vb = self.plot_widget.getViewBox()
+            if not self.plot_widget.sceneBoundingRect().contains(pos):
+                self._hide_hover()
+                return
+            mp = vb.mapSceneToView(pos)
+            mx, my = mp.x(), mp.y()
+            xr, yr = vb.viewRange()
+            if xr[1] <= xr[0] or yr[1] <= yr[0]:
+                self._hide_hover()
+                return
+            # 视坐标 -> 屏幕像素 的缩放，用于按像素判定“贴住曲线”
+            rect = vb.boundingRect()
+            sx = rect.width() / (xr[1] - xr[0])
+            sy = rect.height() / (yr[1] - yr[0])
+            radius = self.HOVER_PICK_RADIUS_PX
+
+            cands = []   # (像素距离, 列名, x, y, 颜色)
+            for col, curve in self.plot_items.items():
+                if not qt_alive(curve):
+                    continue
+                try:
+                    x_arr, y_arr = curve.getOriginalDataset()
+                except Exception:
+                    continue
+                if x_arr is None or y_arr is None:
+                    continue
+                n = len(y_arr)
+                if n == 0 or len(x_arr) != n:
+                    continue
+                i = int(np.searchsorted(x_arr, mx))
+                i = max(0, min(n - 1, i))
+                # 该曲线在最近点附近的有效点里取离鼠标最近的一个（跳过 NaN 断点）
+                local = None
+                for j in range(max(0, i - 5), min(n - 1, i + 5) + 1):
+                    yv = y_arr[j]
+                    if not np.isfinite(yv):
+                        continue
+                    d = np.hypot((x_arr[j] - mx) * sx, (yv - my) * sy)
+                    if local is None or d < local[0]:
+                        local = (d, float(x_arr[j]), float(yv))
+                if local is not None and local[0] <= radius:
+                    cands.append((local[0], col, local[1], local[2], self._curve_color(curve)))
+
+            if not cands:
+                self._hide_hover()
+                return
+            cands.sort(key=lambda t: t[3], reverse=True)   # 按 Y 从高到低排列，便于阅读
+            self._show_hover(cands)
+        except Exception:
+            # 高频回调，任何异常都静默处理，避免弹窗风暴
+            pass
+
+    def _show_hover(self, cands):
+        """显示/更新悬浮提示与标记点（原地复用，避免反复创建销毁绘图项）
+
+        cands: [(像素距离, 列名, x, y, 颜色), ...]，可能包含多条重合曲线
+        """
+        if self.hover_label is None or not qt_alive(self.hover_label):
+            label = pg.TextItem(anchor=(0, 1.15), fill=pg.mkBrush(255, 255, 255, 235),
+                                border=pg.mkPen('#CBD5E1'))
+            label.setZValue(1e9)
+            self.plot_widget.addItem(label)
+            self.hover_label = label
+        if self.hover_dot is None or not qt_alive(self.hover_dot):
+            dot = pg.ScatterPlotItem(symbol='o', size=9, pen=pg.mkPen('#FFFFFF', width=1.5))
+            dot.setZValue(1e9)
+            self.plot_widget.addItem(dot)
+            self.hover_dot = dot
+
+        # 时间取离鼠标最近（像素距离最小）的那条曲线
+        _, near_col, near_x, _, _ = min(cands, key=lambda t: t[0])
+        rows = [f'<div style="color:#1E293B">{self._format_x_value(near_x, near_col)}</div>']
+        spots = []
+        for d, col, x, y, color in cands:
+            name = col.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            rows.append(f'<div style="color:{color.name()}">{name} = {y:.5f}</div>')
+            spots.append({'pos': (x, y), 'brush': pg.mkBrush(color),
+                          'pen': pg.mkPen('#FFFFFF', width=1.5), 'size': 9})
+
+        self.hover_label.setHtml(''.join(rows))
+        # 锚点放在最高的那个点上，避免提示框压住曲线
+        self.hover_label.setPos(cands[0][2], cands[0][3])
+        self.hover_label.setVisible(True)
+        self.hover_dot.setData(spots)
+        self.hover_dot.setVisible(True)
+
+    def _hide_hover(self):
+        for item in (self.hover_label, self.hover_dot):
+            if item is not None and qt_alive(item):
+                try:
+                    if item.isVisible():
+                        item.setVisible(False)
+                except Exception:
+                    pass
+
     def clear_all_curves(self):
+        self._hide_hover()
         self._remove_cursor_labels()
         for curve in self.plot_items.values():
             self._safe_remove_item(curve)
@@ -2134,7 +2532,23 @@ class PlotTab(QWidget):
         for ci in range(2):
             if self.cursor_enabled[ci] and self.cursor_x[ci] is not None:
                 sub.set_cursor_visible(self.cursor_x[ci], True, cursor_idx=ci)
+        self._update_bottom_labels()
         self._align_left_axes()
+
+    def _update_bottom_labels(self):
+        """纵向堆叠子图时，仅最下方子图保留"时间"轴标签，其余收起。
+
+        每张子图都画一遍"时间"会白白多占约 18px 高度，堆叠时留白明显。
+        """
+        vertical = self.splitter.orientation() == Qt.Vertical
+        n = len(self.sub_widgets)
+        for i, sub in enumerate(self.sub_widgets):
+            axis = sub.plot_widget.getAxis('bottom')
+            show = (not vertical) or (i == n - 1)
+            if show:
+                axis.setLabel('时间')
+            if hasattr(axis, 'showLabel'):
+                axis.showLabel(show)
 
     def split_horizontal(self):
         if not self.sub_widgets:
@@ -2167,6 +2581,8 @@ class PlotTab(QWidget):
         if qt_alive(sub_widget):
             sub_widget.setParent(None)
             sub_widget.deleteLater()
+        # 删除后"最下方子图"可能变化，需重新分配"时间"轴标签
+        self._update_bottom_labels()
         # 在线模式：分栏关闭后其曲线不再参与记录目标计算
         if hasattr(self.main, '_refresh_recording_targets'):
             self.main._refresh_recording_targets()
@@ -2526,6 +2942,7 @@ class MainWindow(QMainWindow):
         self.df = None
         self.current_columns = []
         self.load_thread = None
+        self._dropped_files = None  # 拖入的多文件列表（path_edit 无法表示时使用）
         self.live_threads = []
         self.use_cache = True
         self.force_rebuild = False
@@ -2539,8 +2956,8 @@ class MainWindow(QMainWindow):
         self._tree_prebuilt = False
         # ---- 在线按需记录状态 ----
         self._arm_active_cols = {}    # 臂前缀 → 该臂当前已绘制列（裸列名）集合
-        self._current_decimation = 1  # 当前抽稀间隔（按窗口大小动态调整）
         self._live_conn = None        # 最近一次在线连接参数（用于按臂重启线程）
+        self._last_time_jump_text = ""  # 记录上一次输入的时间，弹窗时回填
         self.update_timer = QTimer()
         self.update_timer.setInterval(50)
         self.update_timer.timeout.connect(self.update_plots_from_buffer)
@@ -2555,12 +2972,11 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(10)
 
         # ========== 左侧控制面板 ==========
-        left_panel = QWidget()
-        # 宽度自适应内容：不同分辨率/DPI/窗口大小下文字不会被压缩截断，也不会过宽
-        left_panel.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
-        left_panel.setMinimumWidth(320)
-        left_panel.setMaximumWidth(520)
-        left_layout = QVBoxLayout(left_panel)
+        # 内容放在滚动区内：窗口/屏幕高度不足时改为滚动，
+        # 而不是把 QGroupBox、输入框强行压扁导致字段相互遮挡
+        left_inner = QWidget()
+        left_inner.setObjectName("leftPanel")  # 对应 QSS 中的紧凑字号规则
+        left_layout = QVBoxLayout(left_inner)
         left_layout.setSpacing(8)
         left_layout.setContentsMargins(10, 10, 10, 10)
 
@@ -2593,6 +3009,8 @@ class MainWindow(QMainWindow):
         path_layout = QVBoxLayout()
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("选择文件或文件夹...")
+        # 路径文本一经改动（手动编辑/重新选择）即放弃此前拖入的多文件列表
+        self.path_edit.textChanged.connect(self._on_path_text_changed)
         path_layout.addWidget(self.path_edit)
         btn_layout = QHBoxLayout()
         self.file_btn = QPushButton("选择文件")
@@ -2754,13 +3172,14 @@ class MainWindow(QMainWindow):
         self.tree.setHeaderLabel("数据列")
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.setIndentation(20)
-        self.tree.setMinimumHeight(150)  # 允许在矮窗口下收缩，避免挤压其他控件文字
+        self.tree.setMinimumHeight(240)  # 数据列区域留出足够高度，窗口不足时由左侧滚动区滚动
         self.tree.setAlternatingRowColors(True)   # 斑马纹提升长列表可读性
         self.tree.setAnimated(True)               # 展开/折叠平滑动画
         self.tree.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)  # 平滑滚动
         self.tree.setAccessibleName("数据列树，可将数据列拖入绘图区")
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        left_layout.addWidget(self.tree)
+        # stretch=1：窗口变高时把多余空间让给数据列树（不再被下面的弹簧吃掉）
+        left_layout.addWidget(self.tree, 1)
 
         # 清除当前页所有曲线按钮
         clear_btn = QPushButton("🗑️ 清除当前页所有曲线")
@@ -2774,15 +3193,22 @@ class MainWindow(QMainWindow):
         self.save_btn.clicked.connect(self.save_current_figure)
         left_layout.addWidget(self.save_btn)
 
-        left_layout.addStretch()
-
         # logo（与 launcher 风格一致）
         logo_label = QLabel("Made with TC❤️")
         logo_label.setObjectName("logoLabel")
         logo_label.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(logo_label)
 
-        main_layout.addWidget(left_panel)
+        # 左侧面板整体放入滚动区：内容超出可用高度时出现滚动条，控件永不被压扁
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)   # 空间足够时拉伸填满，不足时滚动
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # 宽度由面板自适应，不出现横向滚动
+        left_scroll.setWidget(left_inner)
+        left_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        left_scroll.setMinimumWidth(340)
+        left_scroll.setMaximumWidth(560)
+        main_layout.addWidget(left_scroll)
 
         # ========== 右侧绘图区域 ==========
         right_container = QWidget()
@@ -2800,20 +3226,20 @@ class MainWindow(QMainWindow):
         corner_layout.setContentsMargins(0, 0, 0, 0)
         corner_layout.setSpacing(2)
 
-        # 水平分栏按钮（图标）
-        self.h_split_btn = QPushButton("‖")
-        # self.h_split_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
-        self.h_split_btn.setToolTip("水平分栏")
+        # 水平分栏按钮（左右并排 → 竖线分隔图标）
+        self.h_split_btn = QPushButton(split_icon("vertical"), "")
+        self.h_split_btn.setIconSize(QSize(16, 16))
+        self.h_split_btn.setToolTip("水平分栏（左右并排）")
         self.h_split_btn.setFixedSize(30, 30)
         self.h_split_btn.setProperty("class", "icon")
         self.h_split_btn.setAccessibleName("水平分栏")
         self.h_split_btn.clicked.connect(self.split_current_tab_horizontal)
         corner_layout.addWidget(self.h_split_btn)
 
-        # 垂直分栏按钮
-        self.v_split_btn = QPushButton("☰")
-        # self.v_split_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMinButton))
-        self.v_split_btn.setToolTip("垂直分栏")
+        # 垂直分栏按钮（上下堆叠 → 横线分隔图标）
+        self.v_split_btn = QPushButton(split_icon("horizontal"), "")
+        self.v_split_btn.setIconSize(QSize(16, 16))
+        self.v_split_btn.setToolTip("垂直分栏（上下堆叠）")
         self.v_split_btn.setFixedSize(30, 30)
         self.v_split_btn.setProperty("class", "icon")
         self.v_split_btn.setAccessibleName("垂直分栏")
@@ -2821,7 +3247,8 @@ class MainWindow(QMainWindow):
         corner_layout.addWidget(self.v_split_btn)
 
         # 新建标签页按钮
-        self.new_tab_btn = QPushButton("+")
+        self.new_tab_btn = QPushButton(plus_icon(), "")
+        self.new_tab_btn.setIconSize(QSize(16, 16))
         self.new_tab_btn.setFixedSize(30, 30)
         self.new_tab_btn.setProperty("class", "icon")
         self.new_tab_btn.setToolTip("新建标签页")
@@ -2830,7 +3257,8 @@ class MainWindow(QMainWindow):
         corner_layout.addWidget(self.new_tab_btn)
 
         # 垂直游标切换按钮
-        self.cursor_btn = QPushButton("I")
+        self.cursor_btn = QPushButton(cursor_icon(0), "")
+        self.cursor_btn.setIconSize(QSize(16, 16))
         self.cursor_btn.setToolTip("切换游标A (Tab键切换活动游标, 左右箭头移动)")
         self.cursor_btn.setFixedSize(30, 30)
         self.cursor_btn.setProperty("class", "icon")
@@ -2839,7 +3267,8 @@ class MainWindow(QMainWindow):
         self.cursor_btn.clicked.connect(lambda: self.toggle_current_tab_cursor(0))
         corner_layout.addWidget(self.cursor_btn)
 
-        self.cursor2_btn = QPushButton("II")
+        self.cursor2_btn = QPushButton(cursor_icon(1), "")
+        self.cursor2_btn.setIconSize(QSize(16, 16))
         self.cursor2_btn.setToolTip("切换游标B (Tab键切换活动游标, 左右箭头移动)")
         self.cursor2_btn.setFixedSize(30, 30)
         self.cursor2_btn.setProperty("class", "icon")
@@ -2849,7 +3278,8 @@ class MainWindow(QMainWindow):
         corner_layout.addWidget(self.cursor2_btn)
 
         # 时间跳转按钮
-        self.time_jump_btn = QPushButton("⏱")
+        self.time_jump_btn = QPushButton(clock_icon(), "")
+        self.time_jump_btn.setIconSize(QSize(16, 16))
         self.time_jump_btn.setToolTip("跳转到指定时间 (J)")
         self.time_jump_btn.setFixedSize(30, 30)
         self.time_jump_btn.setProperty("class", "icon")
@@ -2888,12 +3318,11 @@ class MainWindow(QMainWindow):
         self._resize_timer.start(300)  # 去抖：拖动结束后才刷新
 
     def _after_resize(self):
-        """窗口尺寸调整完成后：重新对齐各子图左轴（网格对齐）并更新记录密度"""
+        """窗口尺寸调整完成后：重新对齐各子图左轴（网格对齐）"""
         for i in range(self.tab_widget.count()):
             tab = self.tab_widget.widget(i)
             if hasattr(tab, '_align_left_axes'):
                 tab._align_left_axes()
-        self._update_decimation()
 
     def _start_post_load_heartbeat(self):
         """加载完成后启动短时心跳日志。
@@ -2929,33 +3358,7 @@ class MainWindow(QMainWindow):
                     pw.repaint()
         # 重新自适应树表头宽度（DPI 变化后字体尺寸会变）
         self.tree.header().resizeSections(QHeaderView.ResizeToContents)
-        self._update_decimation()
         self.statusBar().showMessage("已切换显示设备，界面布局已刷新")
-
-    def _update_decimation(self):
-        """根据当前窗口/绘图区大小动态调整在线记录密度（抽稀间隔）：
-        窗口越大记录越密集（保留更多细节），窗口越小记录越稀疏（更流畅）"""
-        if not self.live_threads:
-            return
-        width_px = 0
-        for i in range(self.tab_widget.count()):
-            tab = self.tab_widget.widget(i)
-            if hasattr(tab, 'sub_widgets'):
-                for sub in tab.sub_widgets:
-                    width_px += sub.plot_widget.width()
-        if width_px <= 0:
-            return
-        POINTS_PER_PX = 4  # 每像素保留的数据点数（兼顾曲线平滑度与性能）
-        est_points = self.buffer_seconds * 1000  # 缓冲区内估计总点数（按 1kHz 采样）
-        decim = max(1, min(100, int(est_points / (width_px * POINTS_PER_PX))))
-        if decim == self._current_decimation:
-            return
-        self._current_decimation = decim
-        for t in self.live_threads:
-            if t and t.isRunning():
-                t.decimation = decim
-        if decim > 1:
-            self.statusBar().showMessage(f"已按窗口大小调整记录密度：每 {decim} 点取 1 点")
 
     # ========== 标签页管理 ==========
     def _install_tab_close_button(self, index):
@@ -3042,10 +3445,12 @@ class MainWindow(QMainWindow):
         time_str, ok = QInputDialog.getText(
             self, "时间跳转",
             "输入目标时间",
-            text=""
+            text=self._last_time_jump_text
         )
-        if ok and time_str:
-            tab.jump_to_time(time_str)
+        if ok:
+            if time_str:
+                self._last_time_jump_text = time_str
+                tab.jump_to_time(time_str)
 
     def save_current_figure(self):
         current_tab = self.tab_widget.currentWidget()
@@ -3109,7 +3514,6 @@ class MainWindow(QMainWindow):
                 for sub in tab.sub_widgets:
                     sub.view_width = float(new_seconds)
         self.statusBar().showMessage(f"保留时间已调整为 {new_seconds} s")
-        self._update_decimation()
 
     def _get_remote_paths(self):
         """返回 [(arm_prefix, remote_path), ...] 列表，从配置读取"""
@@ -3311,7 +3715,6 @@ class MainWindow(QMainWindow):
             self.online_info_label.setText("正在监控中...")
         self.pause_btn.setEnabled(True)
         self.resume_btn.setEnabled(False)
-        self._update_decimation()
 
     def stop_live(self):
         if hasattr(self, 'live_threads'):
@@ -3339,7 +3742,6 @@ class MainWindow(QMainWindow):
         thread = LiveThread(ip, port, user, pwd, remote_path, arm_prefix=prefix)
         # 动态格式（如 ADS）需持续读取以发现数据列；已知格式默认空闲，拖入曲线后按需记录
         thread.recording_enabled = (not self._tree_prebuilt)
-        thread.decimation = self._current_decimation
         thread.new_batch.connect(lambda batch, p=prefix: self.on_new_batch(batch, p))
         thread.error.connect(self.on_live_error)
         thread.status.connect(self.statusBar().showMessage)
@@ -3364,7 +3766,6 @@ class MainWindow(QMainWindow):
             return None
         thread = LiveThread(conn['ip'], conn['port'], conn['user'], conn['pwd'],
                             conn['paths'][arm_prefix], arm_prefix=arm_prefix)
-        thread.decimation = self._current_decimation
         thread.new_batch.connect(lambda batch, p=arm_prefix: self.on_new_batch(batch, p))
         thread.error.connect(self.on_live_error)
         thread.status.connect(self.statusBar().showMessage)
@@ -3399,6 +3800,14 @@ class MainWindow(QMainWindow):
             if ':' in key:
                 p, c = key.split(':', 1)
                 arm_cols.setdefault(p, set()).add(c)
+        # 新激活的列：其历史缓冲区与当前 x 轴时间不再对应（曲线曾被移除过），
+        # 必须清空后重新与 x 同步追加，否则 x/y 尾部对齐会错位显示旧数据
+        for p, cols in arm_cols.items():
+            newly = cols - self._arm_active_cols.get(p, set())
+            for c in newly:
+                b = self.y_buffers.get(f"{p}:{c}")
+                if b is not None:
+                    b.clear()
         self._arm_active_cols = arm_cols
         dynamic_mode = not self._tree_prebuilt
 
@@ -3470,6 +3879,8 @@ class MainWindow(QMainWindow):
                 for c, b in col_bufs:
                     v = data_dict.get(c)
                     b.append(v if v is not None else float('nan'))
+            # 按保留时间淘汰过期点（maxlen 仅作内存安全上限）
+            self._evict_old_data(arm_prefix, [c for c, _ in col_bufs])
         else:
             # 动态格式（如 ADS）：动态建树 + 惰性 buffer 创建
             new_cols = []
@@ -3484,8 +3895,39 @@ class MainWindow(QMainWindow):
                         self.y_buffers[full] = buf
                         new_cols.append(col)
                     buf.append(val)
+            self._evict_old_data(arm_prefix)
             if new_cols:
                 self._ensure_tree_items(arm_prefix, new_cols)
+
+    def _evict_old_data(self, arm_prefix, active_cols=None):
+        """按"保留时间"淘汰过期数据，使缓冲区的时间跨度严格等于设置值。
+
+        淘汰依据是时间戳而非点数：x 轴按时间裁剪，各列 y 按其自身长度补齐，
+        因此后加入的列（起始时间更晚）不会被误删。
+        active_cols 为 None 时处理该臂的全部列（动态格式）。
+        """
+        xbuf = self.x_buffers.get(arm_prefix)
+        if not xbuf:
+            return
+        cutoff = xbuf[-1] - float(self.buffer_seconds)
+        dropped = False
+        while xbuf and xbuf[0] < cutoff:
+            xbuf.popleft()
+            dropped = True
+        if not dropped:
+            return
+        # 裁剪后 x 的长度即"窗口内应有的点数"；各列 y 与其尾部对齐，
+        # 因此超出该长度的部分即为过期点
+        keep = len(xbuf)
+        pk = arm_prefix + ':'
+        keys = ([pk + c for c in active_cols] if active_cols is not None
+                else [k for k in self.y_buffers if k.startswith(pk)])
+        for k in keys:
+            b = self.y_buffers.get(k)
+            if b is None:
+                continue
+            for _ in range(max(0, len(b) - keep)):
+                b.popleft()
 
     def _ensure_tree_items(self, arm_prefix, bare_cols):
         """动态模式：为首次出现的列创建树节点"""
@@ -3562,7 +4004,7 @@ class MainWindow(QMainWindow):
 
         if len(paths) == 1:
             path = paths[0]
-            self.path_edit.setText(path)
+            self.path_edit.setText(path)   # textChanged 会清空 _dropped_files
             self.force_rebuild = False
             if os.path.isdir(path):
                 if self.use_cache:
@@ -3577,23 +4019,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "提示", "拖入的文件中没有可解析的日志文件")
                 return
             log_files.sort(key=lambda f: get_file_first_timestamp(f) or datetime.datetime.min)
+            # 多文件没有单一路径可用于回填 path_edit，此处仅作展示，
+            # 真正的待加载列表存入 _dropped_files，点击“加载”时复用
             self.path_edit.setText(f"拖放 {len(log_files)} 个文件")
+            self._dropped_files = log_files
             self.force_rebuild = False
             self.rebuild_btn.setEnabled(False)
-            # 准备加载
-            self.load_btn.setEnabled(False)
-            self.cancel_btn.setEnabled(True)
-            self.file_btn.setEnabled(False)
-            self.folder_btn.setEnabled(False)
-            self.progress_bar.setValue(0)
-            self.info_label.setText("加载中...")
-            self.tree.clear()
-            self.load_thread = LoadThread(log_files[0], self.use_cache, self.force_rebuild,
-                                          use_relative_time=self.relative_time_cb.isChecked(),
-                                          files=log_files)
-            self.load_thread.progress.connect(self.update_progress)
-            self.load_thread.finished.connect(self.load_finished)
-            self.load_thread.start()
+            self.start_load()
 
     # ========== 离线模式方法 ==========
     def select_file(self):
@@ -3634,11 +4066,20 @@ class MainWindow(QMainWindow):
         self.force_rebuild = True
         self.start_load()
 
+    def _on_path_text_changed(self, _text):
+        """路径文本变化（手动编辑或重新选择）后，不再沿用拖入的多文件列表"""
+        self._dropped_files = None
+
     def start_load(self):
-        path = self.path_edit.text().strip()
-        if not path or not os.path.exists(path):
-            QMessageBox.warning(self, "错误", "路径不存在")
-            return
+        # 多文件拖入时 path_edit 里只有展示文本，真实列表存在 _dropped_files
+        files = self._dropped_files
+        if files:
+            path = files[0]
+        else:
+            path = self.path_edit.text().strip()
+            if not path or not os.path.exists(path):
+                QMessageBox.warning(self, "错误", "路径不存在")
+                return
 
         self.load_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
@@ -3650,7 +4091,8 @@ class MainWindow(QMainWindow):
         self.tree.clear()
 
         self.load_thread = LoadThread(path, self.use_cache, self.force_rebuild,
-                                      use_relative_time=self.relative_time_cb.isChecked())
+                                      use_relative_time=self.relative_time_cb.isChecked(),
+                                      files=files)
         self.load_thread.progress.connect(self.update_progress)
         self.load_thread.finished.connect(self.load_finished)
         self.load_thread.start()
