@@ -643,12 +643,101 @@ TIMESTAMP_PAT = re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\
 MASTER_NUM_PAT = re.compile(r'-?\d+\.?\d*(?:[eE][+-]?\d+)?')
 
 # ========== 配置文件驱动 ==========
+# 内置默认配置：内容需与 configs/data_formats.json 保持一致。
+# 编进源码后即随 exe 一起编译，外部配置文件缺失或无法读取时回退到这里，
+# 保证 exe 单独拷贝到其他电脑也能解析日志。
+DEFAULT_CONFIG_JSON = r"""
+{
+  "slave": {
+    "detect": { "prefix": ",", "counts": [142, 92] },
+    "array_vars": [
+      {"name": "tar_pos", "count": 13},
+      {"name": "cur_pos", "count": 13},
+      {"name": "tar_toq", "count": 13},
+      {"name": "cur_toq", "count": 13},
+      {"name": "status_word", "count": 13},
+      {"name": "control_word", "count": 13},
+      {"name": "error_code", "count": 13},
+      {"name": "encoder1", "count": 13},
+      {"name": "encoder2", "count": 13},
+      {"name": "mode", "count": 13}
+    ],
+    "flat_vars": [
+      {"name": "pa", "count": 6},
+      {"name": "ff_PDO", "count": 5},
+      {"name": "motion_cmd", "count": 1}
+    ],
+    "simple": { "array_start": 5, "array_end": 13 }
+  },
+  "boom": {
+    "detect": { "prefix": ",", "counts": [36] },
+    "array_vars": [
+      {"name": "tar_pos", "count": 4},
+      {"name": "cur_pos", "count": 4},
+      {"name": "tar_toq", "count": 4},
+      {"name": "cur_toq", "count": 4},
+      {"name": "status_word", "count": 4},
+      {"name": "control_word", "count": 4},
+      {"name": "error_code", "count": 4},
+      {"name": "encoder1", "count": 4},
+      {"name": "encoder2", "count": 4}
+    ]
+  },
+  "master": {
+    "detect": { "prefix": null },
+    "fields": [
+      {"name": "cur_q", "count": 8, "has_label": true},
+      {"name": "cur_qabs", "count": 8, "has_label": true},
+      {"name": "tar_q", "count": 8, "has_label": true},
+      {"name": "pdo6064", "count": 8, "has_label": true},
+      {"name": "pdo20a0", "count": 8, "has_label": true},
+      {"name": "cur_toq", "count": 8, "has_label": true},
+      {"name": "tar_toq", "count": 8, "has_label": true},
+      {"name": "gravityTau", "count": 7, "has_label": true},
+      {"name": "feedbackTau", "count": 7, "has_label": true},
+      {"name": "cur_endpos", "count": 12, "has_label": true},
+      {"name": "clipratio", "count": 1, "has_label": true},
+      {"name": "hall", "count": 1, "has_label": true},
+      {"name": "io_finger_clutch", "count": 1, "has_label": true},
+      {"name": "control_word", "count": 8, "has_label": true},
+      {"name": "status_word", "count": 8, "has_label": true},
+      {"name": "error_code", "count": 8, "has_label": true},
+      {"name": "mode_of_operation", "count": 8, "has_label": true},
+      {"name": "motion_cmd", "count": 1, "has_label": true},
+      {"name": "view_angle", "count": 1, "has_label": true}
+    ]
+  },
+  "lout": {
+    "detect_regex": "\\[ADS\\]"
+  },
+  "online_paths": {
+    "从手": [
+      {"prefix": "arm1", "path": "/data/log/rt/mmsArm1/mmsArm1"},
+      {"prefix": "arm2", "path": "/data/log/rt/mmsArm2/mmsArm2"},
+      {"prefix": "arm3", "path": "/data/log/rt/mmsArm3/mmsArm3"},
+      {"prefix": "arm4", "path": "/data/log/rt/mmsArm4/mmsArm4"},
+      {"prefix": "boom", "path": "/data/log/rt/mmsBoom/mmsBoom"}
+    ],
+    "主手": [
+      {"prefix": "left", "path": "/data/log/rt/LeftDataModel/LeftDataModel"},
+      {"prefix": "right", "path": "/data/log/rt/RightDataModel/RightDataModel"}
+    ],
+    "ADS": [
+      {"prefix": "ADS", "path": "/data/log/rt/LOUT/LOUT"}
+    ]
+  }
+}
+"""
+
+
 class FormatConfig:
     """从 JSON 配置加载数据格式定义，动态生成列名和解析规则。"""
 
-    def __init__(self, config_path):
-        with open(config_path, 'r', encoding='utf-8') as f:
-            self._raw = json.load(f)
+    def __init__(self, config_path=None, raw=None):
+        if raw is None:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+        self._raw = raw
         self._cols_cache = {}
         self._simple_to_full = None
         
@@ -833,36 +922,88 @@ def parse_timestamp(line: str):
         return m.group(1), line[m.end():]
     return None, line
 
-def get_config_path():
-    """定位数据格式配置文件，按优先级返回第一个存在的路径：
-    1) exe/脚本同级 configs  —— 便于用户现场覆盖配置
-    2) 打包内置资源(_MEIPASS)/configs —— 保证 exe 单独拷贝到其他电脑也能用
+def resolve_config():
+    """定位数据格式配置，返回 (路径, 来源说明)。按优先级：
+    1) exe/脚本同级 configs/data_formats.json —— 用户可现场覆盖的配置文件
+    2) 打包内置资源(_MEIPASS)/configs/data_formats.json —— 随 exe 打包的默认配置
+       （单文件 exe 会被解包到 %TEMP%\\_MEIxxxxxx，故路径形如临时目录）
+    两者都不存在时返回首选路径，来源为 None
     """
     if getattr(sys, 'frozen', False):
-        candidates = [os.path.join(os.path.dirname(sys.executable), 'configs', 'data_formats.json')]
+        sibling = os.path.join(os.path.dirname(sys.executable), 'configs', 'data_formats.json')
         meipass = getattr(sys, '_MEIPASS', None)
-        if meipass:
-            candidates.append(os.path.join(meipass, 'configs', 'data_formats.json'))
+        bundled = os.path.join(meipass, 'configs', 'data_formats.json') if meipass else None
     else:
-        candidates = [os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs', 'data_formats.json')]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    return candidates[0]  # 均不存在时返回首选路径，便于日志提示
+        sibling = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs', 'data_formats.json')
+        bundled = None
+
+    if os.path.exists(sibling):
+        return sibling, f"程序同级配置文件：{sibling}"
+    if bundled and os.path.exists(bundled):
+        return bundled, f"打包内置配置（exe 内解包到临时目录）：{bundled}"
+    return sibling, None
 
 
-# 加载配置文件（可能位于 exe 同级目录，或打包内置的 configs 资源中）
-_CONFIG_PATH = get_config_path()
+def describe_config(cfg, source):
+    """汇总当前生效的配置内容，逐行写入日志，便于确认“到底用了哪份配置”"""
+    raw = cfg._raw
+    lines = [f"配置来源: {source}"]
+    parts = []
+    for name in ('slave', 'boom', 'master'):
+        if name not in raw:
+            continue
+        try:
+            cnt = len(cfg.get_columns(name))
+        except Exception:
+            cnt = -1
+        if name == 'slave' and 'simple' in raw[name]:
+            try:
+                parts.append(f"slave={cnt}列(简表{len(cfg.get_columns('slave', 'simple'))}列)")
+                continue
+            except Exception:
+                pass
+        parts.append(f"{name}={cnt}列")
+    if 'lout' in raw:
+        parts.append(f"lout(ADS正则={raw['lout'].get('detect_regex', '')})")
+    lines.append("日志格式: " + (", ".join(parts) if parts else "无"))
+
+    devices = []
+    for dt in cfg.get_online_device_types():
+        try:
+            prefixes = [p for p, _ in cfg.get_online_paths(dt)]
+        except Exception:
+            prefixes = []
+        devices.append(f"{dt}[{','.join(prefixes)}]")
+    lines.append("在线设备: " + ("; ".join(devices) if devices else "无"))
+    return lines
+
+
+# 加载配置文件：优先外部 configs/data_formats.json（便于现场覆盖），
+# 文件缺失或读取失败时回退到编进 exe 的内置默认配置（DEFAULT_CONFIG_JSON）
+_CONFIG_PATH, _config_source = resolve_config()
 config = None
-try:
-    if os.path.exists(_CONFIG_PATH):
+if _config_source is not None:
+    try:
         config = FormatConfig(_CONFIG_PATH)
         log(f"配置文件加载成功: {_CONFIG_PATH}")
-    else:
-        log(f"警告：配置文件未找到，路径 {_CONFIG_PATH}（将无法解析日志格式）")
-except Exception as _cfg_err:
-    # 配置损坏不应导致程序无法启动
-    log(f"警告：配置文件解析失败（{_CONFIG_PATH}）：{_cfg_err}")
+    except Exception as _cfg_err:
+        # 配置损坏/被加密等不应导致程序无法启动
+        log(f"警告：配置文件解析失败（{_CONFIG_PATH}）：{_cfg_err}，改用源码内嵌的默认配置")
+        _config_source = None
+else:
+    log(f"未找到配置文件（{_CONFIG_PATH}），改用源码内嵌的默认配置")
+if config is None:
+    try:
+        config = FormatConfig(raw=json.loads(DEFAULT_CONFIG_JSON))
+        _config_source = "源码内嵌默认配置"
+        log("已加载源码内嵌的默认配置")
+    except Exception as _cfg_err:
+        _config_source = None
+        log(f"错误：源码内嵌默认配置解析失败：{_cfg_err}\n{traceback.format_exc()}")
+# 把实际生效的配置内容写进日志，排查问题时可直接对照
+if config is not None:
+    for _line in describe_config(config, _config_source):
+        log(_line)
 
 def parse_slave_line_fast(data_part: str):
     return config.parse_values('slave', data_part) if config else (None, None)
@@ -4135,8 +4276,8 @@ class MainWindow(QMainWindow):
                 if config is None:
                     QMessageBox.warning(
                         self, "警告",
-                        "未找到数据格式配置文件 configs/data_formats.json，无法解析日志。\n\n"
-                        "请将 configs 文件夹与程序放在同一目录后重试。")
+                        "数据格式配置不可用（外部 configs/data_formats.json 与内置默认配置均无法加载），"
+                        "无法解析日志。")
                 else:
                     QMessageBox.warning(self, "警告", "未找到有效日志数据")
                 self.info_label.setText("未加载数据")
