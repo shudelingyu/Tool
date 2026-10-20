@@ -434,11 +434,27 @@ def qt_alive(obj):
         return True  # 无法判断时按有效处理（非 PyQt 对象）
 
 
+ICON_FILENAME = 'logAnalysis.ico'   # 程序图标（exe 图标与运行时窗口/任务栏图标共用同一文件）
+
+
 def get_app_base_dir():
     """返回程序基准目录：打包后为 exe 所在目录，开发环境为脚本所在目录"""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_icon_path():
+    """定位程序图标 logAnalysis.ico：exe/脚本同级优先，其次打包内置资源(_MEIPASS)"""
+    name = ICON_FILENAME
+    candidates = [os.path.join(get_app_base_dir(), name)]
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        candidates.append(os.path.join(meipass, name))
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def _open_log_file():
@@ -4416,6 +4432,15 @@ def main():
     font.setStyleStrategy(QFont.PreferAntialias)
     app.setFont(font)
     app.setStyleSheet(MODERN_QSS)
+    # 窗口/任务栏图标：与 exe 图标同一份 logAnalysis.ico
+    try:
+        _icon = get_icon_path()
+        if _icon:
+            app.setWindowIcon(QIcon(_icon))
+        else:
+            log("警告：未找到图标文件 logAnalysis.ico，使用系统默认图标")
+    except Exception as _e:
+        log(f"警告：设置窗口图标失败：{_e}")
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
