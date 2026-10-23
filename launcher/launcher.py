@@ -23,11 +23,13 @@ class ProgramLauncher:
         self.root.minsize(950, 650)
 
         self.script_dir = get_script_dir()
+        # log_file 与 init_log_window 必须先初始化：
+        # load_config() 在文件缺失/解析失败时会调用 add_log() 访问它们
+        self.log_file = os.path.join(self.script_dir, 'launcher.log')
+        self.init_log_window = None
         self.programs = self.load_config()
         self.running_processes = {}
-        self.log_file = os.path.join(self.script_dir, 'launcher.log')
         self._icon_images = []
-        self.init_log_window = None
 
         self.setup_ui()
         # 异步检查缺失工具，不阻塞启动
@@ -35,18 +37,18 @@ class ProgramLauncher:
         self.add_log("INFO", "工具箱已启动")
 
     def load_config(self):
-        default_config = [
-            {"name": "Xml管理工具", "path": "tool/XmlTool.exe", "desc": "批量处理xml参数", "icon": "📄"}
-        ]
+        """读取 programs.json；文件不存在时从空列表开始（首次添加工具会自动创建）"""
+        config_path = os.path.join(self.script_dir, 'programs.json')
+        if not os.path.exists(config_path):
+            self.add_log("INFO", "未找到 programs.json，从空列表开始")
+            return []
         try:
-            config_path = os.path.join(self.script_dir, 'programs.json')
-            if os.path.exists(config_path):
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
         except Exception as e:
             self.add_log("ERROR", f"配置文件读取失败: {e}")
             messagebox.showerror("配置错误", f"配置文件失败: {e}")
-        return default_config
+            return []
 
     def setup_ui(self):
         self.main_container = ctk.CTkFrame(self.root, fg_color="transparent")
@@ -76,6 +78,12 @@ class ProgramLauncher:
                                 text_color="#1f2937", hover_color="#e5e7eb",
                                 anchor="w", command=cmd)
             btn.pack(fill="x", padx=20, pady=5)
+
+        # 添加工具：主按钮样式，与上面的导航项区分
+        ctk.CTkButton(self.sidebar, text="➕ 添加工具",
+                      fg_color="#4f46e5", hover_color="#6366f1",
+                      font=("Microsoft YaHei", 11, "bold"),
+                      command=self.open_add_tool_dialog).pack(fill="x", padx=20, pady=(4, 0))
 
         ctk.CTkLabel(self.sidebar, text="Made with TC❤️", font=("Microsoft YaHei", 8),
                      text_color="#9ca3af").pack(side="bottom", pady=20)
@@ -117,6 +125,13 @@ class ProgramLauncher:
         # 清空容器
         for widget in self.tools_container.winfo_children():
             widget.destroy()
+
+        if not self.programs:
+            ctk.CTkLabel(self.tools_container,
+                         text="还没有添加任何工具\n点击左侧「➕ 添加工具」开始添加",
+                         font=("Microsoft YaHei", 13), text_color="#6b7280",
+                         justify="center").pack(pady=60)
+            return
 
         filtered = self.programs.copy()
         if search_text:
@@ -294,6 +309,39 @@ class ProgramLauncher:
         self.show_notification("刷新完成", "info")
         self.add_log("INFO", "刷新列表")
 
+    def open_add_tool_dialog(self):
+        AddToolDialog(self.root, self)
+
+    def add_tool(self, prog):
+        """把新工具追加到 programs.json 并刷新列表。同路径已存在时提示并返回 False。"""
+        new_abs = os.path.normcase(os.path.abspath(os.path.join(self.script_dir, prog['path'])))
+        for p in self.programs:
+            old_abs = os.path.normcase(os.path.abspath(os.path.join(self.script_dir, p['path'])))
+            if old_abs == new_abs:
+                messagebox.showwarning("提示", f"该程序已添加：{p['name']}", parent=self.root)
+                return False
+
+        programs = self.programs + [prog]
+        try:
+            self.save_config(programs)
+        except Exception as e:
+            self.add_log("ERROR", f"保存配置失败: {e}")
+            messagebox.showerror("错误", f"写入配置文件失败:\n{e}", parent=self.root)
+            return False
+
+        self.programs = programs
+        self.stats_label.configure(text=f"📦 {len(self.programs)} 个工具")
+        self.load_tools(self.search_var.get())
+        self.show_notification(f"已添加 {prog['name']}", "info")
+        self.add_log("INFO", f"添加工具 {prog['name']} ({prog['path']})")
+        return True
+
+    def save_config(self, programs):
+        """整体重写 programs.json（保持原有字段与缩进格式）"""
+        config_path = os.path.join(self.script_dir, 'programs.json')
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(programs, f, ensure_ascii=False, indent=2)
+
     def run_program(self, prog):
         exe_path = os.path.join(self.script_dir, prog['path'])
         try:
@@ -307,6 +355,106 @@ class ProgramLauncher:
         except Exception as e:
             self.add_log("ERROR", f"启动失败 {prog['name']}: {e}")
             messagebox.showerror("错误", f"启动失败:\n{e}")
+
+class AddToolDialog(ctk.CTkToplevel):
+    """添加工具对话框：选择程序路径、填写名称/描述/图标，保存后写入 programs.json"""
+
+    def __init__(self, parent, launcher):
+        super().__init__(parent)
+        self.launcher = launcher
+        self.title("添加工具")
+        self.geometry("560x430")
+        self.resizable(False, False)
+        self.transient(parent)
+        # 等窗口真正映射后再抓取焦点，否则在部分环境下 grab_set 会失败
+        self.after(80, self.grab_set)
+
+        wrap = ctk.CTkFrame(self, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=20, pady=(18, 12))
+
+        # 程序路径
+        ctk.CTkLabel(wrap, text="程序路径", anchor="w",
+                     font=("Microsoft YaHei", 11, "bold")).pack(fill="x")
+        path_row = ctk.CTkFrame(wrap, fg_color="transparent")
+        path_row.pack(fill="x", pady=(4, 12))
+        self.path_var = ctk.StringVar()
+        ctk.CTkEntry(path_row, textvariable=self.path_var,
+                     placeholder_text="选择 .exe 或脚本文件").pack(
+            side="left", fill="x", expand=True)
+        ctk.CTkButton(path_row, text="浏览...", width=80,
+                      command=self.browse).pack(side="left", padx=(8, 0))
+
+        # 名称
+        ctk.CTkLabel(wrap, text="工具名称", anchor="w",
+                     font=("Microsoft YaHei", 11, "bold")).pack(fill="x")
+        self.name_var = ctk.StringVar()
+        ctk.CTkEntry(wrap, textvariable=self.name_var,
+                     placeholder_text="留空则使用文件名").pack(fill="x", pady=(4, 12))
+
+        # 描述
+        ctk.CTkLabel(wrap, text="工具描述", anchor="w",
+                     font=("Microsoft YaHei", 11, "bold")).pack(fill="x")
+        self.desc_box = ctk.CTkTextbox(wrap, height=96, wrap="word")
+        self.desc_box.pack(fill="x", pady=(4, 12))
+
+        # 图标
+        ctk.CTkLabel(wrap, text="图标（emoji，可留空）", anchor="w",
+                     font=("Microsoft YaHei", 11, "bold")).pack(fill="x")
+        self.icon_var = ctk.StringVar(value="🔧")
+        ctk.CTkEntry(wrap, textvariable=self.icon_var, width=80).pack(
+            anchor="w", pady=(4, 0))
+
+        # 底部按钮
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 16))
+        ctk.CTkButton(btn_row, text="取消", width=90, fg_color="#9ca3af",
+                      hover_color="#6b7280", command=self.destroy).pack(side="right")
+        ctk.CTkButton(btn_row, text="保存", width=90, fg_color="#4f46e5",
+                      hover_color="#6366f1", command=self.save).pack(
+            side="right", padx=(0, 10))
+
+    def browse(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="选择程序",
+            filetypes=[("可执行文件", "*.exe"),
+                       ("Python 脚本", "*.py *.pyw"),
+                       ("所有文件", "*.*")])
+        if not path:
+            return
+        self.path_var.set(os.path.normpath(path))
+        # 名称尚未填写时，用文件名自动填充
+        if not self.name_var.get().strip():
+            self.name_var.set(os.path.splitext(os.path.basename(path))[0])
+
+    def _normalize_path(self, path):
+        """位于工具箱目录内则存相对路径（便于整体迁移），否则存绝对路径。"""
+        abs_path = os.path.abspath(path)
+        try:
+            rel = os.path.relpath(abs_path, os.path.abspath(self.launcher.script_dir))
+        except ValueError:  # 跨盘符无法计算相对路径
+            rel = None
+        stored = rel if (rel is not None and not rel.startswith('..')) else abs_path
+        return stored.replace('\\', '/')
+
+    def save(self):
+        path = self.path_var.get().strip().strip('"')
+        if not path:
+            messagebox.showwarning("提示", "请先选择程序路径", parent=self)
+            return
+        if not os.path.exists(path):
+            messagebox.showerror("错误", f"路径不存在：\n{path}", parent=self)
+            return
+
+        name = self.name_var.get().strip() or os.path.splitext(os.path.basename(path))[0]
+        prog = {
+            "name": name,
+            "path": self._normalize_path(path),
+            "desc": self.desc_box.get("1.0", "end").strip(),
+            "icon": self.icon_var.get().strip() or "🔧",
+        }
+        if self.launcher.add_tool(prog):
+            self.destroy()
+
 
 if __name__ == "__main__":
     root = ctk.CTk()
