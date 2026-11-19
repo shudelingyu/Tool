@@ -23,9 +23,10 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView,
     QPlainTextEdit, QFileDialog, QMessageBox,
+    QStackedWidget, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QFont, QPalette, QColor
+from PyQt5.QtGui import QFont, QPalette, QColor, QIcon
 
 
 # ==================== 配色方案 ====================
@@ -34,15 +35,20 @@ C = {
     "indigo_dk": "#3730A3",
     "indigo_lt": "#818CF8",
     "indigo_md": "#6366F1",
+    "indigo_soft": "#EEF2FF",
     "slate":     "#1E293B",
     "slate_md":  "#475569",
     "slate_lt":  "#94A3B8",
     "bg":        "#F1F5F9",
     "card":      "#FFFFFF",
     "green":     "#10B981",
+    "green_dk":  "#059669",
     "red":       "#EF4444",
+    "red_dk":    "#DC2626",
     "amber":     "#F59E0B",
     "border":    "#E2E8F0",
+    "border_strong": "#CBD5E1",
+    "console":   "#0B1220",
 }
 
 # 摆位按钮配色
@@ -87,6 +93,12 @@ def _slot_cmd(arm_id: int, cmd: str) -> str:
     return "{" + "||".join(parts) + "}"
 
 # ==================== 自动摆位命令配置 ====================
+
+def _resource_path(name: str) -> str:
+    """资源路径：源码运行时取脚本目录，PyInstaller 打包后取解包目录"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
+
 
 # 从 Positioning 文件读取四臂的摆位数据
 def _load_positioning(path: str = None) -> Dict[int, List[float]]:
@@ -182,112 +194,195 @@ def _build_master_exec_cmd(angles: List[float], hand: int = 0) -> str:
 
 # ==================== 全局样式表 ====================
 STYLESHEET = f"""
+/* ── 全局 ── */
 QWidget {{
-    font-family: "Microsoft YaHei", "Segoe UI", "PingFang SC", sans-serif;
-    font-size: 9pt;
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 9.5pt;
     color: {C['slate']};
+}}
+QToolTip {{
+    background: {C['slate']}; color: #F8FAFC;
+    border: none; padding: 6px 8px; font-size: 8.5pt;
 }}
 
 /* ── 标题栏 ── */
 #headerBar {{
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 {C['indigo']}, stop:1 {C['indigo_dk']});
-    min-height: 60px; max-height: 60px; border: none;
+        stop:0 {C['indigo']}, stop:0.55 {C['indigo_md']}, stop:1 {C['indigo_dk']});
+    min-height: 64px; max-height: 64px; border: none;
 }}
+#brandTitle {{
+    color: #FFFFFF; font-size: 14pt; font-weight: 600; letter-spacing: 1px;
+}}
+#brandChip {{
+    background: rgba(255, 255, 255, 0.12); color: #DDD6FE;
+    border-radius: 7px; padding: 2px 9px;
+    font-size: 7.5pt; font-weight: 600; letter-spacing: 1px;
+}}
+#brandLogo {{
+    background: #FFFFFF; border-radius: 9px;
+}}
+#headerMeta {{ color: #C7D2FE; font-size: 8.5pt; }}
 
-/* ── 卡片容器 ── */
+/* ── 卡片 ── */
 Card {{
     background: {C['card']};
     border: 1px solid {C['border']};
-    border-radius: 10px;
+    border-radius: 12px;
 }}
-
+#cardAccent {{
+    background: {C['indigo']}; border-radius: 2px;
+    min-width: 4px; max-width: 4px; min-height: 15px; max-height: 15px;
+}}
 #cardTitle {{
-    font-size: 11pt; font-weight: bold; color: {C['slate']};
-    padding: 0; margin: 0;
+    font-size: 10.5pt; font-weight: 600; color: {C['slate']};
 }}
+#fieldLabel {{ color: #64748B; font-size: 8.5pt; }}
+#hintLabel {{ color: {C['slate_lt']}; font-size: 8pt; }}
 
 /* ── 输入框 ── */
 QLineEdit {{
-    border: 1.5px solid {C['border']};
-    border-radius: 6px; padding: 6px 10px;
+    border: 1.5px solid {C['border_strong']};
+    border-radius: 8px;
+    padding: 0 10px;
+    min-height: 30px; max-height: 30px;
     background: {C['card']}; color: {C['slate']};
     selection-background-color: {C['indigo_lt']};
-    font-size: 9pt;
+    font-size: 9.5pt;
 }}
-QLineEdit:focus {{
-    border-color: {C['indigo']};
-}}
+QLineEdit:hover {{ border-color: {C['slate_lt']}; }}
+QLineEdit:focus {{ border: 1.5px solid {C['indigo']}; background: #FFFFFF; }}
 
 /* ── 按钮通用 ── */
 QPushButton {{
-    border: none; border-radius: 6px;
-    padding: 7px 18px; font-weight: bold; font-size: 9pt;
+    border: none; border-radius: 8px;
+    padding: 0 16px;
+    font-weight: 600; font-size: 9pt;
 }}
-QPushButton::disabled {{
-    background: #CBD5E1 !important;
-    color: #94A3B8 !important;
-}}
+QPushButton:disabled {{ background: #E2E8F0; color: {C['slate_lt']}; }}
 
-/* ── 连接按钮 ── */
-#connectBtn {{
-    background: {C['indigo']}; color: white; padding: 7px 28px;
-    border-radius: 8px; font-size: 10pt;
-}}
-#connectBtn:hover {{ background: {C['indigo_dk']}; }}
-#connectBtn:pressed {{ background: {C['indigo_dk']}; }}
+#primaryBtn {{ background: {C['indigo']}; color: #FFFFFF; padding: 0 22px; min-height: 32px; }}
+#primaryBtn:hover {{ background: {C['indigo_dk']}; }}
+#primaryBtn:pressed {{ background: #312E81; }}
+#primaryBtn:disabled {{ background: #C7D2FE; color: #EEF2FF; }}
 
-/* ── 加载文件按钮 ── */
-#loadBtn {{
-    background: {C['slate_md']}; color: white; border-radius: 6px;
+#secondaryBtn {{
+    background: {C['card']}; color: {C['slate_md']};
+    border: 1px solid {C['border_strong']}; padding: 0 16px; min-height: 32px;
 }}
-#loadBtn:hover {{ background: {C['slate']}; }}
+#secondaryBtn:hover {{ background: #F8FAFC; border-color: {C['slate_lt']}; color: {C['slate']}; }}
+#secondaryBtn:pressed {{ background: #F1F5F9; }}
+#secondaryBtn:disabled {{ background: #F8FAFC; color: {C['slate_lt']}; border-color: {C['border']}; }}
 
-/* ── 执行按钮 ── */
-#execBtn {{
-    background: {C['green']}; color: white; padding: 9px 30px;
-    border-radius: 8px; font-size: 10pt;
+#ghostBtn {{
+    background: transparent; color: {C['slate_md']};
+    border: none; padding: 0 10px; font-size: 8.5pt; font-weight: 500;
+    min-height: 24px; max-height: 24px;
 }}
-#execBtn:hover {{ background: #059669; }}
+#ghostBtn:hover {{ background: #F1F5F9; color: {C['slate']}; }}
+#ghostBtn:disabled {{ background: transparent; color: {C['slate_lt']}; }}
+
+#dangerBtn {{ background: {C['red']}; color: #FFFFFF; padding: 0 24px; min-height: 34px; }}
+#dangerBtn:hover {{ background: {C['red_dk']}; }}
+#dangerBtn:pressed {{ background: #B91C1C; }}
+#dangerBtn:disabled {{ background: #FECACA; color: #FEF2F2; }}
+
+#execBtn {{ background: {C['green']}; color: #FFFFFF; padding: 0 26px; min-height: 34px; }}
+#execBtn:hover {{ background: {C['green_dk']}; }}
 #execBtn:pressed {{ background: #047857; }}
+#execBtn:disabled {{ background: #D1FAE5; color: #ECFDF5; }}
 
-/* ── 状态灯 ── */
-#statusLight {{
-    border-radius: 7px;
-    min-width: 14px; max-width: 14px;
-    min-height: 14px; max-height: 14px;
+/* ── 分段选择（模式 / 执行目标） ── */
+#segBtn {{
+    background: {C['card']}; color: {C['slate_md']};
+    border: 1px solid {C['border_strong']}; border-radius: 7px;
+    min-height: 26px; max-height: 26px; padding: 0 12px;
+    font-size: 8.5pt; font-weight: 500;
 }}
+#segBtn:hover {{ background: #F8FAFC; border-color: {C['slate_lt']}; }}
+#segBtn:checked {{
+    background: {C['indigo']}; color: #FFFFFF; border-color: {C['indigo']};
+    font-weight: 600;
+}}
+#segBtn:checked:hover {{ background: {C['indigo_dk']}; border-color: {C['indigo_dk']}; }}
+#segBtn:disabled {{ background: #F8FAFC; color: {C['slate_lt']}; border-color: {C['border']}; }}
+
+/* ── 状态胶囊 ── */
+#statusPill {{ background: #F1F5F9; border-radius: 13px; min-height: 26px; max-height: 26px; }}
+#statusPill[state="ok"] {{ background: #ECFDF5; }}
+#statusPill[state="warn"] {{ background: #FFFBEB; }}
+#statusPill[state="err"] {{ background: #FEF2F2; }}
+#statusDot {{
+    border-radius: 4px; background: {C['slate_lt']};
+    min-width: 8px; max-width: 8px; min-height: 8px; max-height: 8px;
+}}
+#statusPill[state="warn"] #statusDot {{ background: {C['amber']}; }}
+#statusPill[state="ok"] #statusDot {{ background: {C['green']}; }}
+#statusPill[state="err"] #statusDot {{ background: {C['red']}; }}
+#statusLabel {{ font-size: 8.5pt; color: #64748B; background: transparent; }}
+#statusPill[state="warn"] #statusLabel {{ color: #B45309; font-weight: 600; }}
+#statusPill[state="ok"] #statusLabel {{ color: #047857; font-weight: 600; }}
+#statusPill[state="err"] #statusLabel {{ color: #B91C1C; font-weight: 600; }}
+
+/* ── 摆位按钮内文字 ── */
+#posIcon {{ color: #FFFFFF; font-size: 20px; background: transparent; }}
+#posText {{ color: #FFFFFF; font-size: 11pt; font-weight: 600; background: transparent; }}
+#posHint {{ color: rgba(255, 255, 255, 0.75); font-size: 8pt; background: transparent; }}
 
 /* ── 表格 ── */
 QTableWidget {{
-    border: 1px solid {C['border']};
-    border-radius: 6px; gridline-color: {C['border']};
+    border: 1px solid {C['border']}; border-radius: 8px;
     background: {C['card']};
-    selection-background-color: #EEF2FF;
+    alternate-background-color: #FAFBFC;
+    gridline-color: transparent;
+    selection-background-color: {C['indigo_soft']};
     selection-color: {C['slate']};
     font-size: 9pt;
+    outline: none;
 }}
-QTableWidget::item {{
-    padding: 6px 10px; border-bottom: 1px solid {C['border']};
-}}
-QTableWidget::item:selected {{
-    background: {C['green']}; color: white;
-    font-weight: bold;
-}}
+QTableWidget::item {{ padding: 4px 10px; border: none; }}
+QTableWidget::item:selected {{ background: {C['indigo_soft']}; color: {C['indigo_dk']}; }}
 QHeaderView::section {{
-    background: #F8FAFC; color: {C['slate_md']};
-    font-weight: bold; font-size: 9pt;
-    border: none; border-bottom: 2px solid {C['indigo_lt']};
-    padding: 8px 10px;
+    background: #F8FAFC; color: #64748B;
+    font-weight: 600; font-size: 8.5pt;
+    border: none; border-bottom: 1px solid {C['border']};
+    padding: 6px 10px;
+}}
+QTableCornerButton::section {{ background: #F8FAFC; border: none; }}
+
+/* ── 计数徽标 ── */
+#countBadge {{
+    background: #F1F5F9; color: {C['slate_md']};
+    border-radius: 10px; padding: 3px 10px; font-size: 8.5pt;
 }}
 
-/* ── 日志区域 ── */
+/* ── 空状态 ── */
+#emptyState {{ background: #FAFBFC; border: 1px dashed {C['border_strong']}; border-radius: 8px; }}
+#emptyTitle {{ color: {C['slate_md']}; font-size: 9.5pt; font-weight: 600; }}
+#emptyHint {{ color: {C['slate_lt']}; font-size: 8.5pt; }}
+
+/* ── 日志控制台 ── */
 #logEdit {{
-    background: #FFFFFF; color: #1E293B;
+    background: {C['console']}; color: #E2E8F0;
     font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
-    font-size: 9pt; border: 1px solid {C['border']}; border-radius: 6px;
-    padding: 6px; selection-background-color: {C['indigo_lt']};
+    font-size: 9pt;
+    border: none; border-radius: 8px;
+    padding: 8px 10px;
+    selection-background-color: {C['indigo_md']};
 }}
+#logEdit QScrollBar::handle:vertical {{ background: #334155; }}
+#logEdit QScrollBar::handle:vertical:hover {{ background: #475569; }}
+
+/* ── 滚动条 ── */
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
+QScrollBar::handle:vertical {{ background: #CBD5E1; border-radius: 4px; min-height: 28px; }}
+QScrollBar::handle:vertical:hover {{ background: {C['slate_lt']}; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
+QScrollBar::handle:horizontal {{ background: #CBD5E1; border-radius: 4px; min-width: 28px; }}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: transparent; }}
 """
 
 
@@ -312,33 +407,44 @@ class PosButton(QPushButton):
 
 # ==================== 卡片组件 ====================
 class Card(QFrame):
-    """卡片容器 — 带标题的圆角白色卡片"""
+    """卡片容器 — 标题左侧带强调条，可选右上角操作控件"""
 
-    def __init__(self, title: str = "", parent=None):
+    def __init__(self, title: str = "", parent=None, action: QWidget = None):
         super().__init__(parent)
         self.setObjectName("card")
-        self.setStyleSheet(f"""
-            Card {{ background: {C['card']}; border: 1px solid {C['border']};
-                    border-radius: 10px; }}
-        """)
         self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(16, 14, 16, 14)
-        self._layout.setSpacing(10)
+        self._layout.setContentsMargins(18, 16, 18, 16)
+        self._layout.setSpacing(12)
 
         if title:
+            title_row = QHBoxLayout()
+            title_row.setContentsMargins(0, 0, 0, 0)
+            title_row.setSpacing(8)
+
+            accent = QFrame()
+            accent.setObjectName("cardAccent")
+            accent.setFixedSize(4, 15)
+            title_row.addWidget(accent)
+
             title_lbl = QLabel(title)
             title_lbl.setObjectName("cardTitle")
-            self._layout.addWidget(title_lbl)
+            title_row.addWidget(title_lbl)
+            title_row.addStretch(1)
+
+            if action is not None:
+                title_row.addWidget(action)
+
+            self._layout.addLayout(title_row)
 
         self._content = QVBoxLayout()
-        self._content.setSpacing(8)
-        self._layout.addLayout(self._content)
+        self._content.setSpacing(10)
+        self._layout.addLayout(self._content, 1)
 
     def addLayout(self, layout):
         self._content.addLayout(layout)
 
-    def addWidget(self, widget):
-        self._content.addWidget(widget)
+    def addWidget(self, widget, stretch: int = 0):
+        self._content.addWidget(widget, stretch)
 
 
 # ==================== TCP客户端 ====================
@@ -613,7 +719,7 @@ class AutoKinematicsWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("运动学自动辨识工具")
-        self.resize(1000, 760)
+        self.setWindowIcon(QIcon(_resource_path("app_icon.ico")))
         self._center()
 
         # TCP
@@ -649,8 +755,14 @@ class AutoKinematicsWindow(QWidget):
 
     # ---------- 窗口 ----------
     def _center(self):
-        screen = QApplication.primaryScreen().geometry()
-        self.move((screen.width() - 1000) // 2, (screen.height() - 760) // 2)
+        """按可用屏幕区域自适应尺寸并居中，避免小屏被裁切"""
+        avail = QApplication.primaryScreen().availableGeometry()
+        w = max(900, min(1040, avail.width() - 60))
+        h = max(620, min(820, avail.height() - 80))
+        self.setMinimumSize(min(940, w), min(700, h))
+        self.resize(w, h)
+        self.move(avail.x() + (avail.width() - w) // 2,
+                  avail.y() + (avail.height() - h) // 2)
 
     # ---------- UI构建 ----------
     def _setup_ui(self):
@@ -671,22 +783,34 @@ class AutoKinematicsWindow(QWidget):
         header.setObjectName("headerBar")
         hdr = QHBoxLayout(header)
         hdr.setContentsMargins(24, 0, 24, 0)
+        hdr.setSpacing(12)
 
-        title = QLabel("⚙运动学自动辨识工具")
-        title.setStyleSheet("color: white; font-size: 15pt; font-weight: bold; letter-spacing: 1px;")
+        logo = QLabel()
+        logo.setObjectName("brandLogo")
+        logo.setPixmap(QIcon(_resource_path("app_icon.ico")).pixmap(26, 26))
+        logo.setFixedSize(34, 34)
+        logo.setAlignment(Qt.AlignCenter)
+        hdr.addWidget(logo)
+
+        title = QLabel("运动学自动辨识工具")
+        title.setObjectName("brandTitle")
         hdr.addWidget(title)
+
+        chip = QLabel("KINEMATICS ID")
+        chip.setObjectName("brandChip")
+        hdr.addWidget(chip)
 
         hdr.addStretch()
 
-        subtitle = QLabel(f"Made with TC❤️  |  {datetime.now().strftime('%Y-%m-%d')}")
-        subtitle.setStyleSheet("color: #A5B4FC; font-size: 8pt;")
+        subtitle = QLabel(f"TCP / SSH   ·   {datetime.now().strftime('%Y-%m-%d')}")
+        subtitle.setObjectName("headerMeta")
         hdr.addWidget(subtitle)
 
         root.addWidget(header)
 
         # ========== 主体 ==========
         body = QVBoxLayout()
-        body.setContentsMargins(20, 16, 20, 16)
+        body.setContentsMargins(20, 18, 20, 18)
         body.setSpacing(14)
 
         # ── 连接卡片 ──
@@ -701,13 +825,20 @@ class AutoKinematicsWindow(QWidget):
         body.addLayout(cols, stretch=1)
 
         # ── 日志卡片 ──
-        log_card = Card("📝 运行日志")
-        log_card.setMaximumHeight(180)
+        self.clear_log_btn = QPushButton("清空")
+        self.clear_log_btn.setObjectName("ghostBtn")
+        self.clear_log_btn.setToolTip("清空运行日志")
+        self.clear_log_btn.setCursor(Qt.PointingHandCursor)
+        self.clear_log_btn.setFixedHeight(24)
+        self.clear_log_btn.clicked.connect(lambda: self.log_edit.clear())
+
+        log_card = Card("📝 运行日志", action=self.clear_log_btn)
+        log_card.setMaximumHeight(176)
         self.log_edit = QPlainTextEdit()
         self.log_edit.setObjectName("logEdit")
         self.log_edit.setReadOnly(True)
         self.log_edit.setMaximumBlockCount(1000)
-        log_card.addWidget(self.log_edit)
+        log_card.addWidget(self.log_edit, 1)
         body.addWidget(log_card)
 
         root.addLayout(body)
@@ -719,53 +850,73 @@ class AutoKinematicsWindow(QWidget):
         card = Card("🔗 远程连接")
 
         row = QHBoxLayout()
-        row.setSpacing(2)
+        row.setSpacing(12)
 
         self.ip_edit = QLineEdit("192.168.11.11")
-        self.ip_edit.setFixedWidth(140)
+        self.ip_edit.setFixedWidth(142)
         self.ip_edit.setFont(QFont("Consolas", 9))
-        row.addWidget(self._labeled_widget("主机IP", self.ip_edit))
-        row.addSpacing(2)
+        self.ip_edit.setPlaceholderText("远端 IP")
+        self.ip_edit.setToolTip("远端控制器 IP 地址，回车可直接连接")
+        self.ip_edit.returnPressed.connect(self._do_connect)
+        row.addWidget(self._labeled_widget("主机 IP", self.ip_edit))
 
         self.port_edit = QLineEdit("7866")
-        self.port_edit.setFixedWidth(70)
+        self.port_edit.setFixedWidth(74)
         self.port_edit.setFont(QFont("Consolas", 9))
+        self.port_edit.setPlaceholderText("端口")
+        self.port_edit.setToolTip("TCP 端口，回车可直接连接")
+        self.port_edit.returnPressed.connect(self._do_connect)
         row.addWidget(self._labeled_widget("端口", self.port_edit))
-        row.addSpacing(10)
 
         self.connect_btn = QPushButton("🔗 连接")
-        self.connect_btn.setObjectName("connectBtn")
+        self.connect_btn.setObjectName("primaryBtn")
+        self.connect_btn.setCursor(Qt.PointingHandCursor)
+        self.connect_btn.setToolTip("建立 TCP 与 SSH 连接")
         self.connect_btn.clicked.connect(self._do_connect)
         row.addWidget(self.connect_btn)
-        row.addSpacing(6)
 
-        self.status_light = QFrame()
-        self.status_light.setObjectName("statusLight")
-        self.status_light.setStyleSheet(f"background: #CBD5E1; border-radius: 7px;")
-        row.addWidget(self.status_light)
-        row.addSpacing(4)
+        # ── 连接状态胶囊 ──
+        self.status_pill = QFrame()
+        self.status_pill.setObjectName("statusPill")
+        self.status_pill.setProperty("state", "idle")
+        pill = QHBoxLayout(self.status_pill)
+        pill.setContentsMargins(11, 0, 13, 0)
+        pill.setSpacing(7)
+
+        self.status_dot = QFrame()
+        self.status_dot.setObjectName("statusDot")
+        pill.addWidget(self.status_dot)
 
         self.status_label = QLabel("未连接")
-        self.status_label.setStyleSheet(f"color: {C['slate_lt']}; font-size: 9pt;")
-        row.addWidget(self.status_label)
-        row.addSpacing(16)
-
-        # ── 主手/从手切换 ──
-        row.addWidget(QLabel("模式:"))
-        self.mode_btn_master = QPushButton("主手")
-        self.mode_btn_master.setCheckable(True)
-        self.mode_btn_master.setFixedWidth(60)
-        self.mode_btn_master.clicked.connect(lambda: self._set_mode(0))
-        self.mode_btn_slave = QPushButton("从手")
-        self.mode_btn_slave.setCheckable(True)
-        self.mode_btn_slave.setFixedWidth(60)
-        self.mode_btn_slave.setChecked(True)
-        self.mode_btn_slave.clicked.connect(lambda: self._set_mode(1))
-        self._style_mode_buttons()
-        row.addWidget(self.mode_btn_master)
-        row.addWidget(self.mode_btn_slave)
+        self.status_label.setObjectName("statusLabel")
+        pill.addWidget(self.status_label)
+        row.addWidget(self.status_pill)
 
         row.addStretch()
+
+        # ── 主手/从手切换 ──
+        mode_label = QLabel("模式")
+        mode_label.setObjectName("fieldLabel")
+        row.addWidget(mode_label)
+
+        self.mode_btn_master = QPushButton("主手")
+        self.mode_btn_master.setObjectName("segBtn")
+        self.mode_btn_master.setCheckable(True)
+        self.mode_btn_master.setCursor(Qt.PointingHandCursor)
+        self.mode_btn_master.setToolTip("主手模式：执行 MtmMoveP 指令")
+        self.mode_btn_master.clicked.connect(lambda: self._set_mode(0))
+
+        self.mode_btn_slave = QPushButton("从手")
+        self.mode_btn_slave.setObjectName("segBtn")
+        self.mode_btn_slave.setCheckable(True)
+        self.mode_btn_slave.setCursor(Qt.PointingHandCursor)
+        self.mode_btn_slave.setToolTip("从手模式：执行 MoveAbsolute 指令")
+        self.mode_btn_slave.clicked.connect(lambda: self._set_mode(1))
+        self.mode_btn_slave.setChecked(True)
+        self._style_mode_buttons()
+
+        row.addWidget(self.mode_btn_master)
+        row.addWidget(self.mode_btn_slave)
 
         card.addLayout(row)
 
@@ -777,9 +928,9 @@ class AutoKinematicsWindow(QWidget):
         container = QFrame()
         layout = QHBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
         lbl = QLabel(label)
-        lbl.setStyleSheet(f"color: {C['slate_md']}; font-size: 9pt; white-space: nowrap;")
+        lbl.setObjectName("fieldLabel")
         layout.addWidget(lbl)
         layout.addWidget(widget)
         return container
@@ -794,28 +945,37 @@ class AutoKinematicsWindow(QWidget):
         for i in range(4):
             ac = ARM_COLORS[i]
             btn = PosButton(i + 1)
-            btn.setMinimumSize(0, 90)
+            btn.setMinimumSize(0, 116)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet(self._pos_css(i, enabled=False))
+            btn.setToolTip(f"按住执行从臂{i + 1}自动摆位，松开即释放")
             btn.setEnabled(False)
             btn.press_arm.connect(self._start_auto_position)
             btn.release_arm.connect(self._stop_auto_position)
 
             # 按钮内用垂直布局排列图标+文字
             bl = QVBoxLayout()
-            bl.setContentsMargins(8, 8, 8, 8)
-            bl.setSpacing(2)
+            bl.setContentsMargins(8, 10, 8, 10)
+            bl.setSpacing(3)
             bl.addStretch()
+
             icon = QLabel(ac["icon"])
+            icon.setObjectName("posIcon")
             icon.setAlignment(Qt.AlignCenter)
             icon.setAttribute(Qt.WA_TransparentForMouseEvents)
-            icon.setStyleSheet("font-size: 22px; color: white; background: transparent;")
             bl.addWidget(icon)
-            txt = QLabel(f"从臂{i+1}\n自动摆位")
+
+            txt = QLabel(f"从臂 {i+1}")
+            txt.setObjectName("posText")
             txt.setAlignment(Qt.AlignCenter)
             txt.setAttribute(Qt.WA_TransparentForMouseEvents)
-            txt.setStyleSheet("color: white; font-size: 10pt; font-weight: bold; background: transparent;")
             bl.addWidget(txt)
+
+            hint = QLabel("请先连接")
+            hint.setObjectName("posHint")
+            hint.setAlignment(Qt.AlignCenter)
+            hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+            bl.addWidget(hint)
+
             bl.addStretch()
             btn.setLayout(bl)
 
@@ -823,23 +983,55 @@ class AutoKinematicsWindow(QWidget):
             grid.addWidget(btn, row, col)
             self.pos_btns.append(btn)
 
+        grid.setRowStretch(0, 1)
+        grid.setRowStretch(1, 1)
+
+        # 初始为未连接状态
+        for i in range(4):
+            self._apply_pos_state(i, enabled=False)
+
         card.addLayout(grid)
         return card
 
     def _pos_css(self, idx: int, enabled: bool = True, busy: bool = False) -> str:
         ac = ARM_COLORS[idx]
         if busy:
-            bg, hov = "#94A3B8", "#94A3B8"
+            bg = hov = pr = "#94A3B8"
         elif not enabled:
-            bg, hov = "#CBD5E1", "#CBD5E1"
+            bg = hov = pr = "#E2E8F0"
         else:
-            bg, hov = ac["bg"], ac["hover"]
+            bg, hov, pr = ac["bg"], ac["hover"], ac["hover"]
         return (
-            f"QPushButton {{ background: {bg}; border: none; border-radius: 10px; }}"
+            f"QPushButton {{ background: {bg}; border: none; border-radius: 12px; padding: 0; "
+            f"min-height: 116px; }}"
             f"QPushButton:hover {{ background: {hov}; }}"
-            f"QPushButton:pressed {{ background: {hov}; }}"
-            f"QPushButton::disabled {{ background: #CBD5E1; }}"
+            f"QPushButton:pressed {{ background: {pr}; }}"
+            f"QPushButton:disabled {{ background: #E2E8F0; }}"
         )
+
+    def _apply_pos_state(self, idx: int, enabled: bool, busy: bool = False):
+        """统一下发摆位按钮的外观状态（按钮底色 + 内部文字颜色）"""
+        btn = self.pos_btns[idx]
+        btn.setStyleSheet(self._pos_css(idx, enabled=enabled, busy=busy))
+
+        main_color = "#FFFFFF" if (enabled or busy) else "#94A3B8"
+        if busy:
+            hint_color, hint_text = "#E2E8F0", "正在执行 · 松开停止"
+        elif enabled:
+            hint_color, hint_text = "#E0E7FF", "自动摆位 · 按住"
+        else:
+            hint_color, hint_text = "#94A3B8", "请先连接"
+
+        for child in btn.findChildren(QLabel):
+            name = child.objectName()
+            if name == "posIcon":
+                child.setStyleSheet(f"font-size: 20px; color: {main_color}; background: transparent;")
+            elif name == "posText":
+                child.setStyleSheet(
+                    f"font-size: 11pt; font-weight: 600; color: {main_color}; background: transparent;")
+            elif name == "posHint":
+                child.setText(hint_text)
+                child.setStyleSheet(f"font-size: 8pt; color: {hint_color}; background: transparent;")
 
     # ---------- 路点卡片 ----------
     def _build_waypoint_card(self):
@@ -847,12 +1039,16 @@ class AutoKinematicsWindow(QWidget):
 
         # 文件选择
         file_row = QHBoxLayout()
+        file_row.setSpacing(10)
         self.file_label = QLabel("未选择路点文件")
-        self.file_label.setStyleSheet(f"color: {C['slate_lt']}; font-size: 8pt;")
+        self.file_label.setObjectName("hintLabel")
+        self.file_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         file_row.addWidget(self.file_label, stretch=1)
 
         self.load_btn = QPushButton("📂 加载文件")
-        self.load_btn.setObjectName("loadBtn")
+        self.load_btn.setObjectName("secondaryBtn")
+        self.load_btn.setCursor(Qt.PointingHandCursor)
+        self.load_btn.setToolTip("选择 .txt 轨迹文件并解析路点")
         self.load_btn.clicked.connect(self._load_trajectory_file)
         file_row.addWidget(self.load_btn)
         card.addLayout(file_row)
@@ -861,10 +1057,10 @@ class AutoKinematicsWindow(QWidget):
         self.target_frame = QFrame()
         target_row = QHBoxLayout(self.target_frame)
         target_row.setContentsMargins(0, 0, 0, 0)
-        target_row.setSpacing(4)
+        target_row.setSpacing(8)
 
-        self.target_label = QLabel("执行于:")
-        self.target_label.setStyleSheet(f"color: {C['slate_md']}; font-size: 8pt; font-weight: bold;")
+        self.target_label = QLabel("执行于")
+        self.target_label.setObjectName("fieldLabel")
         target_row.addWidget(self.target_label)
 
         # 从手臂选择按钮
@@ -872,9 +1068,9 @@ class AutoKinematicsWindow(QWidget):
         arm_labels = ["❶ 从臂1", "❷ 从臂2", "❸ 从臂3", "❹ 从臂4"]
         for i in range(4):
             btn = QPushButton(arm_labels[i])
+            btn.setObjectName("segBtn")
             btn.setCheckable(True)
-            btn.setFixedHeight(26)
-            btn.setStyleSheet(self._target_btn_css(selected=(i == 0)))
+            btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _, a=i+1: self._select_arm_target(a))
             target_row.addWidget(btn)
             self.arm_target_btns.append(btn)
@@ -884,9 +1080,9 @@ class AutoKinematicsWindow(QWidget):
         self.hand_target_btns = []
         for i, label in enumerate(["👈 左手", "👉 右手"]):
             btn = QPushButton(label)
+            btn.setObjectName("segBtn")
             btn.setCheckable(True)
-            btn.setFixedHeight(26)
-            btn.setStyleSheet(self._target_btn_css(selected=(i == 0)))
+            btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _, h=i: self._select_hand_target(h))
             target_row.addWidget(btn)
             self.hand_target_btns.append(btn)
@@ -906,38 +1102,78 @@ class AutoKinematicsWindow(QWidget):
         self.table.setHorizontalHeaderLabels(["路点名称", "关节角度"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setFixedHeight(34)
+        self.table.verticalHeader().setDefaultSectionSize(32)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
-        card.addWidget(self.table)
+
+        # 空状态 + 表格切换
+        self.table_stack = QStackedWidget()
+        self.table_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.table_stack.addWidget(self._build_empty_state())
+        self.table_stack.addWidget(self.table)
+        self.table_stack.setCurrentIndex(0)
+        card.addWidget(self.table_stack, 1)
 
         # 底部操作行
         exec_row = QHBoxLayout()
-        self.wp_count_label = QLabel("共 0 个路点")
-        self.wp_count_label.setStyleSheet(f"color: {C['slate_lt']};")
+        exec_row.setSpacing(8)
+        self.wp_count_label = QLabel("0 个路点")
+        self.wp_count_label.setObjectName("countBadge")
         exec_row.addWidget(self.wp_count_label)
         exec_row.addStretch()
 
-        self.exec_btn = QPushButton("▶执行路点")
+        self.exec_btn = QPushButton("▶  执行路点")
         self.exec_btn.setObjectName("execBtn")
+        self.exec_btn.setCursor(Qt.PointingHandCursor)
+        self.exec_btn.setToolTip("向当前选中的执行目标下发所选路点")
         self.exec_btn.setEnabled(False)
         self.exec_btn.clicked.connect(self._execute_waypoint)
         exec_row.addWidget(self.exec_btn)
-        exec_row.addSpacing(6)
 
-        self.stop_btn = QPushButton("🛑急停")
-        self.stop_btn.setStyleSheet(
-            f"background: {C['red']}; color: white; border-radius: 8px; "
-            f"padding: 9px 24px; font-size: 10pt; font-weight: bold;"
-        )
+        self.stop_btn = QPushButton("🛑  急停")
+        self.stop_btn.setObjectName("dangerBtn")
+        self.stop_btn.setCursor(Qt.PointingHandCursor)
+        self.stop_btn.setToolTip("立即停止当前运动")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._emergency_stop)
         exec_row.addWidget(self.stop_btn)
         card.addLayout(exec_row)
 
         return card
+
+    @staticmethod
+    def _build_empty_state() -> QWidget:
+        """路点列表的空状态占位"""
+        empty = QFrame()
+        empty.setObjectName("emptyState")
+
+        layout = QVBoxLayout(empty)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(6)
+        layout.addStretch(1)
+
+        icon = QLabel("📄")
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setStyleSheet("font-size: 26px; background: transparent;")
+        layout.addWidget(icon)
+
+        title = QLabel("尚未加载路点")
+        title.setObjectName("emptyTitle")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        hint = QLabel("点击右上角「加载文件」，选择 .txt 轨迹文件以解析路点")
+        hint.setObjectName("emptyHint")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        layout.addStretch(1)
+        return empty
 
     # ---------- 日志 ----------
     def _log(self, msg: str):
@@ -948,23 +1184,24 @@ class AutoKinematicsWindow(QWidget):
         self.log_edit.appendPlainText(f"[{ts}] {msg}")
 
     # ---------- 目标选择辅助 ----------
-    def _target_btn_css(self, selected: bool = False) -> str:
-        if selected:
-            return f"background: {C['indigo']}; color: white; border: none; border-radius: 4px; padding: 4px 10px; font-size: 8pt;"
-        else:
-            return f"background: {C['card']}; color: {C['slate_md']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 4px 10px; font-size: 8pt;"
+    @staticmethod
+    def _repolish(widget: QWidget):
+        """让动态属性/伪状态对应的 QSS 立即生效"""
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        widget.update()
 
     def _select_arm_target(self, arm_id: int):
         self.selected_arm = arm_id
         for i, btn in enumerate(self.arm_target_btns):
             btn.setChecked(i + 1 == arm_id)
-            btn.setStyleSheet(self._target_btn_css(i + 1 == arm_id))
+            self._repolish(btn)
 
     def _select_hand_target(self, hand: int):
         self.selected_hand = hand
         for i, btn in enumerate(self.hand_target_btns):
             btn.setChecked(i == hand)
-            btn.setStyleSheet(self._target_btn_css(i == hand))
+            self._repolish(btn)
 
     def _refresh_target_visibility(self):
         """根据当前模式显示对应目标选择器"""
@@ -972,7 +1209,7 @@ class AutoKinematicsWindow(QWidget):
             return
         show_arm = (self.mode == 1)
         show_hand = (self.mode == 0)
-        self.target_label.setText("执行于:" if show_arm else "手:")
+        self.target_label.setText("执行于" if show_arm else "执行手")
         for btn in self.arm_target_btns:
             btn.setVisible(show_arm)
         for btn in self.hand_target_btns:
@@ -980,11 +1217,11 @@ class AutoKinematicsWindow(QWidget):
 
     # ---------- 模式切换 ----------
     def _style_mode_buttons(self):
-        """更新模式按钮样式"""
-        active = f"background: {C['indigo']}; color: white; border: 1px solid {C['indigo']}; border-radius: 4px; padding: 4px 10px; font-size: 8pt;"
-        inactive = f"background: {C['card']}; color: {C['slate_md']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 4px 10px; font-size: 8pt;"
-        self.mode_btn_master.setStyleSheet(active if self.mode == 0 else inactive)
-        self.mode_btn_slave.setStyleSheet(active if self.mode == 1 else inactive)
+        """同步模式按钮的选中态（样式由 #segBtn:checked 决定）"""
+        self.mode_btn_master.setChecked(self.mode == 0)
+        self.mode_btn_slave.setChecked(self.mode == 1)
+        for btn in (self.mode_btn_master, self.mode_btn_slave):
+            self._repolish(btn)
 
     def _set_mode(self, mode: int):
         """切换主手/从手模式"""
@@ -1011,7 +1248,7 @@ class AutoKinematicsWindow(QWidget):
     def _update_ui_state(self):
         for i, btn in enumerate(self.pos_btns):
             btn.setEnabled(self.connected)
-            btn.setStyleSheet(self._pos_css(i, enabled=self.connected))
+            self._apply_pos_state(i, self.connected)
         self._update_exec_btn()
 
     def _update_exec_btn(self):
@@ -1060,9 +1297,7 @@ class AutoKinematicsWindow(QWidget):
             self.ssh_slave_connected = False
             self.ssh_master_connected = False
             self.connect_btn.setText("🔗 连接")
-            self.status_light.setStyleSheet(f"background: #CBD5E1; border-radius: 7px;")
-            self.status_label.setText("未连接")
-            self.status_label.setStyleSheet(f"color: {C['slate_lt']};")
+            self._set_connection_state("idle", "未连接")
             self._update_ui_state()
             self._log("已断开连接")
             return
@@ -1080,10 +1315,8 @@ class AutoKinematicsWindow(QWidget):
             return
 
         self.connect_btn.setEnabled(False)
-        self.connect_btn.setText("连接中...")
-        self.status_light.setStyleSheet(f"background: {C['amber']}; border-radius: 7px;")
-        self.status_label.setText("连接中...")
-        self.status_label.setStyleSheet(f"color: {C['amber']};")
+        self.connect_btn.setText("连接中…")
+        self._set_connection_state("warn", "连接中…")
         self._log(f"正在连接 {ip}:{port} ...")
 
         def task():
@@ -1107,9 +1340,7 @@ class AutoKinematicsWindow(QWidget):
         if tcp_ok:
             self.connected = True
             self.connect_btn.setText("🔌 断开")
-            self.status_light.setStyleSheet(f"background: {C['green']}; border-radius: 7px;")
-            self.status_label.setText("已连接")
-            self.status_label.setStyleSheet(f"color: {C['green']}; font-weight: bold;")
+            self._set_connection_state("ok", "已连接")
             self._update_ui_state()
             if self.mode == 1:
                 ssh_text = "SSH从手✓" if ssh_slave_ok else "SSH从手✗"
@@ -1120,11 +1351,16 @@ class AutoKinematicsWindow(QWidget):
         else:
             self.connected = False
             self.connect_btn.setText("🔗 连接")
-            self.status_light.setStyleSheet(f"background: {C['red']}; border-radius: 7px;")
-            self.status_label.setText("TCP失败")
-            self.status_label.setStyleSheet(f"color: {C['red']};")
+            self._set_connection_state("err", "TCP 失败")
             self._update_ui_state()
             self._log("TCP连接失败，SSH也不会可用")
+
+    def _set_connection_state(self, state: str, text: str):
+        """更新连接状态胶囊：state 取 idle / warn / ok / err"""
+        self.status_pill.setProperty("state", state)
+        self.status_label.setText(text)
+        for widget in (self.status_pill, self.status_dot, self.status_label):
+            self._repolish(widget)
 
     # ---------- 连接初始化 ----------
     def _send_connect_init(self):
@@ -1162,10 +1398,9 @@ class AutoKinematicsWindow(QWidget):
     # ---------- 自动摆位（按下/松开） ----------
     def _set_pos_label(self, arm_id: int, text: str, busy: bool = False):
         """更新摆位按钮文字和样式"""
-        btn = self.pos_btns[arm_id - 1]
-        btn.setStyleSheet(self._pos_css(arm_id - 1, enabled=not busy, busy=busy))
-        for child in btn.findChildren(QLabel):
-            if "从臂" in child.text() or "执行" in child.text():
+        self._apply_pos_state(arm_id - 1, enabled=not busy, busy=busy)
+        for child in self.pos_btns[arm_id - 1].findChildren(QLabel):
+            if child.objectName() == "posText":
                 child.setText(text)
 
     def _start_auto_position(self, arm_id: int):
@@ -1179,7 +1414,7 @@ class AutoKinematicsWindow(QWidget):
                 return
             self.pos_running[arm_id] = True
 
-        self._set_pos_label(arm_id, f"从臂{arm_id}\n执行中...", busy=True)
+        self._set_pos_label(arm_id, "执行中…", busy=True)
         self._log(f"从臂{arm_id} 自动摆位 ▼ 按住")
 
         cmds = _build_press_cmds(arm_id)
@@ -1225,7 +1460,7 @@ class AutoKinematicsWindow(QWidget):
         threading.Thread(target=task, daemon=True).start()
 
     def _on_auto_pos_done(self, arm_id: int):
-        self._set_pos_label(arm_id, f"从臂{arm_id}\n自动摆位")
+        self._set_pos_label(arm_id, f"从臂 {arm_id}")
         self._log(f"从臂{arm_id} 自动摆位完成")
 
     # ---------- 路点管理 ----------
@@ -1238,7 +1473,10 @@ class AutoKinematicsWindow(QWidget):
             return
 
         self.file_label.setText(os.path.basename(file_path))
-        self.file_label.setStyleSheet(f"color: {C['slate']}; font-size: 8pt;")
+        self.file_label.setToolTip(file_path)
+        self.file_label.setStyleSheet("")
+        self.file_label.setObjectName("fieldLabel")
+        self._repolish(self.file_label)
         self._log(f"加载路点文件: {file_path}")
 
         def task():
@@ -1284,7 +1522,9 @@ class AutoKinematicsWindow(QWidget):
 
         if not waypoints:
             self._log("警告: 文件中未解析到任何路点")
-            self.wp_count_label.setText("共 0 个路点")
+            self.wp_count_label.setText("0 个路点")
+            self.table_stack.setCurrentIndex(0)
+            self._update_exec_btn()
             return
 
         for name, angles in waypoints:
@@ -1297,7 +1537,8 @@ class AutoKinematicsWindow(QWidget):
             item.setToolTip(angle_str)
             self.table.setItem(row, 1, item)
 
-        self.wp_count_label.setText(f"共 {len(waypoints)} 个路点")
+        self.wp_count_label.setText(f"{len(waypoints)} 个路点")
+        self.table_stack.setCurrentIndex(1)
         self._log(f"成功加载 {len(waypoints)} 个路点")
         self._update_exec_btn()
         if self.table.rowCount() > 0:
@@ -1505,6 +1746,7 @@ if __name__ == "__main__":
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setWindowIcon(QIcon(_resource_path("app_icon.ico")))
     window = AutoKinematicsWindow()
     window.show()
     sys.exit(app.exec_())

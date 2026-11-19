@@ -1,12 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
-
-block_cipher = None
+# 构建：pyinstaller --clean --noconfirm autoKinematicsIdentify.spec
 
 a = Analysis(
     ['autoKinematicsIdentify.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('app_icon.ico', '.')],
     hiddenimports=[
         'PyQt5.sip',
         'PyQt5.QtCore',
@@ -23,19 +22,15 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
     name='AutoKinematics',
@@ -51,5 +46,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,         # 可指定 .ico 图标路径，如 'icon.ico'
+    icon='app_icon.ico',
 )
