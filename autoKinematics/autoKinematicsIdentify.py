@@ -4,7 +4,7 @@
 运动学自动辨识工具 (PyQt5版)
 - SSH远程连接到远端
 - 自动摆位控制（从臂1-4）
-- 读取identifytrajectory路点文件并执行
+- 读取identifytrajectory路点文件（cvt/cst/csv/txt）并执行
 """
 
 import re
@@ -22,11 +22,11 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QLineEdit, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView,
-    QPlainTextEdit, QFileDialog, QMessageBox,
-    QStackedWidget, QSizePolicy,
+    QPlainTextEdit, QFileDialog, QMessageBox, QMenu,
+    QStackedWidget, QSizePolicy, QDoubleSpinBox, QAbstractSpinBox,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QFont, QPalette, QColor, QIcon
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QFont, QPalette, QColor, QIcon, QCursor
 
 
 # ==================== 配色方案 ====================
@@ -79,7 +79,7 @@ SLAVE_EXEC_TEMPLATE = [
     "Mode",
     "UEnable --begin_motion_id=0 --num={num}",
     "URecover",
-    "MoveAbsolute --num={num} --pos={{{wp}}} --vel={{0.05}} --acc={{0.05}} --jerk={{0.1}}",
+    "MoveAbsolute --num={num} --pos={{{wp}}} --vel={{{vel}}} --acc={{{acc}}} --jerk={{{jerk}}}",
     "URecover",
     "UDisable --begin_motion_id=0 --num={num}",
 ]
@@ -173,13 +173,21 @@ def _build_release_cmds() -> List[str]:
     return [all_stop, all_start]
 
 
-def _build_slave_exec_cmds(arm_id: int, angles: List[float]) -> List[str]:
-    """构建从手执行路点的7条指令，angles为关节角度列表"""
+def _build_slave_exec_cmds(arm_id: int, angles: List[float],
+                           vel: float = 0.15, acc: float = 0.30, jerk: float = 0.30) -> List[str]:
+    """构建从手执行路点的7条指令，angles为关节角度列表，vel/acc/jerk为运动参数"""
     num = ARM_CFG[arm_id]["num"]
     angle_str = ",".join(f"{a:.4f}" for a in angles)
+    params = {
+        "num": num,
+        "wp": angle_str,
+        "vel": f"{vel:.2f}",
+        "acc": f"{acc:.2f}",
+        "jerk": f"{jerk:.2f}",
+    }
     cmds = []
     for template in SLAVE_EXEC_TEMPLATE:
-        cmd = template.format(num=num, wp=angle_str)
+        cmd = template.format(**params)
         cmds.append(_slot_cmd(arm_id, cmd))
     return cmds
 
@@ -240,6 +248,57 @@ Card {{
 #fieldLabel {{ color: #64748B; font-size: 8.5pt; }}
 #hintLabel {{ color: {C['slate_lt']}; font-size: 8pt; }}
 
+/* ── 路点拖拽区 ── */
+#dropZone {{
+    background: #F8FAFC;
+    border: 1.5px dashed {C['border_strong']};
+    border-radius: 10px;
+}}
+#dropZone[state="hover"] {{
+    background: {C['indigo_soft']};
+    border: 1.5px dashed {C['indigo']};
+}}
+#dropZone[state="loaded"] {{
+    background: #FFFFFF;
+    border: 1px solid {C['border']};
+}}
+#dropZone[state="error"] {{
+    background: #FEF2F2;
+    border: 1.5px dashed #F87171;
+}}
+#dropZone[state="loading"] {{
+    background: {C['indigo_soft']};
+    border: 1.5px solid {C['indigo_md']};
+}}
+#dropIcon {{ font-size: 20px; color: {C['indigo_lt']}; background: transparent; }}
+#dropTitle {{ font-size: 9.5pt; font-weight: 600; color: {C['slate_md']}; background: transparent; }}
+#dropHint {{ font-size: 8pt; color: {C['slate_lt']}; background: transparent; }}
+#dropBadge {{
+    background: {C['indigo_soft']}; color: {C['indigo']};
+    border-radius: 9px; padding: 3px 10px;
+    font-size: 8pt; font-weight: 600;
+}}
+
+/* ── 目标选择菜单 ── */
+QMenu {{
+    background: #FFFFFF;
+    border: 1px solid {C['border']};
+    border-radius: 8px;
+    padding: 6px;
+}}
+QMenu::item {{
+    padding: 7px 26px 7px 14px;
+    border-radius: 6px;
+    color: {C['slate']};
+}}
+QMenu::item:selected {{
+    background: {C['indigo_soft']};
+    color: {C['indigo']};
+}}
+QMenu::separator {{
+    height: 1px; background: {C['border']}; margin: 4px 8px;
+}}
+
 /* ── 输入框 ── */
 QLineEdit {{
     border: 1.5px solid {C['border_strong']};
@@ -252,6 +311,19 @@ QLineEdit {{
 }}
 QLineEdit:hover {{ border-color: {C['slate_lt']}; }}
 QLineEdit:focus {{ border: 1.5px solid {C['indigo']}; background: #FFFFFF; }}
+
+QDoubleSpinBox {{
+    border: 1.5px solid {C['border_strong']};
+    border-radius: 8px;
+    padding: 0 8px;
+    min-height: 28px; max-height: 28px;
+    background: {C['card']}; color: {C['slate']};
+    selection-background-color: {C['indigo_lt']};
+    font-size: 9pt;
+}}
+QDoubleSpinBox:hover {{ border-color: {C['slate_lt']}; }}
+QDoubleSpinBox:focus {{ border: 1.5px solid {C['indigo']}; background: #FFFFFF; }}
+QDoubleSpinBox:disabled {{ background: #F8FAFC; color: {C['slate_lt']}; border-color: {C['border']}; }}
 
 /* ── 按钮通用 ── */
 QPushButton {{
@@ -403,6 +475,162 @@ class PosButton(QPushButton):
     def mouseReleaseEvent(self, event):
         self.release_arm.emit(self._arm_id)
         super().mouseReleaseEvent(event)
+
+
+# ==================== 路点拖拽区 ====================
+class WaypointDropZone(QFrame):
+    """路点文件拖拽区：拖入 cvt/cst/csv/txt，点击可浏览选择"""
+
+    file_dropped = pyqtSignal(str)
+    browse_requested = pyqtSignal()
+
+    SUFFIXES = (".cvt", ".cst", ".csv", ".txt")
+    STATE_COLORS = {
+        "idle":    ("#818CF8", "#475569", "#94A3B8"),
+        "hover":   ("#4F46E5", "#3730A3", "#6366F1"),
+        "loaded":  ("#6366F1", "#1E293B", "#94A3B8"),
+        "loading": ("#4F46E5", "#3730A3", "#6366F1"),
+        "error":   ("#EF4444", "#B91C1C", "#DC2626"),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("dropZone")
+        self.setProperty("state", "idle")
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(62)
+        self.setToolTip("拖入路点文件，随后选择所属从臂/手；点击也可选择文件")
+        self._has_file = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 8, 12, 8)
+        layout.setSpacing(10)
+
+        self.icon = QLabel("📥")
+        self.icon.setObjectName("dropIcon")
+        self.icon.setFixedWidth(24)
+        self.icon.setAlignment(Qt.AlignCenter)
+        self.icon.setAttribute(Qt.WA_TransparentForMouseEvents)
+        layout.addWidget(self.icon)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(1)
+        self.title = QLabel("拖入路点文件")
+        self.title.setObjectName("dropTitle")
+        self.title.setMinimumHeight(24)
+        self.title.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.hint = QLabel("支持 .cvt / .cst / .csv / .txt · 拖入后选择目标")
+        self.hint.setObjectName("dropHint")
+        self.hint.setMinimumHeight(18)
+        self.hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        text_col.addWidget(self.title)
+        text_col.addWidget(self.hint)
+        layout.addLayout(text_col, 1)
+
+        self.target_badge = QLabel("未选择")
+        self.target_badge.setObjectName("dropBadge")
+        self.target_badge.setAlignment(Qt.AlignCenter)
+        self.target_badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+        layout.addWidget(self.target_badge)
+
+        self.browse_btn = QPushButton("选择文件")
+        self.browse_btn.setObjectName("ghostBtn")
+        self.browse_btn.setCursor(Qt.PointingHandCursor)
+        self.browse_btn.setToolTip("浏览并选择路点文件")
+        self.browse_btn.clicked.connect(self.browse_requested)
+        layout.addWidget(self.browse_btn)
+
+        self._apply_state()
+
+    # ---------- 对外接口 ----------
+    def set_target(self, text: str):
+        self.target_badge.setText(text)
+
+    def set_file(self, filename: str = "", count: int = 0):
+        self._has_file = bool(filename)
+        if filename:
+            self.title.setText(filename)
+            self.hint.setText(f"{count} 个路点 · 拖入新文件可替换")
+            self.icon.setText("📄")
+            self._set_state("loaded")
+        else:
+            self.title.setText("拖入路点文件")
+            self.hint.setText("支持 .cvt / .cst / .csv / .txt · 拖入后选择目标")
+            self.icon.setText("📥")
+            self._set_state("idle")
+
+    def set_loading(self, filename: str):
+        self.title.setText(filename)
+        self.hint.setText("正在解析路点…")
+        self.icon.setText("⏳")
+        self._set_state("loading")
+
+    def set_error(self, message: str = "文件解析失败"):
+        self.title.setText(message)
+        self.hint.setText("请检查文件格式，或拖入其他文件")
+        self.icon.setText("⚠")
+        self._set_state("error")
+
+    # ---------- 拖拽 ----------
+    @classmethod
+    def _pick_file(cls, mime) -> Optional[str]:
+        if not mime.hasUrls():
+            return None
+        for url in mime.urls():
+            path = url.toLocalFile()
+            if path and os.path.isfile(path) and path.lower().endswith(cls.SUFFIXES):
+                return path
+        return None
+
+    def dragEnterEvent(self, event):
+        if self._pick_file(event.mimeData()):
+            event.acceptProposedAction()
+            self._set_state("hover")
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._pick_file(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_state("loaded" if self._has_file else "idle")
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        path = self._pick_file(event.mimeData())
+        if not path:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self._set_state("loaded" if self._has_file else "idle")
+        self.file_dropped.emit(path)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.browse_requested.emit()
+        super().mousePressEvent(event)
+
+    # ---------- 状态 ----------
+    def _set_state(self, state: str):
+        if self.property("state") != state:
+            self.setProperty("state", state)
+        self._apply_state()
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def _apply_state(self):
+        """显式设置子控件颜色，避免属性选择器不刷新后代样式"""
+        state = self.property("state")
+        icon_color, title_color, hint_color = self.STATE_COLORS.get(state, self.STATE_COLORS["idle"])
+        self.icon.setStyleSheet(f"font-size: 20px; color: {icon_color}; background: transparent;")
+        self.title.setStyleSheet(
+            f"font-size: 9.5pt; font-weight: 600; color: {title_color}; background: transparent;")
+        self.hint.setStyleSheet(f"font-size: 8pt; color: {hint_color}; background: transparent;")
 
 
 # ==================== 卡片组件 ====================
@@ -712,7 +940,7 @@ class AutoKinematicsWindow(QWidget):
     # 线程安全信号
     signal_connect_result = pyqtSignal(bool, bool, bool)  # tcp, ssh_slave, ssh_master
     signal_auto_pos_done = pyqtSignal(int)
-    signal_file_loaded = pyqtSignal(list)
+    signal_file_loaded = pyqtSignal(object)
     signal_exec_done = pyqtSignal()
     signal_log = pyqtSignal(str)
 
@@ -731,7 +959,13 @@ class AutoKinematicsWindow(QWidget):
         self.ssh_slave_connected = False
         self.ssh_master_connected = False
 
+        # 单目标路点：一次只保留一个文件及其归属
         self.waypoints: List[Tuple[str, List[float]]] = []
+        self.current_target: Optional[Tuple[str, int]] = None
+        self.loaded_filename = ""
+        self.loaded_file_path = ""
+        self.executed_names: set = set()
+        self._load_seq = 0
 
         # 模式: 0=主手, 1=从手
         self.mode = 1
@@ -758,7 +992,7 @@ class AutoKinematicsWindow(QWidget):
         """按可用屏幕区域自适应尺寸并居中，避免小屏被裁切"""
         avail = QApplication.primaryScreen().availableGeometry()
         w = max(900, min(1040, avail.width() - 60))
-        h = max(620, min(820, avail.height() - 80))
+        h = max(620, min(860, avail.height() - 80))
         self.setMinimumSize(min(940, w), min(700, h))
         self.resize(w, h)
         self.move(avail.x() + (avail.width() - w) // 2,
@@ -833,7 +1067,7 @@ class AutoKinematicsWindow(QWidget):
         self.clear_log_btn.clicked.connect(lambda: self.log_edit.clear())
 
         log_card = Card("📝 运行日志", action=self.clear_log_btn)
-        log_card.setMaximumHeight(176)
+        log_card.setMaximumHeight(168)
         self.log_edit = QPlainTextEdit()
         self.log_edit.setObjectName("logEdit")
         self.log_edit.setReadOnly(True)
@@ -934,6 +1168,20 @@ class AutoKinematicsWindow(QWidget):
         layout.addWidget(lbl)
         layout.addWidget(widget)
         return container
+
+    @staticmethod
+    def _make_param_spin(value: float, step: float, tooltip: str) -> QDoubleSpinBox:
+        """执行参数输入框（无箭头、两位小数）"""
+        spin = QDoubleSpinBox()
+        spin.setDecimals(2)
+        spin.setRange(0.01, 10.00)
+        spin.setSingleStep(step)
+        spin.setValue(value)
+        spin.setFixedWidth(72)
+        spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        spin.setKeyboardTracking(False)
+        spin.setToolTip(tooltip)
+        return spin
 
     # ---------- 摆位卡片 ----------
     def _build_pos_card(self):
@@ -1037,64 +1285,37 @@ class AutoKinematicsWindow(QWidget):
     def _build_waypoint_card(self):
         card = Card("📋 路点管理")
 
-        # 文件选择
-        file_row = QHBoxLayout()
-        file_row.setSpacing(10)
-        self.file_label = QLabel("未选择路点文件")
-        self.file_label.setObjectName("hintLabel")
-        self.file_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        file_row.addWidget(self.file_label, stretch=1)
+        # 文件拖拽区（拖入/选择文件后再指定归属）
+        self.drop_zone = WaypointDropZone()
+        self.drop_zone.file_dropped.connect(self._on_file_dropped)
+        self.drop_zone.browse_requested.connect(lambda: self._load_trajectory_file())
+        self.drop_zone.set_target("未选择")
+        card.addWidget(self.drop_zone)
 
-        self.load_btn = QPushButton("📂 加载文件")
-        self.load_btn.setObjectName("secondaryBtn")
-        self.load_btn.setCursor(Qt.PointingHandCursor)
-        self.load_btn.setToolTip("选择 .txt 轨迹文件并解析路点")
-        self.load_btn.clicked.connect(self._load_trajectory_file)
-        file_row.addWidget(self.load_btn)
-        card.addLayout(file_row)
+        # 执行参数（MoveAbsolute，仅从手生效）
+        self.param_frame = QFrame()
+        param_row = QHBoxLayout(self.param_frame)
+        param_row.setContentsMargins(0, 0, 0, 0)
+        param_row.setSpacing(8)
 
-        # ── 执行目标选择 ──
-        self.target_frame = QFrame()
-        target_row = QHBoxLayout(self.target_frame)
-        target_row.setContentsMargins(0, 0, 0, 0)
-        target_row.setSpacing(8)
+        param_title = QLabel("执行参数")
+        param_title.setObjectName("fieldLabel")
+        param_title.setToolTip("MoveAbsolute 运动参数，仅从手模式生效")
+        param_row.addWidget(param_title)
 
-        self.target_label = QLabel("执行于")
-        self.target_label.setObjectName("fieldLabel")
-        target_row.addWidget(self.target_label)
+        self.vel_spin = self._make_param_spin(0.15, 0.05, "速度 --vel，默认 0.15")
+        self.acc_spin = self._make_param_spin(0.30, 0.10, "加速度 --acc，默认 0.30")
+        self.jerk_spin = self._make_param_spin(0.30, 0.10, "加加速度 --jerk，默认 0.30")
+        param_row.addWidget(self._labeled_widget("速度", self.vel_spin))
+        param_row.addWidget(self._labeled_widget("加速度", self.acc_spin))
+        param_row.addWidget(self._labeled_widget("加加速度", self.jerk_spin))
+        param_row.addStretch(1)
 
-        # 从手臂选择按钮
-        self.arm_target_btns = []
-        arm_labels = ["❶ 从臂1", "❷ 从臂2", "❸ 从臂3", "❹ 从臂4"]
-        for i in range(4):
-            btn = QPushButton(arm_labels[i])
-            btn.setObjectName("segBtn")
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _, a=i+1: self._select_arm_target(a))
-            target_row.addWidget(btn)
-            self.arm_target_btns.append(btn)
-        self.arm_target_btns[0].setChecked(True)
+        param_hint = QLabel("仅从手生效")
+        param_hint.setObjectName("hintLabel")
+        param_row.addWidget(param_hint)
 
-        # 主手左右选择按钮
-        self.hand_target_btns = []
-        for i, label in enumerate(["👈 左手", "👉 右手"]):
-            btn = QPushButton(label)
-            btn.setObjectName("segBtn")
-            btn.setCheckable(True)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _, h=i: self._select_hand_target(h))
-            target_row.addWidget(btn)
-            self.hand_target_btns.append(btn)
-        self.hand_target_btns[0].setChecked(True)
-
-        target_row.addStretch()
-        card.addWidget(self.target_frame)
-
-        # 存储选中状态
-        self.selected_arm = 1
-        self.selected_hand = 0
-        self._refresh_target_visibility()
+        card.addWidget(self.param_frame)
 
         # 表格
         self.table = QTableWidget()
@@ -1166,7 +1387,7 @@ class AutoKinematicsWindow(QWidget):
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        hint = QLabel("点击右上角「加载文件」，选择 .txt 轨迹文件以解析路点")
+        hint = QLabel("拖入上方区域或点击「选择文件」，随后选择归属目标")
         hint.setObjectName("emptyHint")
         hint.setAlignment(Qt.AlignCenter)
         hint.setWordWrap(True)
@@ -1191,29 +1412,88 @@ class AutoKinematicsWindow(QWidget):
         widget.style().polish(widget)
         widget.update()
 
-    def _select_arm_target(self, arm_id: int):
-        self.selected_arm = arm_id
-        for i, btn in enumerate(self.arm_target_btns):
-            btn.setChecked(i + 1 == arm_id)
-            self._repolish(btn)
+    @staticmethod
+    def _target_text(key: Optional[Tuple[str, int]]) -> str:
+        if not key:
+            return "未选择"
+        kind, idx = key
+        if kind == "arm":
+            return f"从臂 {idx}"
+        return "左手" if idx == 0 else "右手"
 
-    def _select_hand_target(self, hand: int):
-        self.selected_hand = hand
-        for i, btn in enumerate(self.hand_target_btns):
-            btn.setChecked(i == hand)
-            self._repolish(btn)
+    def _choose_target(self, global_pos=None) -> Optional[Tuple[str, int]]:
+        """弹出目标菜单选择文件归属，取消返回 None"""
+        menu = QMenu(self)
+        if self.mode == 1:
+            options = [(f"{ARM_COLORS[i]['icon']} 从臂 {i + 1}", ("arm", i + 1)) for i in range(4)]
+        else:
+            options = [("👈 左手", ("hand", 0)), ("👉 右手", ("hand", 1))]
+        for label, key in options:
+            action = menu.addAction(label)
+            action.setData(key)
+        pos = global_pos or self.drop_zone.mapToGlobal(self.drop_zone.rect().bottomLeft())
+        chosen = menu.exec_(pos)
+        return chosen.data() if chosen else None
 
-    def _refresh_target_visibility(self):
-        """根据当前模式显示对应目标选择器"""
-        if not hasattr(self, 'arm_target_btns'):
+    def _clear_waypoints(self):
+        self.waypoints = []
+        self.current_target = None
+        self.loaded_filename = ""
+        self.loaded_file_path = ""
+        self.executed_names.clear()
+        self.drop_zone.set_target("未选择")
+        self._refresh_waypoint_view()
+
+    def _refresh_waypoint_view(self):
+        """刷新表格、拖拽区、计数与已执行状态"""
+        self.table.setRowCount(0)
+        for name, angles in self.waypoints:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(name))
+            angle_str = ", ".join(f"{a:.4f}" for a in angles)
+            item = QTableWidgetItem(angle_str)
+            item.setToolTip(angle_str)
+            self.table.setItem(row, 1, item)
+            if name in self.executed_names:
+                self._style_executed_row(row)
+
+        self.drop_zone.set_target(self._target_text(self.current_target))
+        self.drop_zone.set_file(self.loaded_filename, len(self.waypoints))
+        self._update_count_label()
+        self.table_stack.setCurrentIndex(1 if self.waypoints else 0)
+        if self.waypoints:
+            self.table.selectRow(0)
+        self._update_exec_btn()
+
+    def _update_count_label(self):
+        text = f"{len(self.waypoints)} 个路点"
+        done = len(self.executed_names)
+        if done:
+            text += f" · 已执行 {done}"
+        self.wp_count_label.setText(text)
+
+    def _style_executed_row(self, row: int):
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item is None:
+                continue
+            item.setBackground(QColor("#ECFDF5"))
+            item.setForeground(QColor("#047857"))
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+
+    def _mark_executed(self, wp_name: str):
+        """标记已执行路点，用绿色区分"""
+        if wp_name in self.executed_names:
             return
-        show_arm = (self.mode == 1)
-        show_hand = (self.mode == 0)
-        self.target_label.setText("执行于" if show_arm else "执行手")
-        for btn in self.arm_target_btns:
-            btn.setVisible(show_arm)
-        for btn in self.hand_target_btns:
-            btn.setVisible(show_hand)
+        self.executed_names.add(wp_name)
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 0).text() == wp_name:
+                self._style_executed_row(row)
+                break
+        self._update_count_label()
 
     # ---------- 模式切换 ----------
     def _style_mode_buttons(self):
@@ -1225,17 +1505,27 @@ class AutoKinematicsWindow(QWidget):
 
     def _set_mode(self, mode: int):
         """切换主手/从手模式"""
+        if mode == self.mode:
+            self._style_mode_buttons()
+            return
         self.mode = mode
         self.model = 7 if self.mode == 1 else 2
         self.mode_btn_master.setChecked(mode == 0)
         self.mode_btn_slave.setChecked(mode == 1)
         self._style_mode_buttons()
 
-        # 主手隐藏摆位卡片，从手显示
+        # 主手隐藏摆位卡片与执行参数，从手显示
         if hasattr(self, 'pos_card'):
             self.pos_card.setVisible(mode == 1)
+        if hasattr(self, 'param_frame'):
+            self.param_frame.setVisible(mode == 1)
 
-        self._refresh_target_visibility()
+        # 单目标：模式切换后原归属失效，清空已加载路点
+        target_kind = "arm" if mode == 1 else "hand"
+        if self.current_target and self.current_target[0] != target_kind:
+            self._clear_waypoints()
+            self._log("模式切换，已清空当前路点")
+
         self._update_exec_btn()
         mode_name = "主手" if mode == 0 else "从手"
         self._log(f"切换至{mode_name}模式,model:{self.model}")
@@ -1252,7 +1542,7 @@ class AutoKinematicsWindow(QWidget):
         self._update_exec_btn()
 
     def _update_exec_btn(self):
-        has_data = len(self.waypoints) > 0
+        has_data = bool(self.waypoints)
         self.exec_btn.setEnabled(self.connected and has_data)
         self.stop_btn.setEnabled(self.connected)
         # if self.mode == 0:
@@ -1464,95 +1754,135 @@ class AutoKinematicsWindow(QWidget):
         self._log(f"从臂{arm_id} 自动摆位完成")
 
     # ---------- 路点管理 ----------
-    def _load_trajectory_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择路点文件", os.path.dirname(os.path.abspath(__file__)),
-            "路点文件 (*.txt);;所有文件 (*.*)"
-        )
+    def _on_file_dropped(self, file_path: str):
+        """文件拖入后先选择归属，再加载"""
+        key = self._choose_target(QCursor.pos())
+        if key is None:
+            self._refresh_waypoint_view()
+            return
+        self._load_trajectory_file(file_path, key)
+
+    def _load_trajectory_file(self, file_path: str = "", target_key=None):
+        """加载路点文件；未指定文件时弹出选择框，未指定归属时弹出目标菜单"""
         if not file_path:
+            start_dir = os.path.dirname(self.loaded_file_path) if self.loaded_file_path else os.path.dirname(
+                os.path.abspath(__file__))
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "选择路点文件", start_dir,
+                "路点文件 (*.cvt *.cst *.csv *.txt);;所有文件 (*.*)"
+            )
+            if not file_path:
+                return
+
+        key = target_key or self._choose_target()
+        if key is None:
+            self._refresh_waypoint_view()
             return
 
-        self.file_label.setText(os.path.basename(file_path))
-        self.file_label.setToolTip(file_path)
-        self.file_label.setStyleSheet("")
-        self.file_label.setObjectName("fieldLabel")
-        self._repolish(self.file_label)
-        self._log(f"加载路点文件: {file_path}")
+        target_text = self._target_text(key)
+        self.drop_zone.set_target(target_text)
+        self.drop_zone.set_loading(os.path.basename(file_path))
+        self._log(f"加载路点文件（{target_text}）: {file_path}")
+
+        self._load_seq += 1
+        seq = self._load_seq
 
         def task():
-            waypoints = self._parse_trajectory_file(file_path)
-            self.signal_file_loaded.emit(waypoints)
+            waypoints, error = self._parse_trajectory_file(file_path)
+            self.signal_file_loaded.emit((seq, key, file_path, waypoints, error))
 
         threading.Thread(target=task, daemon=True).start()
 
     @staticmethod
-    def _parse_trajectory_file(file_path: str) -> List[Tuple[str, List[float]]]:
-        waypoints = []
+    def _read_text_auto(file_path: str) -> str:
+        """按 BOM/编码探测读取文本，兼容 UTF-8、UTF-16 与 GBK"""
+        with open(file_path, "rb") as f:
+            raw = f.read()
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return raw.decode("utf-16")
+        for enc in ("utf-8-sig", "gbk"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    @classmethod
+    def _parse_trajectory_file(cls, file_path: str) -> Tuple[List[Tuple[str, List[float]]], Optional[str]]:
+        """解析路点文件（cvt/cst/csv/txt）
+
+        - 分隔符自动识别：制表符 / 逗号 / 分号 / 竖线 / 空格
+        - 跳过表头、空行、# 与 // 注释
+        - 支持「名称 + 关节角」和「纯数值」两种数据行
+        返回 (路点列表, 错误信息)
+        """
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-
-            for i, line in enumerate(lines):
-                line = line.strip()
-                if not line:
-                    continue
-                # 跳过表头行（包含 J1,J2 等列名）
-                if i == 0 and ('J1' in line or 'name' in line.lower()):
-                    continue
-                # 按 Tab 切分
-                parts = line.split('\t')
-                if len(parts) < 2:
-                    continue
-                name = parts[0].rstrip(':')
-                angles = []
-                for val in parts[1:]:
-                    try:
-                        angles.append(float(val))
-                    except ValueError:
-                        break
-                if angles:
-                    waypoints.append((name, angles))
+            text = cls._read_text_auto(file_path)
         except Exception as e:
-            return [(f"错误: {e}", [])]
-        return waypoints
+            return [], f"读取文件失败: {e}"
 
-    def _on_file_loaded(self, waypoints: List[Tuple[str, List[float]]]):
-        self.table.setRowCount(0)
-        self.waypoints = waypoints
+        raw_items: List[Tuple[str, List[float]]] = []
+        for line in text.splitlines():
+            line = line.strip().lstrip("\ufeff")
+            if not line or line.startswith(("#", "//")):
+                continue
+            tokens = [t for t in re.split(r"[\s,;|]+", line) if t]
+            if not tokens:
+                continue
 
-        if not waypoints:
-            self._log("警告: 文件中未解析到任何路点")
-            self.wp_count_label.setText("0 个路点")
-            self.table_stack.setCurrentIndex(0)
-            self._update_exec_btn()
+            try:
+                # 纯数值行：无名称列
+                angles = [float(t) for t in tokens]
+                name = ""
+            except ValueError:
+                name = tokens[0].rstrip(":")
+                try:
+                    angles = [float(t) for t in tokens[1:]]
+                except ValueError:
+                    continue  # 表头 / 说明行
+            if angles:
+                raw_items.append((name, angles))
+
+        if not raw_items:
+            return [], "未解析到任何路点，请确认文件包含「名称（可选）+ 关节角」数据行"
+
+        # 名称为空、重复或为通用标签时，统一命名 P1..PN，保证表格与执行查找唯一
+        generic = {"", "name", "actpos", "addlpos", "pos", "joint"}
+        labels = [name.lower() for name, _ in raw_items]
+        if any(label in generic for label in labels) or len(set(labels)) != len(labels):
+            return [(f"P{i}", angles) for i, (_, angles) in enumerate(raw_items, 1)], None
+        return raw_items, None
+
+    def _on_file_loaded(self, payload):
+        seq, key, file_path, waypoints, error = payload
+        if seq != self._load_seq:
+            return  # 已有更新的加载请求，忽略旧结果
+
+        target_text = self._target_text(key)
+        filename = os.path.basename(file_path)
+
+        if error or not waypoints:
+            message = error or "文件中未解析到任何路点"
+            self._log(f"警告（{target_text}）: {message}")
+            self.drop_zone.set_error("文件解析失败")
+            QTimer.singleShot(2200, self._refresh_waypoint_view)
             return
 
-        for name, angles in waypoints:
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            self.table.setItem(row, 0, QTableWidgetItem(name))
-            angle_str = ", ".join([f"{a:.4f}" for a in angles])
-            display = f"{angle_str}"
-            item = QTableWidgetItem(display)
-            item.setToolTip(angle_str)
-            self.table.setItem(row, 1, item)
-
-        self.wp_count_label.setText(f"{len(waypoints)} 个路点")
-        self.table_stack.setCurrentIndex(1)
-        self._log(f"成功加载 {len(waypoints)} 个路点")
-        self._update_exec_btn()
-        if self.table.rowCount() > 0:
-            self.table.selectRow(0)
-
-    def _get_selected_arm(self) -> int:
-        return self.selected_arm
-
-    def _get_selected_hand(self) -> int:
-        return self.selected_hand
+        self.current_target = key
+        self.waypoints = waypoints
+        self.loaded_filename = filename
+        self.loaded_file_path = file_path
+        self.executed_names.clear()
+        self.drop_zone.set_target(target_text)
+        self._refresh_waypoint_view()
+        self._log(f"成功为 {target_text} 加载 {len(waypoints)} 个路点: {filename}")
 
     def _execute_waypoint(self):
         if not self.connected:
             QMessageBox.warning(self, "警告", "请先连接远程服务器")
+            return
+        if not self.current_target:
+            QMessageBox.information(self, "提示", "请先拖入路点文件并选择归属目标")
             return
 
         row = self.table.currentRow()
@@ -1561,34 +1891,42 @@ class AutoKinematicsWindow(QWidget):
             return
 
         wp_name = self.table.item(row, 0).text()
-        angles = []
-        for name, ang in self.waypoints:
-            if name == wp_name:
-                angles = ang
-                break
+        angles = next((ang for n, ang in self.waypoints if n == wp_name), [])
+        if not angles:
+            QMessageBox.warning(self, "警告", "未找到该路点的关节角数据")
+            return
+
+        # 归属决定执行模式与臂号；执行参数在主线程读取后固定
+        kind, idx = self.current_target
+        mode = 0 if kind == "hand" else 1
+        model = 2 if mode == 0 else 7
+        arm_id = idx if kind == "arm" else 1
+        hand = idx if kind == "hand" else 0
+        vel = self.vel_spin.value()
+        acc = self.acc_spin.value()
+        jerk = self.jerk_spin.value()
 
         angle_str = ", ".join([f"{a:.4f}" for a in angles])
-        self._log(f"执行路点: {wp_name} 角度: [{angle_str}]")
+        self._mark_executed(wp_name)
+        self._log(f"执行路点（{self._target_text(self.current_target)}）: {wp_name} 角度: [{angle_str}]")
         self.exec_btn.setEnabled(False)
         self.exec_btn.setText("执行中...")
 
         def task():
-            if self.mode == 0:
-                hand = self._get_selected_hand()
+            if mode == 0:
                 cmd = _build_master_exec_cmd(angles, hand)
                 self._log(f"执行 ({'左手' if hand==0 else '右手'}): {cmd}")
-                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0,expected=self.model)
+                resp, err = self.tcp.send_and_recv(cmd, timeout=500.0, expected=model)
                 if resp:
                     for line in resp.split("\n"):
                         self._log(f"  <- {line}")
                 if err:
                     self._log(f"  -> {err}")
             else:
-                arm_id = self._get_selected_arm()
-                cmds = _build_slave_exec_cmds(arm_id, angles)
+                cmds = _build_slave_exec_cmds(arm_id, angles, vel, acc, jerk)
                 for i, cmd in enumerate(cmds, 1):
                     self._log(f"[{i}/7] 发送: {cmd}")
-                    resp, err = self.tcp.send_and_recv(cmd, timeout=500.0 ,expected=self.model)
+                    resp, err = self.tcp.send_and_recv(cmd, timeout=500.0, expected=model)
                     if resp:
                         for line in resp.split("\n"):
                             self._log(f"  <- {line}")
@@ -1596,15 +1934,14 @@ class AutoKinematicsWindow(QWidget):
                         self._log(f"  -> {err}")
 
             # 所有返回已收到 → 直接保存关节角数据（同一线程）
-            
-            self._do_save_after_exec(wp_name)
+            self._do_save_after_exec(wp_name, angles, mode, arm_id, hand)
             self.signal_exec_done.emit()
 
         threading.Thread(target=task, daemon=True).start()
 
     # ---------- 路点执行完成回调 ----------
     def _on_exec_done(self):
-        self.exec_btn.setText("▶执行路点")
+        self.exec_btn.setText("▶  执行路点")
         self._update_exec_btn()
         self._log("路点执行完成")
 
@@ -1652,9 +1989,9 @@ class AutoKinematicsWindow(QWidget):
                 self._log(f"写入文件失败 {filepath}: {e}")
                 return -1
 
-    def _do_save_after_exec(self, wp_name: str):
+    def _do_save_after_exec(self, wp_name: str, waypoint_angles: List[float],
+                            mode: int, arm_id: int, hand: int):
         """执行线程中直接调用：收到所有返回后，等 1s 等待日志刷新，SSH 读取实际角度并保存"""
-        waypoint_angles = next((ang for n, ang in self.waypoints if n == wp_name), None)
         if not waypoint_angles:
             return
 
@@ -1664,15 +2001,13 @@ class AutoKinematicsWindow(QWidget):
         try:
             # 等待 1s 让机器人日志文件更新到最新位置
             threading.Event().wait(1)
-            if self.mode == 1 and self.ssh_slave_connected:
-                arm_id = self._get_selected_arm()
+            if mode == 1 and self.ssh_slave_connected:
                 ssh_angles = self.ssh.read_slave(arm_id)
                 if ssh_angles:
                     actual_angles = ssh_angles
                     source = "SSH"
 
-            elif self.mode == 0 and self.ssh_master_connected:
-                hand = self._get_selected_hand()
+            elif mode == 0 and self.ssh_master_connected:
                 arm_name = "Left" if hand == 0 else "Right"
                 ssh_angles, view_angle = self.ssh.read_master(arm_name)
                 if ssh_angles:
@@ -1684,8 +2019,7 @@ class AutoKinematicsWindow(QWidget):
             if actual_angles is None:
                 actual_angles = waypoint_angles
 
-            if self.mode == 1:
-                arm_id = self._get_selected_arm()
+            if mode == 1:
                 front_8 = actual_angles[:8]
                 back_4 = actual_angles[8:12] if len(actual_angles) >= 12 else []
                 psm_file = os.path.join(self.data_dir, f"psm{arm_id}_joint.cst")
@@ -1693,8 +2027,7 @@ class AutoKinematicsWindow(QWidget):
                 self._write_joint_file(psm_file, front_8, 8, "actpos")
                 if back_4:
                     self._write_joint_file(inst_file, back_4, 4, "actpos")
-            elif self.mode == 0:
-                hand = self._get_selected_hand()
+            elif mode == 0:
                 filename = "mtm1_joint.cst" if hand == 0 else "mtm2_joint.cst"
                 filepath = os.path.join(self.data_dir, filename)
                 self._write_joint_file(filepath, actual_angles, 7, "addlpos")
