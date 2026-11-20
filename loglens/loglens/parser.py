@@ -47,6 +47,13 @@ MAX_ENTRY_CHARS = 131_072
 LARGE_FILE_WARN_BYTES = 100 * 1024 * 1024
 MAX_FIELDS = 16
 
+# 大文件只解析末尾窗口：先按行数倒推起点，避免读完整个文件后丢弃早期日志
+TAIL_SCAN_THRESHOLD = 16 * 1024 * 1024
+TAIL_WINDOW_FACTOR = 1.5
+READ_BUFFER_BYTES = 1024 * 1024
+TIME_SPAN_PROBE_BYTES = 4 * 1024 * 1024
+RANGE_EARLY_STOP_STREAK = 4096
+
 
 class ParseError(RuntimeError):
     """日志解析失败。"""
@@ -111,6 +118,11 @@ class ParseResult:
     last_timestamp: Optional[datetime] = None
     source_first_timestamp: Optional[datetime] = None
     source_last_timestamp: Optional[datetime] = None
+    scan_mode: str = "full"  # full / tail / range
+    scan_offset: int = 0
+    _level_counts_cache: Optional[dict[str, int]] = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def entry_count(self) -> int:
@@ -128,6 +140,25 @@ class ParseResult:
             f"{self.first_timestamp:%Y-%m-%d %H:%M:%S} → "
             f"{self.last_timestamp:%Y-%m-%d %H:%M:%S}"
         )
+
+    @property
+    def source_time_range_text(self) -> str:
+        """文件内全部日志的时间跨度，用于时间筛选定位。"""
+
+        first = self.source_first_timestamp or self.first_timestamp
+        last = self.source_last_timestamp or self.last_timestamp
+        if first is None or last is None:
+            return ""
+        return f"{first:%Y-%m-%d %H:%M:%S} → {last:%Y-%m-%d %H:%M:%S}"
+
+    @property
+    def level_counts(self) -> dict[str, int]:
+        if self._level_counts_cache is None:
+            counts = {level: 0 for level in LEVELS}
+            for entry in self.entries:
+                counts[entry.level] = counts.get(entry.level, 0) + 1
+            self._level_counts_cache = counts
+        return self._level_counts_cache
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +271,9 @@ def detect_encoding(sample: bytes) -> str:
     return "latin-1"
 
 
+_CONTROL_BYTES = bytes(range(0, 9)) + bytes(range(14, 32))
+
+
 def _is_binary(sample: bytes, encoding: str) -> bool:
     if not sample:
         return False
@@ -247,7 +281,7 @@ def _is_binary(sample: bytes, encoding: str) -> bool:
         return False
     if sample.count(b"\x00") / len(sample) > 0.08:
         return True
-    controls = sum(1 for byte in sample if byte < 9 or 13 < byte < 32)
+    controls = len(sample) - len(sample.translate(None, delete=_CONTROL_BYTES))
     return controls / len(sample) > 0.10
 
 
@@ -401,6 +435,25 @@ _KV_RE = re.compile(
 )
 
 _QUICK_TS_RE = re.compile(r"^\[?\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{2}:\d{2}:\d{2}")
+
+_NUMERIC_WORD_RE = re.compile(r"[\d\s.:+\-/]+")
+_NUMERIC_TOKEN_RE = re.compile(r"[\d.+\-/:]+")
+_PREFIX_SPLIT_RE = re.compile(r"[\s|]+")
+_MODULE_INDEX_RE = re.compile(r"\[\d+\]$")
+_BRACKETS_RE = re.compile(r"\[([^\]]{1,64})\]")
+_THREAD_RE = re.compile(r"^\[([^\[\]]{0,240})\]\s*(.*)$")
+_LOG4J_RE = re.compile(r"^([^\s\[\]()]{1,80})\s+-\s+(.*)$")
+_MODULE_DASH_RE = re.compile(r"^([^\s\[\]()]{1,80}?)\s+-\s+(.*)$")
+_MODULE_COLON_RE = re.compile(r"^([^\s:\[\]()]{1,80})\s*:\s+(.*)$")
+_TZ_SUFFIX_RE = re.compile(r"([+-]\d{2})(\d{2})$")
+_SYSLOG_RE = re.compile(
+    r"^(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+"
+    r"(?P<time>\d{2}:\d{2}:\d{2})$"
+)
+_HOST_APP_RE = re.compile(
+    r"^(?P<host>[^\s]+)\s+(?P<module>[^\s\[]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<msg>.*)$"
+)
+_BRACKET_MODULE_RE = re.compile(r"^\[([^\]]{0,64})\]\s*[:\-|]?\s*(?P<msg>.*)$")
 _QUICK_BRACKET_TS_RE = re.compile(
     r"^\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,9})?\]\s*(?P<rest>.*)$"
 )
@@ -456,23 +509,28 @@ def _clean_module(raw: str) -> str:
         value = value[:61] + "..."
     if _LEVEL_RE.fullmatch(value):
         return "general"
-    if re.fullmatch(r"[\d\s.:+\-/]+", value):
+    if _NUMERIC_WORD_RE.fullmatch(value):
         return "general"
     return value
 
 
 def _clean_message(text: str) -> str:
     value = text.strip()
-    value = re.sub(r"^[\s\-–—|>]+\s*", "", value)
-    value = re.sub(r"^:[ \t]*", "", value)
-    value = value.strip()
+    if value:
+        value = value.lstrip(" \t-–—|>").lstrip()
+        if value.startswith(":"):
+            value = value[1:].lstrip(" \t")
     return value or "(空消息)"
 
 
 def _format_ts(value: datetime) -> str:
+    text = (
+        f"{value.year:04d}-{value.month:02d}-{value.day:02d} "
+        f"{value.hour:02d}:{value.minute:02d}:{value.second:02d}"
+    )
     if value.microsecond:
-        return value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    return value.strftime("%Y-%m-%d %H:%M:%S")
+        return f"{text}.{value.microsecond // 1000:03d}"
+    return text
 
 
 def _localize(value: datetime) -> datetime:
@@ -482,14 +540,13 @@ def _localize(value: datetime) -> datetime:
 
 
 def _parse_timestamp(kind: str, text: str) -> Optional[datetime]:
-    now = datetime.now()
     raw = text.strip()
     try:
         if kind == "iso":
             normalized = raw.replace(",", ".")
             if normalized.endswith("Z"):
                 normalized = normalized[:-1] + "+00:00"
-            normalized = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", normalized)
+            normalized = _TZ_SUFFIX_RE.sub(r"\1:\2", normalized)
             value = datetime.fromisoformat(normalized)
         elif kind in ("slash", "slash_us"):
             normalized = raw.replace(",", ".").replace("T", " ")
@@ -501,16 +558,13 @@ def _parse_timestamp(kind: str, text: str) -> Optional[datetime]:
         elif kind == "date":
             value = datetime.strptime(raw, "%Y-%m-%d")
         elif kind == "syslog":
-            match = re.match(
-                r"^(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+"
-                r"(?P<time>\d{2}:\d{2}:\d{2})$",
-                raw,
-            )
+            match = _SYSLOG_RE.match(raw)
             if not match:
                 return None
             month = _MONTHS.get(match.group("mon"))
             if not month:
                 return None
+            now = datetime.now()
             hour, minute, second = (int(part) for part in match.group("time").split(":"))
             value = datetime(now.year, month, int(match.group("day")), hour, minute, second)
             if value > now + timedelta(days=1):
@@ -524,6 +578,7 @@ def _parse_timestamp(kind: str, text: str) -> Optional[datetime]:
             normalized = raw.replace(",", ".")
             fmt = "%H:%M:%S.%f" if "." in normalized else "%H:%M:%S"
             parsed = datetime.strptime(normalized, fmt)
+            now = datetime.now()
             value = now.replace(
                 hour=parsed.hour,
                 minute=parsed.minute,
@@ -578,23 +633,23 @@ def _looks_module_token(token: str) -> bool:
         return False
     if _LEVEL_RE.fullmatch(value):
         return False
-    if re.fullmatch(r"[\d.+\-/:]+", value):
+    if _NUMERIC_TOKEN_RE.fullmatch(value):
         return False
     return True
 
 
 def _module_from_prefix(prefix: str) -> str:
-    tokens = [token for token in re.split(r"[\s|]+", prefix) if token]
+    tokens = [token for token in _PREFIX_SPLIT_RE.split(prefix) if token]
     for token in reversed(tokens):
         value = token.strip("[]():,;")
-        value = re.sub(r"\[\d+\]$", "", value)
+        value = _MODULE_INDEX_RE.sub("", value)
         if not value or value in ("-", "|"):
             continue
-        if re.fullmatch(r"[\d.+\-/:]+", value):
+        if _NUMERIC_TOKEN_RE.fullmatch(value):
             continue
         if _looks_module_token(value):
             return _clean_module(value)
-    brackets = re.findall(r"\[([^\]]{1,64})\]", prefix)
+    brackets = _BRACKETS_RE.findall(prefix)
     if brackets:
         return _clean_module(brackets[-1])
     return "general"
@@ -615,22 +670,22 @@ def _split_suffix(suffix: str) -> tuple[str, str, str]:
 
     suffix = suffix.lstrip(" \t-|:;,>]")
     thread = ""
-    match = re.match(r"^\[([^\[\]]{0,240})\]\s*(.*)$", suffix)
+    match = _THREAD_RE.match(suffix) if "[" in suffix else None
     if match:
         inner, remainder = match.group(1), match.group(2)
         if _is_source_location(inner):
             return inner, remainder, ""
-        log4j = re.match(r"^([^\s\[\]()]{1,80})\s+-\s+(.*)$", remainder)
+        log4j = _LOG4J_RE.match(remainder) if " - " in remainder else None
         if log4j and _looks_module_token(log4j.group(1)):
             return _clean_module(log4j.group(1)), log4j.group(2), inner
         # 例如 INFO [nav] message，方括号里通常是模块名
         return _clean_module(inner), remainder, ""
 
-    module_dash = re.match(r"^([^\s\[\]()]{1,80}?)\s+-\s+(.*)$", suffix)
+    module_dash = _MODULE_DASH_RE.match(suffix) if " - " in suffix else None
     if module_dash and _looks_module_token(module_dash.group(1)):
         return _clean_module(module_dash.group(1)), module_dash.group(2), thread
 
-    module_colon = re.match(r"^([^\s:\[\]()]{1,80})\s*:\s+(.*)$", suffix)
+    module_colon = _MODULE_COLON_RE.match(suffix)
     if module_colon and _looks_module_token(module_colon.group(1)):
         return _clean_module(module_colon.group(1)), module_colon.group(2), thread
 
@@ -667,7 +722,7 @@ def _parse_bracket_tag(
         module = _clean_module(tag)
 
     # 标签后还可以再跟一个源码位置方括号，例如 [instrument][/path/a.cpp:12]
-    source_match = re.match(r"^\[([^\[\]]{0,240})\]\s*(.*)$", remainder)
+    source_match = _THREAD_RE.match(remainder)
     if source_match and _is_source_location(source_match.group(1)):
         source = source_match.group(1)
         remainder = source_match.group(2).lstrip()
@@ -705,7 +760,58 @@ def _parse_bracket_tag(
     )
 
 
+def _extract_simple_fields(message: str, limit: int) -> dict[str, str]:
+    """无引号消息的快速键值提取，行为与 ``_KV_RE`` 的非引号分支一致。"""
+
+    fields: dict[str, str] = {}
+    length = len(message)
+    position = 0
+    while len(fields) < limit:
+        equal = message.find("=", position)
+        if equal < 0:
+            break
+        position = equal + 1
+        start = equal
+        while start > 0 and (
+            message[start - 1].isalnum() or message[start - 1] in "_.-:"
+        ):
+            start -= 1
+        key_start = start
+        while key_start < equal and not (
+            message[key_start] == "_"
+            or (message[key_start].isascii() and message[key_start].isalpha())
+        ):
+            key_start += 1
+        key = message[key_start:equal]
+        if not key or len(key) > 41:
+            continue
+        if key_start > 0:
+            previous = message[key_start - 1]
+            if previous.isalnum() or previous == "_":
+                continue
+        value_start = equal + 1
+        while value_start < length and message[value_start] in " \t":
+            value_start += 1
+        value_end = value_start
+        while value_end < length and message[value_end] not in " \t,;&|{}<>":
+            value_end += 1
+        value = message[value_start:value_end]
+        if not value:
+            continue
+        value = value.rstrip(")]};,")
+        if not value or not any(char.isalnum() for char in value):
+            continue
+        if key in fields:
+            continue
+        fields[key] = value[:240]
+    return fields
+
+
 def _extract_fields(message: str, limit: int = 12) -> dict[str, str]:
+    if "=" not in message:
+        return {}
+    if '"' not in message and "'" not in message:
+        return _extract_simple_fields(message, limit)
     fields: dict[str, str] = {}
     for match in _KV_RE.finditer(message):
         key = match.group(1)
@@ -986,8 +1092,8 @@ def _parse_glog(text: str) -> Optional[_ParsedLine]:
 
 def _parse_logcat(text: str) -> Optional[_ParsedLine]:
     match = _LOGCAT_RE.match(text)
-    now = datetime.now()
     if match:
+        now = datetime.now()
         try:
             timestamp = datetime.strptime(
                 f"{now.year:04d}-{match.group('mon')}-{match.group('day')} "
@@ -1031,8 +1137,10 @@ def _parse_rest(
 
     rest = rest.lstrip()
     has_ts = timestamp is not None
+    bracket_first = rest[:1] in "[("
+    bracket_match = _LEVEL_BRACKET_RE.match(rest) if bracket_first else None
 
-    if has_ts:
+    if bracket_match is None and has_ts and not bracket_first:
         match = _SPRING_RE.match(rest)
         if match:
             return _ParsedLine(
@@ -1081,7 +1189,7 @@ def _parse_rest(
                 structured=True,
             )
 
-    match = _LEVEL_BRACKET_RE.match(rest)
+    match = bracket_match
     if match is None:
         # [codeit] / [instrument][info] 这类标签头优先于正文中的级别关键词
         tagged = _parse_bracket_tag(rest, timestamp, timestamp_text)
@@ -1127,10 +1235,7 @@ def _parse_rest(
 
     # 时间戳后可能是 syslog 风格 host app[pid]: message
     if has_ts:
-        match = re.match(
-            r"^(?P<host>[^\s]+)\s+(?P<module>[^\s\[]+)(?:\[(?P<pid>\d+)\])?:\s*(?P<msg>.*)$",
-            rest,
-        )
+        match = _HOST_APP_RE.match(rest)
         if match and _looks_module_token(match.group("module")):
             fields = {"host": match.group("host")}
             if match.group("pid"):
@@ -1146,7 +1251,7 @@ def _parse_rest(
                 structured=bool(timestamp),
             )
 
-    match = re.match(r"^\[([^\]]{0,64})\]\s*[:\-|]?\s*(?P<msg>.*)$", rest)
+    match = _BRACKET_MODULE_RE.match(rest)
     if match:
         message = match.group("msg")
         return _ParsedLine(
@@ -1177,6 +1282,13 @@ def _parse_line(text: str) -> _ParsedLine:
         if parsed is not None:
             return parsed
 
+    first = stripped[:1]
+    checked_timestamp = bool(first) and (first.isdigit() or first in "[(")
+    extracted = _extract_timestamp(stripped) if checked_timestamp else None
+    if extracted:
+        timestamp, _raw_ts, rest = extracted
+        return _parse_rest(rest, timestamp, _format_ts(timestamp))
+
     glog = _parse_glog(stripped)
     if glog is not None:
         return glog
@@ -1184,10 +1296,11 @@ def _parse_line(text: str) -> _ParsedLine:
     if logcat is not None:
         return logcat
 
-    extracted = _extract_timestamp(stripped)
-    if extracted:
-        timestamp, raw_ts, rest = extracted
-        return _parse_rest(rest, timestamp, _format_ts(timestamp))
+    if not checked_timestamp:
+        extracted = _extract_timestamp(stripped)
+        if extracted:
+            timestamp, _raw_ts, rest = extracted
+            return _parse_rest(rest, timestamp, _format_ts(timestamp))
 
     return _parse_rest(stripped, None, "")
 
@@ -1310,10 +1423,12 @@ class _PendingEntry:
     parsed: _ParsedLine
     lines: list[str]
     chars: int
+    sequence_open: bool = False
     omitted: int = 0
     truncated: bool = False
 
-    def append(self, line: str) -> None:
+    def append(self, line: str, numeric: bool = False) -> None:
+        self.sequence_open = numeric or line.rstrip().endswith((",", ":", "="))
         if self.chars >= MAX_ENTRY_CHARS:
             self.omitted += 1
             return
@@ -1344,14 +1459,21 @@ def _finalize_entry(pending: _PendingEntry, seq: int) -> LogEntry:
         raw += f"\n… [已省略 {pending.omitted} 行]"
     fields = dict(pending.parsed.fields)
     continuation = pending.lines[1:]
-    has_sequence_hint = "," in pending.parsed.message or ";" in pending.parsed.message
+    message = pending.parsed.message
+    has_key_hint = "=" in message or ":" in message
+    has_sequence_hint = has_key_hint and (
+        "," in message
+        or ";" in message
+        or any("," in line or ";" in line for line in continuation)
+    )
     if not has_sequence_hint and continuation:
         has_sequence_hint = any(
-            "," in line or ";" in line for line in continuation
+            ("=" in line or ":" in line) and ("," in line or ";" in line)
+            for line in continuation
         )
     # codeit 指令已按 model 拆出参数，避免再生成含义重复的全局序列字段
     if has_sequence_hint and "cmd_id" not in fields:
-        fields.update(_extract_sequence_fields(pending.parsed.message, continuation))
+        fields.update(_extract_sequence_fields(message, continuation))
     return LogEntry(
         seq=seq,
         line_no=pending.line_no,
@@ -1367,6 +1489,107 @@ def _finalize_entry(pending: _PendingEntry, seq: int) -> LogEntry:
     )
 
 
+def _probe_encoding(encoding: str, sample: bytes) -> str:
+    """固定宽度编码在文件中段探测时不能依赖 BOM。"""
+
+    if encoding == "utf-16":
+        return "utf-16-be" if sample.startswith(codecs.BOM_UTF16_BE) else "utf-16-le"
+    if encoding == "utf-32":
+        return "utf-32-be" if sample.startswith(codecs.BOM_UTF32_BE) else "utf-32-le"
+    return encoding
+
+
+def _first_timestamp_in_file(
+    path: Path,
+    encoding: str,
+    file_size: int,
+) -> Optional[datetime]:
+    if file_size <= 0:
+        return None
+    try:
+        with open(path, "rb", buffering=READ_BUFFER_BYTES) as handle:
+            head = handle.read(min(file_size, TIME_SPAN_PROBE_BYTES))
+    except OSError:
+        return None
+    for line in head.decode(encoding, errors="replace").splitlines():
+        matched = _extract_timestamp(line.lstrip())
+        if matched:
+            return matched[0]
+    return None
+
+
+def _last_timestamp_in_file(
+    path: Path,
+    encoding: str,
+    file_size: int,
+) -> Optional[datetime]:
+    if file_size <= 0:
+        return None
+    start = max(0, file_size - TIME_SPAN_PROBE_BYTES)
+    try:
+        with open(path, "rb", buffering=READ_BUFFER_BYTES) as handle:
+            handle.seek(start)
+            tail = handle.read()
+    except OSError:
+        return None
+    lines = tail.decode(encoding, errors="replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]  # 丢弃从行中间开始的片段
+    for line in reversed(lines):
+        matched = _extract_timestamp(line.lstrip())
+        if matched:
+            return matched[0]
+    return None
+
+
+def _find_tail_offset(path: Path, file_size: int, target_lines: int) -> int:
+    """从文件末尾倒推，返回能覆盖 ``target_lines`` 行的起始偏移。"""
+
+    if file_size <= 0 or target_lines <= 0:
+        return 0
+    position = file_size
+    newline_count = 0
+    try:
+        with open(path, "rb", buffering=READ_BUFFER_BYTES) as handle:
+            while position > 0 and newline_count < target_lines:
+                size = min(READ_BUFFER_BYTES, position)
+                position -= size
+                handle.seek(position)
+                newline_count += handle.read(size).count(b"\n")
+            if position <= 0:
+                return 0
+            while position < file_size:
+                handle.seek(position)
+                chunk = handle.read(READ_BUFFER_BYTES)
+                if not chunk:
+                    return 0
+                index = chunk.find(b"\n")
+                if index >= 0:
+                    return position + index + 1
+                position += len(chunk)
+    except OSError:
+        return 0
+    return 0
+
+
+def _count_lines_before(path: Path, offset: int) -> int:
+    if offset <= 0:
+        return 0
+    count = 0
+    remaining = offset
+    try:
+        with open(path, "rb", buffering=READ_BUFFER_BYTES) as handle:
+            while remaining > 0:
+                chunk = handle.read(min(READ_BUFFER_BYTES, remaining))
+                if not chunk:
+                    break
+                count += chunk.count(b"\n")
+                remaining -= len(chunk)
+    except OSError:
+        return 0
+    return count
+
+
 def parse_file(
     path: str | os.PathLike[str],
     *,
@@ -1377,7 +1600,8 @@ def parse_file(
 ) -> ParseResult:
     """流式解析日志文件。
 
-    ``progress`` 参数：``(已读字节, 文件总字节, 已解析条目数)``。
+    ``progress`` 参数：``(已读字节, 本次扫描总字节, 已解析条目数)``；
+    大文件只扫描末尾窗口时，总字节是窗口大小而不是文件大小。
     ``should_cancel`` 返回 True 时抛出 :class:`ParseCancelled`。
     指定 ``time_start`` / ``time_end`` 时只保留该时间范围内的日志，
     用于超过 300,000 条、较早记录已被截断时按时间段重新读取。
@@ -1437,6 +1661,36 @@ def parse_file(
             "可能不是文本日志。"
         )
 
+    time_filter_active = time_start is not None or time_end is not None
+    scan_mode = "range" if time_filter_active else "full"
+    start_offset = 0
+    tail_supported = not encoding.startswith(("utf-16", "utf-32"))
+    if (
+        tail_supported
+        and not time_filter_active
+        and stat.st_size >= TAIL_SCAN_THRESHOLD
+    ):
+        target_lines = max(1, int(MAX_ENTRIES * TAIL_WINDOW_FACTOR))
+        start_offset = _find_tail_offset(file_path, stat.st_size, target_lines)
+        if start_offset > 0:
+            scan_mode = "tail"
+    prefix_lines = (
+        _count_lines_before(file_path, start_offset) if start_offset > 0 else 0
+    )
+
+    # 只解析末尾窗口或指定时间段时，额外探测整个文件的时间跨度；
+    # 完整解析可以直接从解析结果得到，无需重复读文件。
+    source_first_ts: Optional[datetime] = None
+    source_last_ts: Optional[datetime] = None
+    if scan_mode != "full":
+        chunk_encoding = _probe_encoding(encoding, sample)
+        source_first_ts = _first_timestamp_in_file(
+            file_path, chunk_encoding, stat.st_size
+        )
+        source_last_ts = _last_timestamp_in_file(
+            file_path, chunk_encoding, stat.st_size
+        )
+
     # 超过上限时丢弃最早记录，始终保留最近的 MAX_ENTRIES 条
     entries: deque[LogEntry] = deque(maxlen=MAX_ENTRIES)
     produced = 0
@@ -1452,12 +1706,14 @@ def parse_file(
     truncated_entries = 0
     first_ts: Optional[datetime] = None
     last_ts: Optional[datetime] = None
-    source_first_ts: Optional[datetime] = None
-    source_last_ts: Optional[datetime] = None
-    time_filter_active = time_start is not None or time_end is not None
+    last_seen_ts: Optional[datetime] = None
+    timestamps_monotonic = True
+    beyond_end_streak = 0
+    stop_requested = False
 
     def track_source(entry: LogEntry) -> None:
         nonlocal source_first_ts, source_last_ts
+        nonlocal last_seen_ts, timestamps_monotonic
         moment = entry.timestamp
         if moment is None:
             return
@@ -1465,6 +1721,28 @@ def parse_file(
             source_first_ts = moment
         if source_last_ts is None or moment > source_last_ts:
             source_last_ts = moment
+        if time_filter_active:
+            if last_seen_ts is not None and moment < last_seen_ts:
+                timestamps_monotonic = False
+            last_seen_ts = moment
+
+    def note_time_progress(entry: LogEntry) -> None:
+        """时间范围解析时，日志已明显越过结束时间就提前收尾。"""
+
+        nonlocal beyond_end_streak, stop_requested
+        if stop_requested or not time_filter_active or time_end is None:
+            return
+        if not timestamps_monotonic:
+            return
+        moment = entry.timestamp
+        if moment is None:
+            return
+        if moment > time_end:
+            beyond_end_streak += 1
+            if beyond_end_streak >= RANGE_EARLY_STOP_STREAK:
+                stop_requested = True
+        else:
+            beyond_end_streak = 0
 
     def keep_entry(entry: LogEntry) -> bool:
         if not time_filter_active:
@@ -1495,6 +1773,7 @@ def parse_file(
         entry = _finalize_entry(pending, produced)
         produced += 1
         track_source(entry)
+        note_time_progress(entry)
         if structured:
             last_context = _Context(
                 timestamp=entry.timestamp,
@@ -1545,19 +1824,26 @@ def parse_file(
         )
         produced += 1
         track_source(entry)
+        note_time_progress(entry)
         if keep_entry(entry):
             entries.append(entry)
             kept_total += 1
 
     last_progress = 0.0
+    scanned_total = max(0, stat.st_size - start_offset)
     try:
-        with open(file_path, "rb") as binary:
+        with open(file_path, "rb", buffering=READ_BUFFER_BYTES) as binary:
+            if start_offset:
+                binary.seek(start_offset)
             with io.TextIOWrapper(
                 binary, encoding=encoding, errors="replace", newline=None
             ) as reader:
-                for line_no, line in enumerate(reader, start=1):
+                for scanned_index, line in enumerate(reader, start=1):
+                    if stop_requested:
+                        break
+                    line_no = prefix_lines + scanned_index
                     total_lines = line_no
-                    if line_no % 2048 == 0:
+                    if scanned_index % 2048 == 0:
                         if should_cancel is not None and should_cancel():
                             raise ParseCancelled("已取消加载")
                         if progress is not None:
@@ -1565,22 +1851,33 @@ def parse_file(
                             if now - last_progress >= 0.08:
                                 last_progress = now
                                 progress(
-                                    min(binary.tell(), stat.st_size),
-                                    stat.st_size,
+                                    max(
+                                        0,
+                                        min(
+                                            binary.tell() - start_offset,
+                                            scanned_total,
+                                        ),
+                                    ),
+                                    scanned_total,
                                     len(entries),
                                 )
 
                     text = line.rstrip("\r\n")
-                    if not text.strip():
+                    stripped_text = text.strip()
+                    if not stripped_text:
                         blank_lines += 1
                         continue
 
-                    if _is_table_border(text):
+                    if stripped_text[:1] == "+" and _is_table_border(stripped_text):
                         if pending is not None:
                             flush()
                         continue
 
-                    cells = _split_table_row(text)
+                    cells = (
+                        _split_table_row(stripped_text)
+                        if stripped_text[:1] == "|"
+                        else None
+                    )
                     if cells is not None:
                         if pending is not None:
                             flush()
@@ -1627,17 +1924,11 @@ def parse_file(
                     if (
                         pending is not None
                         and pending.parsed.structured
+                        and pending.sequence_open
                         and _is_numeric_line(text)
                     ):
-                        last_line = pending.lines[-1].strip() if pending.lines else ""
-                        opens_sequence = (
-                            last_line.endswith((":", "="))
-                            or _is_numeric_line(last_line)
-                            or pending.parsed.message.rstrip().endswith((",", ":", "="))
-                        )
-                        if opens_sequence:
-                            pending.append(text)
-                            continue
+                        pending.append(text, numeric=True)
+                        continue
 
                     flush()
 
@@ -1651,6 +1942,10 @@ def parse_file(
                         lines=[text],
                         chars=len(text) + 1,
                     )
+                    pending.sequence_open = (
+                        text.rstrip().endswith((",", ":", "="))
+                        or parsed.message.rstrip().endswith((",", ":", "="))
+                    )
                     for extra in parsed.extra_lines:
                         pending.append(extra)
 
@@ -1661,36 +1956,51 @@ def parse_file(
         raise ParseError(f"读取文件失败：{exc}") from exc
 
     if progress is not None:
-        progress(stat.st_size, stat.st_size, len(entries))
+        progress(scanned_total, scanned_total, len(entries))
 
-    dropped_entries = max(0, kept_total - len(entries))
-    truncated = dropped_entries > 0
-    if truncated:
-        if time_filter_active:
-            truncation_reason = (
-                f"所选时间范围内日志条目超过 {MAX_ENTRIES:,} 条上限，"
-                f"仅保留最近 {MAX_ENTRIES:,} 条"
-                f"（范围内共 {kept_total:,} 条，已忽略最早 {dropped_entries:,} 条）"
+    kept_entries = list(entries)
+    if scan_mode == "tail":
+        truncated = True
+        truncation_reason = (
+            f"文件较大，已从末尾解析最近 {len(kept_entries):,} 条日志"
+            f"（最多保留 {MAX_ENTRIES:,} 条）"
+        )
+        if source_first_ts is not None and source_last_ts is not None:
+            truncation_reason += (
+                f"；文件时间范围 "
+                f"{source_first_ts:%Y-%m-%d %H:%M:%S} → "
+                f"{source_last_ts:%Y-%m-%d %H:%M:%S}"
             )
-        else:
-            truncation_reason = (
-                f"日志条目超过 {MAX_ENTRIES:,} 条上限，仅保留最近 {MAX_ENTRIES:,} 条"
-                f"（已忽略最早 {dropped_entries:,} 条）"
-            )
-
-    timestamps = [entry.timestamp for entry in entries if entry.timestamp is not None]
-    if timestamps:
-        first_ts = min(timestamps)
-        last_ts = max(timestamps)
     else:
-        first_ts = None
-        last_ts = None
+        dropped_entries = max(0, kept_total - len(entries))
+        truncated = dropped_entries > 0
+        if truncated:
+            if time_filter_active:
+                truncation_reason = (
+                    f"所选时间范围内日志条目超过 {MAX_ENTRIES:,} 条上限，"
+                    f"仅保留最近 {MAX_ENTRIES:,} 条"
+                    f"（范围内共 {kept_total:,} 条，已忽略最早 {dropped_entries:,} 条）"
+                )
+            else:
+                truncation_reason = (
+                    f"日志条目超过 {MAX_ENTRIES:,} 条上限，仅保留最近 {MAX_ENTRIES:,} 条"
+                    f"（已忽略最早 {dropped_entries:,} 条）"
+                )
+
+    for entry in kept_entries:
+        moment = entry.timestamp
+        if moment is None:
+            continue
+        if first_ts is None or moment < first_ts:
+            first_ts = moment
+        if last_ts is None or moment > last_ts:
+            last_ts = moment
 
     return ParseResult(
         path=file_path,
         encoding=encoding,
         file_size=stat.st_size,
-        entries=list(entries),
+        entries=kept_entries,
         total_lines=total_lines,
         blank_lines=blank_lines,
         unstructured_entries=unstructured,
@@ -1702,4 +2012,6 @@ def parse_file(
         last_timestamp=last_ts,
         source_first_timestamp=source_first_ts,
         source_last_timestamp=source_last_ts,
+        scan_mode=scan_mode,
+        scan_offset=start_offset,
     )

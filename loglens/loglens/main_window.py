@@ -46,7 +46,6 @@ from .analysis import (
     build_pattern,
     export_entries,
     filter_entries,
-    level_counts,
     summarize,
 )
 from .icons import app_icon, icon, logo_pixmap
@@ -949,10 +948,11 @@ class MainWindow(QMainWindow):
         self._file_chip_name.setToolTip(str(result.path))
         self.setWindowTitle(f"{result.path.name} · {__app_title__}")
         self.sidebar.set_result(result)
+        self.level_filter.set_file_time_span(result.source_time_range_text)
         if reset_levels:
-            self.level_filter.set_counts(level_counts(result.entries), set(LEVELS))
+            self.level_filter.set_counts(result.level_counts, set(LEVELS))
         else:
-            self.level_filter.set_counts(level_counts(result.entries))
+            self.level_filter.set_counts(result.level_counts)
         self.level_filter.set_time_filter(self._time_start, self._time_end)
 
         warnings: list[str] = []
@@ -1248,9 +1248,10 @@ class MainWindow(QMainWindow):
         self._time_start = None
         self._time_end = None
         self.level_filter.set_time_filter(None, None)
+        self.level_filter.set_file_time_span("")
         if self._result is not None:
             self.level_filter.set_counts(
-                level_counts(self._result.entries), set(LEVELS)
+                self._result.level_counts, set(LEVELS)
             )
         else:
             self.level_filter.set_counts({}, set(LEVELS))
@@ -1358,7 +1359,11 @@ class MainWindow(QMainWindow):
             self._set_search_invalid(False)
             self._query = query
             self._matched = matched
-            summary = summarize(self._result.entries, matched)
+            summary = summarize(
+                self._result.entries,
+                matched,
+                total_level_counts=self._result.level_counts,
+            )
         finally:
             if heavy:
                 QApplication.restoreOverrideCursor()
@@ -1941,9 +1946,10 @@ def _help_html() -> str:
     以及 key 行后跟多行数值的 4x4 矩阵都会提取为字段；多行数值自动归并为同一条日志。</p>
 
     <h3>8. 大文件保护</h3>
-    <p>超过 100 MB 的文件会在加载前确认；超过 300,000 条时只保留最近 300,000 条
-    （会扫描整个文件，可随时取消）。如果时间筛选选择的范围早于保留范围，
-    会自动按该时间段重新读取文件，只显示该范围内的日志；清除时间筛选后恢复最近
+    <p>超过 100 MB 的文件会在加载前确认。较大的日志会直接从文件末尾定位并解析
+    最近 300,000 条（不再从文件头读完整份文件），同时额外读取文件头尾以得到
+    <b>整个文件的完整时间跨度</b>，时间筛选仍可定位到任意时间段；如果选择的
+    范围早于已加载窗口，会自动按该时间段重新读取文件。清除时间筛选后恢复最近
     300,000 条。单条日志超过 128 KB 会截断堆栈。界面始终保留完整筛选与导出能力。</p>
 
     <p class="muted">LogLens v{{VERSION}} · PyQt5 · 本地离线运行</p>

@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -72,11 +72,17 @@ class UIBase(unittest.TestCase):
         QApplication.processEvents()
 
     def load(self, path: Path, timeout: float = 20.0):
+        target = Path(path).resolve()
         self.window.load_file(str(path), confirm_large=False)
         deadline = time.time() + timeout
         while time.time() < deadline:
             QApplication.processEvents()
-            if self.window.result is not None and not self.window.is_loading:
+            result = self.window.result
+            if (
+                result is not None
+                and result.path.resolve() == target
+                and not self.window.is_loading
+            ):
                 QTest.qWait(20)
                 return
             QTest.qWait(5)
@@ -111,6 +117,53 @@ class LoadAndGroupTests(UIBase):
         self.assertEqual(self.window.summary.total_level_counts["ERROR"], 96)
         self.assertEqual(self.window.summary.total_level_counts["CRITICAL"], 20)
         self.assertEqual(self.window.tree.verticalScrollBar().value(), 0)
+
+    def test_source_card_shows_full_file_time_span(self):
+        result = self.window.result
+        self.assertIsNotNone(result)
+        self.assertEqual(result.scan_mode, "full")
+        self.assertTrue(result.source_time_range_text)
+        label = self.window.sidebar.source._range
+        self.assertTrue(label.isVisible())
+        self.assertIn("文件时间范围", label.text())
+        self.assertIn(
+            result.source_time_range_text.replace(" → ", "  →  "), label.text()
+        )
+
+    def test_tail_load_shows_full_file_time_span(self):
+        total = 400
+        base = datetime(2026, 11, 19, 9, 0, 0)
+        content = "".join(
+            f"{(base + timedelta(seconds=index)):%Y-%m-%d %H:%M:%S} "
+            f"INFO core line {index}\n"
+            for index in range(total)
+        )
+        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
+        handle.write(content.encode("utf-8"))
+        handle.close()
+        try:
+            with mock.patch.object(parser_module, "MAX_ENTRIES", 20), mock.patch.object(
+                parser_module, "TAIL_SCAN_THRESHOLD", 512
+            ), mock.patch.object(parser_module, "READ_BUFFER_BYTES", 1024):
+                self.load(Path(handle.name))
+            result = self.window.result
+            self.assertEqual(result.scan_mode, "tail")
+            self.assertEqual(result.entry_count, 20)
+            self.assertEqual(result.total_lines, total)
+            self.assertEqual(result.first_timestamp, base + timedelta(seconds=380))
+            self.assertEqual(result.source_first_timestamp, base)
+            self.assertEqual(
+                result.source_last_timestamp, base + timedelta(seconds=total - 1)
+            )
+            expected = result.source_time_range_text.replace(" → ", "  →  ")
+            self.assertIn(expected, self.window.sidebar.source._range.text())
+            self.assertIn("文件时间范围", self.window._banner_label.text())
+            self.assertIn(
+                result.source_time_range_text,
+                self.window.level_filter._time_chip.toolTip(),
+            )
+        finally:
+            os.unlink(handle.name)
 
     def test_level_group_counts(self):
         expected = {"TRACE": 15, "DEBUG": 283, "INFO": 647, "WARNING": 139, "ERROR": 96, "CRITICAL": 20}

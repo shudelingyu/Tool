@@ -1163,8 +1163,14 @@ class SourceCard(QFrame):
         layout.addWidget(self._meta)
         self._range = QLabel("")
         self._range.setObjectName("SourceMeta")
+        self._range.setWordWrap(True)
         self._range.setVisible(False)
         layout.addWidget(self._range)
+        self._loaded_range = QLabel("")
+        self._loaded_range.setObjectName("SourceMeta")
+        self._loaded_range.setWordWrap(True)
+        self._loaded_range.setVisible(False)
+        layout.addWidget(self._loaded_range)
 
     def set_result(self, result: ParseResult) -> None:
         self._icon.setPixmap(icon("file", ACCENT, 20).pixmap(20, 20))
@@ -1179,12 +1185,26 @@ class SourceCard(QFrame):
         )
         self._meta.setText(meta)
         self._meta.setVisible(True)
-        time_range = result.time_range_text
-        if time_range:
-            self._range.setText(time_range.replace(" → ", "  →  "))
+        file_range = result.source_time_range_text
+        if file_range:
+            self._range.setText(
+                f"文件时间范围  {file_range.replace(' → ', '  →  ')}"
+            )
+            self._range.setToolTip(
+                "文件中全部日志的时间跨度；时间筛选弹窗按此范围定位。"
+            )
             self._range.setVisible(True)
         else:
             self._range.setVisible(False)
+
+        loaded_range = result.time_range_text
+        if loaded_range and (not file_range or loaded_range != file_range):
+            self._loaded_range.setText(
+                f"当前显示  {loaded_range.replace(' → ', '  →  ')}"
+            )
+            self._loaded_range.setVisible(True)
+        else:
+            self._loaded_range.setVisible(False)
 
     def clear(self) -> None:
         self._icon.setPixmap(icon("file", FAINT, 20).pixmap(20, 20))
@@ -1193,6 +1213,7 @@ class SourceCard(QFrame):
         self._encoding.setVisible(False)
         self._meta.setVisible(False)
         self._range.setVisible(False)
+        self._loaded_range.setVisible(False)
 
 
 class StatsSidebar(QWidget):
@@ -1315,7 +1336,7 @@ class TimeRangeDialog(QDialog):
         )
         if file_start is not None and file_end is not None:
             hint_text += (
-                f"\n文件时间范围：{file_start:%Y-%m-%d %H:%M:%S}"
+                f"\n文件完整时间范围：{file_start:%Y-%m-%d %H:%M:%S}"
                 f" → {file_end:%Y-%m-%d %H:%M:%S}"
             )
         if file_truncated:
@@ -1453,6 +1474,7 @@ class LevelFilterBar(QFrame):
         self._time_chip.clicked.connect(lambda: self.timeFilterRequested.emit())
         self._time_since: Optional[datetime] = None
         self._time_until: Optional[datetime] = None
+        self._file_span_text = ""
         self._level_widgets: list[QWidget] = []
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.setFixedHeight(35)
@@ -1602,8 +1624,14 @@ class LevelFilterBar(QFrame):
         else:
             text = "时间"
             tip = "选择时间范围"
+        if self._file_span_text:
+            tip += f"\n文件完整时间范围：{self._file_span_text}"
         self._time_chip.setText(text)
         self._time_chip.setToolTip(tip)
+
+    def set_file_time_span(self, text: str) -> None:
+        self._file_span_text = text
+        self._refresh_time_chip()
 
     def current_active(self) -> set[str]:
         return set(self._active)

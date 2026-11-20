@@ -275,8 +275,10 @@ def format_bucket_label(start: datetime, step: int) -> str:
     return f"{start:%Y-%m-%d}"
 
 
-def build_histogram(entries: Sequence[LogEntry], missing: int = 0) -> Optional[TimeHistogram]:
-    timestamps = [entry.timestamp for entry in entries if entry.timestamp is not None]
+def _histogram_from_timestamps(
+    timestamps: list[datetime],
+    missing: int = 0,
+) -> Optional[TimeHistogram]:
     if not timestamps:
         return None
     first = min(timestamps)
@@ -303,6 +305,11 @@ def build_histogram(entries: Sequence[LogEntry], missing: int = 0) -> Optional[T
         first=first,
         last=last,
     )
+
+
+def build_histogram(entries: Sequence[LogEntry], missing: int = 0) -> Optional[TimeHistogram]:
+    timestamps = [entry.timestamp for entry in entries if entry.timestamp is not None]
+    return _histogram_from_timestamps(timestamps, missing)
 
 
 # ---------------------------------------------------------------------------
@@ -368,17 +375,40 @@ class Summary:
         return self.level_counts.get("WARNING", 0)
 
 
-def summarize(all_entries: Sequence[LogEntry], matched: Sequence[LogEntry]) -> Summary:
-    missing = sum(1 for entry in matched if entry.timestamp is None)
-    modules = module_counts(matched)
+def summarize(
+    all_entries: Sequence[LogEntry],
+    matched: Sequence[LogEntry],
+    total_level_counts: Optional[dict[str, int]] = None,
+) -> Summary:
+    """一次遍历完成缺失时间、模块、级别与直方图统计。"""
+
+    missing = 0
+    module_counter: Counter[str] = Counter()
+    level_counter: Counter[str] = Counter()
+    timestamps: list[datetime] = []
+    for entry in matched:
+        moment = entry.timestamp
+        if moment is None:
+            missing += 1
+        else:
+            timestamps.append(moment)
+        module_counter[entry.module] += 1
+        level_counter[entry.level] += 1
+
+    modules = sorted(
+        module_counter.items(), key=lambda item: (-item[1], item[0].lower())
+    )
+    matched_counts = {level: level_counter.get(level, 0) for level in LEVELS}
+    if total_level_counts is None:
+        total_level_counts = level_counts(all_entries)
     return Summary(
         total=len(all_entries),
         matched=len(matched),
-        level_counts=level_counts(matched),
-        total_level_counts=level_counts(all_entries),
+        level_counts=matched_counts,
+        total_level_counts=total_level_counts,
         top_modules=modules[:8],
         module_total=len(modules),
-        histogram=build_histogram(matched, missing),
+        histogram=_histogram_from_timestamps(timestamps, missing),
         missing_timestamps=missing,
         fields=compute_field_stats(matched),
     )

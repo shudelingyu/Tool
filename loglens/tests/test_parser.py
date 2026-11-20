@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest import mock
 
 from loglens import parser as parser_module
@@ -523,6 +523,69 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(len(limited.entries), 2)
         self.assertTrue(limited.truncated)
         self.assertIn("范围内共 4 条", limited.truncation_reason)
+
+    def test_tail_scan_keeps_recent_and_full_span(self):
+        total = 500
+        base = datetime(2026, 11, 19, 9, 0, 0)
+        content = "".join(
+            f"{(base + timedelta(seconds=index)):%Y-%m-%d %H:%M:%S} "
+            f"INFO core line {index}\n"
+            for index in range(total)
+        )
+        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
+        handle.write(content.encode("utf-8"))
+        handle.close()
+        try:
+            with mock.patch.object(parser_module, "MAX_ENTRIES", 50), mock.patch.object(
+                parser_module, "TAIL_SCAN_THRESHOLD", 1024
+            ), mock.patch.object(parser_module, "READ_BUFFER_BYTES", 4096):
+                result = parse_file(handle.name)
+        finally:
+            os.unlink(handle.name)
+
+        self.assertEqual(result.scan_mode, "tail")
+        self.assertEqual(len(result.entries), 50)
+        self.assertEqual(result.entries[0].message, "core line 450")
+        self.assertEqual(result.entries[-1].message, "core line 499")
+        self.assertEqual(result.total_lines, total)
+        self.assertTrue(result.truncated)
+        self.assertIn("文件时间范围", result.truncation_reason)
+        self.assertEqual(result.first_timestamp, base + timedelta(seconds=450))
+        self.assertEqual(result.last_timestamp, base + timedelta(seconds=499))
+        self.assertEqual(result.source_first_timestamp, base)
+        self.assertEqual(result.source_last_timestamp, base + timedelta(seconds=499))
+
+    def test_time_window_stops_early_after_end(self):
+        total = 5000
+        base = datetime(2026, 11, 19, 9, 0, 0)
+        content = "".join(
+            f"{(base + timedelta(seconds=index)):%Y-%m-%d %H:%M:%S} "
+            f"INFO core line {index}\n"
+            for index in range(total)
+        )
+        handle = tempfile.NamedTemporaryFile(delete=False, suffix=".log")
+        handle.write(content.encode("utf-8"))
+        handle.close()
+        try:
+            with mock.patch.object(parser_module, "RANGE_EARLY_STOP_STREAK", 10):
+                result = parse_file(
+                    handle.name,
+                    time_start=base,
+                    time_end=base + timedelta(seconds=5),
+                )
+        finally:
+            os.unlink(handle.name)
+
+        self.assertEqual(
+            [entry.message for entry in result.entries],
+            [f"core line {index}" for index in range(6)],
+        )
+        self.assertEqual(result.scan_mode, "range")
+        self.assertLess(result.total_lines, total)
+        self.assertEqual(result.last_timestamp, base + timedelta(seconds=5))
+        self.assertEqual(
+            result.source_last_timestamp, base + timedelta(seconds=total - 1)
+        )
 
     def test_cancel(self):
         content = "".join(f"2026-11-19 09:00:00 INFO core line {i}\n" for i in range(5000))
