@@ -83,6 +83,26 @@ _SVGS = {
     "axis": (
         '<path d="M5 19V5"/><path d="M5 19h14"/><path d="M5 19l7-7"/>'
     ),
+    "vector": (
+        '<path d="M5 19L18.4 5.6"/>'
+        '<path d="M12.6 5.6h5.8v5.8"/>'
+        '<circle cx="5" cy="19" r="1.5" fill="{color}" stroke="none"/>'
+    ),
+    "calc": (
+        '<rect x="4.5" y="3.5" width="15" height="17" rx="2.2"/>'
+        '<path d="M8 8h8"/>'
+        '<path d="M8 12v.01M12 12v.01M16 12v.01"/>'
+        '<path d="M8 16v.01M12 16v.01M16 16v.01"/>'
+    ),
+    "ruler": (
+        '<path d="M4.5 15.5L15.5 4.5l4 4L8.5 19.5z"/>'
+        '<path d="M8.5 11.5l1.6 1.6M11 9l1.6 1.6M13.5 6.5l1.6 1.6"/>'
+    ),
+    "camera": (
+        '<rect x="3.5" y="7" width="17" height="12.5" rx="2.2"/>'
+        '<path d="M8.5 7l1.4-2.4h4.2L15.5 7"/>'
+        '<circle cx="12" cy="13.2" r="3.4"/>'
+    ),
 }
 
 

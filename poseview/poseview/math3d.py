@@ -101,8 +101,53 @@ def parse_poses(text: str, mode: str = "matrix") -> list[Pose]:
             _pose_from_position_euler,
             "位置 + 欧拉角每帧需要 6 个数字（x y z roll pitch yaw，度）",
         )
+    if mode == "rotvec":
+        return _parse_fixed_blocks(
+            text,
+            6,
+            _pose_from_position_rotation_vector,
+            "位置 + 旋转向量每帧需要 6 个数字（x y z rx ry rz，弧度）",
+        )
     matrices = parse_matrices(text)
     return [Pose(matrix) for matrix in matrices]
+
+
+def parse_vectors(
+    text: str, mode: str = "direction"
+) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
+    """解析向量输入，返回 (起点, 方向) 列表。
+
+    每行 6 个数：起点 x y z + 方向 x y z；mode="end" 时后三个数为终点。
+    """
+    if not text or not text.strip():
+        raise MatrixParseError("请输入向量数据")
+
+    vectors: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+    use_end = mode == "end"
+    for index, block in enumerate(_split_blocks(text), start=1):
+        numbers = _numbers(block)
+        if not numbers:
+            continue
+        if len(numbers) % 6 != 0:
+            raise MatrixParseError(
+                f"第 {index} 段共 {len(numbers)} 个数字，向量每行需要 6 个数字"
+                "（起点 x y z + 方向/终点 x y z）"
+            )
+        for offset in range(0, len(numbers), 6):
+            start = (numbers[offset], numbers[offset + 1], numbers[offset + 2])
+            second = numbers[offset + 3 : offset + 6]
+            if use_end:
+                direction = tuple(second[i] - start[i] for i in range(3))
+                if vector_length(direction) < 1e-9:
+                    raise MatrixParseError("起点与终点重合，无法构成向量")
+            else:
+                direction = (second[0], second[1], second[2])
+                if vector_length(direction) < 1e-9:
+                    raise MatrixParseError("向量方向为零向量")
+            vectors.append((start, direction))
+    if not vectors:
+        raise MatrixParseError("没有识别到向量数据")
+    return vectors
 
 
 def parse_matrices(text: str) -> list[list[list[float]]]:
@@ -225,6 +270,12 @@ def _pose_from_position_euler(values: list[float]) -> Pose:
     return Pose(_assemble_matrix(rotation, (x, y, z)))
 
 
+def _pose_from_position_rotation_vector(values: list[float]) -> Pose:
+    x, y, z, rx, ry, rz = values
+    rotation = rotation_from_rotation_vector(rx, ry, rz)
+    return Pose(_assemble_matrix(rotation, (x, y, z)))
+
+
 def _assemble_matrix(
     rotation: list[list[float]], position: tuple[float, float, float]
 ) -> list[list[float]]:
@@ -263,6 +314,190 @@ def rotation_from_euler(roll: float, pitch: float, yaw: float) -> list[list[floa
         [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
         [-sy, cy * sx, cy * cx],
     ]
+
+
+def rotation_from_rotation_vector(
+    rx: float, ry: float, rz: float
+) -> list[list[float]]:
+    """由旋转向量（轴 × 弧度）构造旋转矩阵（Rodrigues 公式）。"""
+    angle = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if angle < 1e-12:
+        return _identity_rotation()
+    kx, ky, kz = rx / angle, ry / angle, rz / angle
+    c, s = math.cos(angle), math.sin(angle)
+    v = 1.0 - c
+    return [
+        [c + kx * kx * v, kx * ky * v - kz * s, kx * kz * v + ky * s],
+        [ky * kx * v + kz * s, c + ky * ky * v, ky * kz * v - kx * s],
+        [kz * kx * v - ky * s, kz * ky * v + kx * s, c + kz * kz * v],
+    ]
+
+
+def axis_angle_from_rotation(
+    rotation: list[list[float]],
+) -> tuple[tuple[float, float, float], float]:
+    """由旋转矩阵求单位转轴与角度（度）。零旋转返回 X 轴、0°。"""
+    w, x, y, z = quaternion_from_rotation(rotation)
+    sin_half = math.sqrt(x * x + y * y + z * z)
+    if sin_half < 1e-12:
+        return (1.0, 0.0, 0.0), 0.0
+    angle = math.degrees(2.0 * math.atan2(sin_half, w))
+    return (x / sin_half, y / sin_half, z / sin_half), angle
+
+
+def rotation_vector_from_rotation(
+    rotation: list[list[float]],
+) -> tuple[float, float, float]:
+    """由旋转矩阵求旋转向量（轴 × 弧度）。"""
+    axis, angle = axis_angle_from_rotation(rotation)
+    radians = math.radians(angle)
+    return (axis[0] * radians, axis[1] * radians, axis[2] * radians)
+
+
+def transform_point(
+    matrix: list[list[float]], point: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    """用齐次变换矩阵变换点：p' = R·p + t。"""
+    return tuple(
+        matrix[row][0] * point[0]
+        + matrix[row][1] * point[1]
+        + matrix[row][2] * point[2]
+        + matrix[row][3]
+        for row in range(3)
+    )
+
+
+def transform_vector(
+    matrix: list[list[float]], vector: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    """用齐次变换矩阵变换方向向量：v' = R·v。"""
+    return tuple(
+        matrix[row][0] * vector[0]
+        + matrix[row][1] * vector[1]
+        + matrix[row][2] * vector[2]
+        for row in range(3)
+    )
+
+
+def matrix_properties(
+    matrix: list[list[float]],
+) -> tuple[float, float, float]:
+    """返回 (旋转部分行列式, 正交误差, 迹)。"""
+    rotation = [row[:3] for row in matrix[:3]]
+    determinant = (
+        rotation[0][0]
+        * (rotation[1][1] * rotation[2][2] - rotation[1][2] * rotation[2][1])
+        - rotation[0][1]
+        * (rotation[1][0] * rotation[2][2] - rotation[1][2] * rotation[2][0])
+        + rotation[0][2]
+        * (rotation[1][0] * rotation[2][1] - rotation[1][1] * rotation[2][0])
+    )
+    error = 0.0
+    for i in range(3):
+        for j in range(3):
+            dot = sum(rotation[k][i] * rotation[k][j] for k in range(3))
+            target = 1.0 if i == j else 0.0
+            error = max(error, abs(dot - target))
+    trace = rotation[0][0] + rotation[1][1] + rotation[2][2]
+    return determinant, error, trace
+
+
+def quaternion_multiply(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    w1, x1, y1, z1 = first
+    w2, x2, y2, z2 = second
+    return (
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    )
+
+
+def quaternion_conjugate(
+    quaternion: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    w, x, y, z = quaternion
+    return (w, -x, -y, -z)
+
+
+def slerp_quaternion(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+    t: float,
+) -> tuple[float, float, float, float]:
+    """四元数球面插值（取最短路径）。"""
+    t = max(0.0, min(1.0, t))
+    dot = sum(a * b for a, b in zip(first, second))
+    if dot < 0.0:
+        second = tuple(-value for value in second)
+        dot = -dot
+    dot = max(-1.0, min(1.0, dot))
+    if dot > 0.9995:
+        result = tuple(first[i] + (second[i] - first[i]) * t for i in range(4))
+        length = math.sqrt(sum(value * value for value in result))
+        if length < 1e-12:
+            return first
+        return tuple(value / length for value in result)
+    theta = math.acos(dot)
+    sin_theta = math.sin(theta)
+    weight_first = math.sin((1.0 - t) * theta) / sin_theta
+    weight_second = math.sin(t * theta) / sin_theta
+    return tuple(
+        first[i] * weight_first + second[i] * weight_second for i in range(4)
+    )
+
+
+def vector_cross(first, second) -> tuple[float, float, float]:
+    """两个三维向量的叉积。"""
+    return (
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    )
+
+
+def project_vector(first, second) -> tuple[float, float, float]:
+    """向量 first 在 second 上的投影。"""
+    length_sq = sum(value * value for value in second)
+    if length_sq < 1e-18:
+        return (0.0, 0.0, 0.0)
+    scale = sum(a * b for a, b in zip(first, second)) / length_sq
+    return (second[0] * scale, second[1] * scale, second[2] * scale)
+
+
+def solve_linear(
+    matrix: list[list[float]], vector: list[float]
+) -> list[float] | None:
+    """高斯-约当消元求解 A·x = b，奇异时返回 None。"""
+    size = len(vector)
+    augmented = [
+        [float(value) for value in matrix[row]] + [float(vector[row])]
+        for row in range(size)
+    ]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda row: abs(augmented[row][column]))
+        if abs(augmented[pivot][column]) < 1e-12:
+            return None
+        if pivot != column:
+            augmented[column], augmented[pivot] = (
+                augmented[pivot],
+                augmented[column],
+            )
+        divisor = augmented[column][column]
+        for index in range(column, size + 1):
+            augmented[column][index] /= divisor
+        for row in range(size):
+            if row == column:
+                continue
+            factor = augmented[row][column]
+            if abs(factor) < 1e-15:
+                continue
+            for index in range(column, size + 1):
+                augmented[row][index] -= factor * augmented[column][index]
+    return [augmented[row][size] for row in range(size)]
 
 
 def pose_values(matrix: list[list[float]]) -> PoseValues:
@@ -323,6 +558,24 @@ def rotation_angle_between(
     trace = sum(first[k][i] * second[k][i] for i in range(3) for k in range(3))
     cosine = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
     return math.degrees(math.acos(cosine))
+
+
+def vector_length(vector) -> float:
+    return math.sqrt(sum(value * value for value in vector))
+
+
+def angle_between_vectors(first, second) -> float:
+    """两个三维向量的夹角（度，0~180）。"""
+    length_first = vector_length(first)
+    length_second = vector_length(second)
+    if length_first < 1e-12 or length_second < 1e-12:
+        raise MatrixParseError("存在零向量，无法计算夹角")
+    cosine = sum(a * b for a, b in zip(first, second)) / (length_first * length_second)
+    return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+
+
+def vector_dot(first, second) -> float:
+    return sum(a * b for a, b in zip(first, second))
 
 
 def quaternion_from_rotation(rotation: list[list[float]]) -> tuple[float, float, float, float]:

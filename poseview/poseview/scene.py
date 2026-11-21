@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
+from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QFont,
@@ -32,8 +32,20 @@ POSE_COLORS = [
     "#FB7185",
 ]
 
+VECTOR_COLORS = [
+    "#FDE047",
+    "#FB7185",
+    "#38BDF8",
+    "#A3E635",
+    "#FB923C",
+    "#C084FC",
+]
+
 AXIS_COLORS = ("#F87171", "#4ADE80", "#60A5FA")
 AXIS_LABELS = ("X", "Y", "Z")
+
+# 三角面超过该数量时，交互（拖动/缩放）期间不绘制外观，避免逐面绘制掉帧。
+INTERACTIVE_TRIANGLE_LIMIT = 6000
 
 
 @dataclass
@@ -43,6 +55,55 @@ class ScenePose:
     position: tuple[float, float, float]
     rotation: list[list[float]]
     visible: bool = True
+
+
+@dataclass
+class SceneVector:
+    name: str
+    color: str
+    start: tuple[float, float, float]
+    direction: tuple[float, float, float]
+    visible: bool = True
+
+    @property
+    def end(self) -> tuple[float, float, float]:
+        return (
+            self.start[0] + self.direction[0],
+            self.start[1] + self.direction[1],
+            self.start[2] + self.direction[2],
+        )
+
+
+@dataclass
+class SceneMarker:
+    name: str
+    color: str
+    position: tuple[float, float, float]
+
+
+@dataclass
+class SceneVisual:
+    link: str
+    color: str
+    alpha: float
+    triangles: list[
+        tuple[
+            tuple[float, float, float],
+            tuple[float, float, float],
+            tuple[float, float, float],
+        ]
+    ]
+
+
+@dataclass
+class RobotJoint:
+    name: str
+    type: str
+    position: tuple[float, float, float]
+    axis: tuple[float, float, float]
+    lower: float
+    upper: float
+    value: float
 
 
 @dataclass
@@ -60,6 +121,9 @@ class RobotSkeleton:
     end_effector: SceneFrame | None = None
     target: SceneFrame | None = None
     joint_frames: list[SceneFrame] = field(default_factory=list)
+    visuals: list[SceneVisual] = field(default_factory=list)
+    bone_links: list[str] = field(default_factory=list)
+    joints_info: list[RobotJoint] = field(default_factory=list)
 
 
 def _dot(a, b) -> float:
@@ -91,6 +155,35 @@ def _nice_step(value: float) -> float:
         if value <= candidate:
             return candidate
     return 10.0 * base
+
+
+def _point_in_triangle(point, first, second, third) -> bool:
+    def side(a, b, c) -> float:
+        return (a.x() - c.x()) * (b.y() - c.y()) - (
+            b.x() - c.x()
+        ) * (a.y() - c.y())
+
+    first_side = side(point, first, second)
+    second_side = side(point, second, third)
+    third_side = side(point, third, first)
+    has_negative = first_side < 0 or second_side < 0 or third_side < 0
+    has_positive = first_side > 0 or second_side > 0 or third_side > 0
+    return not (has_negative and has_positive)
+
+
+def _point_segment_distance(point, start, end) -> float:
+    dx = end.x() - start.x()
+    dy = end.y() - start.y()
+    length_sq = dx * dx + dy * dy
+    if length_sq < 1e-9:
+        return math.hypot(point.x() - start.x(), point.y() - start.y())
+    ratio = (
+        (point.x() - start.x()) * dx + (point.y() - start.y()) * dy
+    ) / length_sq
+    ratio = max(0.0, min(1.0, ratio))
+    x = start.x() + ratio * dx
+    y = start.y() + ratio * dy
+    return math.hypot(point.x() - x, point.y() - y)
 
 
 class _Camera:
@@ -148,6 +241,7 @@ class PoseScene(QWidget):
     """鼠标可旋转 / 平移 / 缩放的位姿三维视图。"""
 
     pose_clicked = pyqtSignal(int)
+    robot_item_selected = pyqtSignal(str, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -157,16 +251,28 @@ class PoseScene(QWidget):
         self.setCursor(Qt.OpenHandCursor)
         self._camera = _Camera()
         self._poses: list[ScenePose] = []
+        self._vectors: list[SceneVector] = []
+        self._markers: list[SceneMarker] = []
         self._robot: RobotSkeleton | None = None
         self._selected = -1
         self._show_grid = True
         self._show_path = True
         self._show_labels = True
         self._show_poses = True
+        self._measure_mode = False
+        self._measure_points: list[tuple[float, float, float]] = []
+        self._show_visuals = True
+        self._selected_link = ""
+        self._selected_joint = ""
         self._press_pos = None
         self._last_pos = None
         self._drag_button = None
         self._moved = False
+        self._visual_triangle_count = 0
+        self._interacting = False
+        self._quality_timer = QTimer(self)
+        self._quality_timer.setSingleShot(True)
+        self._quality_timer.timeout.connect(self._restore_quality)
 
     # ------------------------------------------------------------------
     # 数据与选项
@@ -178,12 +284,64 @@ class PoseScene(QWidget):
             self._selected = -1
         self.update()
 
+    def set_vectors(self, vectors: list[SceneVector]) -> None:
+        self._vectors = vectors
+        self.update()
+
+    def set_markers(self, markers: list[SceneMarker]) -> None:
+        self._markers = markers
+        self.update()
+
+    def set_measure_mode(self, enabled: bool) -> None:
+        self._measure_mode = bool(enabled)
+        if not self._measure_mode:
+            self._measure_points.clear()
+        self.setCursor(Qt.CrossCursor if self._measure_mode else Qt.OpenHandCursor)
+        self.update()
+
+    def clear_measurements(self) -> None:
+        self._measure_points.clear()
+        self.update()
+
     def set_selected(self, index: int) -> None:
         self._selected = index
         self.update()
 
     def set_robot(self, robot: RobotSkeleton | None) -> None:
         self._robot = robot
+        if robot is None:
+            self._selected_link = ""
+            self._selected_joint = ""
+            self._visual_triangle_count = 0
+        else:
+            links = {visual.link for visual in robot.visuals}
+            links.update(robot.bone_links)
+            if self._selected_link and self._selected_link not in links:
+                self._selected_link = ""
+            joint_names = {joint.name for joint in robot.joints_info}
+            if self._selected_joint and self._selected_joint not in joint_names:
+                self._selected_joint = ""
+            self._visual_triangle_count = sum(
+                len(visual.triangles) for visual in robot.visuals
+            )
+        self.update()
+
+    def visual_triangle_count(self) -> int:
+        return self._visual_triangle_count
+
+    def _begin_interaction(self) -> None:
+        if self._visual_triangle_count <= INTERACTIVE_TRIANGLE_LIMIT:
+            return
+        self._interacting = True
+        self._quality_timer.start(160)
+
+    def _restore_quality(self) -> None:
+        if self._interacting:
+            self._interacting = False
+            self.update()
+
+    def set_show_visuals(self, enabled: bool) -> None:
+        self._show_visuals = bool(enabled)
         self.update()
 
     def set_show_poses(self, enabled: bool) -> None:
@@ -230,7 +388,9 @@ class PoseScene(QWidget):
         self._drag_button = event.button()
         self._moved = False
         if event.button() == Qt.LeftButton:
-            self.setCursor(Qt.ClosedHandCursor)
+            self.setCursor(
+                Qt.CrossCursor if self._measure_mode else Qt.ClosedHandCursor
+            )
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
@@ -244,33 +404,48 @@ class PoseScene(QWidget):
         if event.buttons() & Qt.LeftButton:
             self._camera.yaw -= delta.x() * 0.45
             self._camera.pitch = max(-85.0, min(85.0, self._camera.pitch + delta.y() * 0.4))
+            self._begin_interaction()
             self.update()
         elif event.buttons() & (Qt.RightButton | Qt.MiddleButton):
             self._pan(delta.x(), delta.y())
+            self._begin_interaction()
             self.update()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        self.setCursor(Qt.OpenHandCursor)
+        self.setCursor(Qt.CrossCursor if self._measure_mode else Qt.OpenHandCursor)
         if (
             event.button() == Qt.LeftButton
             and not self._moved
             and self._press_pos is not None
         ):
-            self._pick(event.pos())
+            if self._measure_mode:
+                self._add_measure_point(event.pos())
+            else:
+                self._pick(event.pos())
         self._last_pos = None
         self._drag_button = None
         self._press_pos = None
         super().mouseReleaseEvent(event)
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key_Escape and self._measure_points:
+            self.clear_measurements()
+            return
+        super().keyPressEvent(event)
+
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:
-            self.reset_view()
+            if self._measure_mode:
+                self.clear_measurements()
+            else:
+                self.reset_view()
         super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         steps = event.angleDelta().y() / 120.0
         if steps:
             self._camera.distance = max(0.08, min(1e6, self._camera.distance * math.exp(-steps * 0.13)))
+            self._begin_interaction()
             self.update()
         event.accept()
 
@@ -281,6 +456,8 @@ class PoseScene(QWidget):
             self._camera.target[i] += (-view.right[i] * dx + view.up[i] * dy) * scale
 
     def _pick(self, pos) -> None:
+        if self._pick_robot(pos):
+            return
         view = _View(self._camera, self.width(), self.height())
         best = -1
         best_distance = 16.0
@@ -298,6 +475,108 @@ class PoseScene(QWidget):
         if best >= 0:
             self.pose_clicked.emit(best)
 
+    def _pick_robot(self, pos) -> bool:
+        robot = self._robot
+        if robot is None:
+            return False
+        view = _View(self._camera, self.width(), self.height())
+
+        best_joint = ""
+        best_distance = 12.0
+        for joint in robot.joints_info:
+            projected = view.project(joint.position)
+            if projected is None:
+                continue
+            screen = projected[0]
+            distance = math.hypot(screen.x() - pos.x(), screen.y() - pos.y())
+            if distance < best_distance:
+                best_distance = distance
+                best_joint = joint.name
+        if best_joint:
+            self._select_robot_item("joint", best_joint)
+            return True
+
+        if self._show_visuals and robot.visuals:
+            best_depth = float("inf")
+            best_link = ""
+            for visual in robot.visuals:
+                for triangle in visual.triangles:
+                    projected = [
+                        view.project(vertex) for vertex in triangle
+                    ]
+                    if any(item is None for item in projected):
+                        continue
+                    points = [item[0] for item in projected]
+                    if not _point_in_triangle(
+                        pos, points[0], points[1], points[2]
+                    ):
+                        continue
+                    depth = sum(item[1] for item in projected) / 3.0
+                    if depth < best_depth:
+                        best_depth = depth
+                        best_link = visual.link
+            if best_link:
+                self._select_robot_item("link", best_link)
+                return True
+
+        best_link = ""
+        best_distance = 10.0
+        for index, (start, end) in enumerate(robot.bones):
+            first = view.project(start)
+            second = view.project(end)
+            if first is None or second is None:
+                continue
+            distance = _point_segment_distance(
+                pos, first[0], second[0]
+            )
+            if (
+                distance < best_distance
+                and index < len(robot.bone_links)
+            ):
+                best_distance = distance
+                best_link = robot.bone_links[index]
+        if best_link:
+            self._select_robot_item("link", best_link)
+            return True
+        return False
+
+    def _select_robot_item(self, kind: str, name: str) -> None:
+        if kind == "joint":
+            self._selected_joint = name
+            self._selected_link = ""
+        else:
+            self._selected_link = name
+            self._selected_joint = ""
+        self.robot_item_selected.emit(kind, name)
+        self.update()
+
+    def _ground_point(self, pos):
+        view = _View(self._camera, self.width(), self.height())
+        x = (pos.x() - self.width() / 2.0) / view.focal
+        y = -(pos.y() - self.height() / 2.0) / view.focal
+        direction = _normalize(
+            (
+                view.forward[0] + view.right[0] * x + view.up[0] * y,
+                view.forward[1] + view.right[1] * x + view.up[1] * y,
+                view.forward[2] + view.right[2] * x + view.up[2] * y,
+            )
+        )
+        if abs(direction[2]) < 1e-6:
+            return None
+        distance = -view.eye[2] / direction[2]
+        if distance <= 0.05:
+            return None
+        return tuple(view.eye[i] + direction[i] * distance for i in range(3))
+
+    def _add_measure_point(self, pos) -> None:
+        point = self._ground_point(pos)
+        if point is None:
+            return
+        if len(self._measure_points) >= 3:
+            self._measure_points.clear()
+        self._measure_points.append(point)
+        self.update()
+
     # ------------------------------------------------------------------
     # 场景几何
     # ------------------------------------------------------------------
@@ -307,6 +586,12 @@ class PoseScene(QWidget):
         if self._show_poses:
             poses = [pose for pose in self._poses if pose.visible] or self._poses
             points.extend(pose.position for pose in poses)
+        for vector in self._vectors:
+            if vector.visible:
+                points.append(vector.start)
+                points.append(vector.end)
+        points.extend(marker.position for marker in self._markers)
+        points.extend(self._measure_points)
         if self._robot is not None:
             for start, end in self._robot.bones:
                 points.append(start)
@@ -316,6 +601,10 @@ class PoseScene(QWidget):
                 points.append(self._robot.end_effector.position)
             if self._robot.target is not None:
                 points.append(self._robot.target.position)
+            if self._show_visuals:
+                for visual in self._robot.visuals:
+                    for triangle in visual.triangles:
+                        points.extend(triangle)
         if not points:
             return (0.0, 0.0, 0.0), 3.0
 
@@ -386,7 +675,16 @@ class PoseScene(QWidget):
 
         if self._robot is not None:
             self._draw_joint_frames(painter, view, step)
-            self._draw_robot_body(painter, view)
+            reduced = (
+                self._interacting
+                and self._visual_triangle_count > INTERACTIVE_TRIANGLE_LIMIT
+            )
+            if self._show_visuals and self._robot.visuals and not reduced:
+                self._draw_robot_visuals(painter, view)
+                self._draw_robot_joints(painter, view)
+            else:
+                self._draw_robot_body(painter, view)
+            self._draw_joint_axes(painter, view, step)
 
         if self._show_path and len(visible) >= 2:
             self._draw_path(painter, view, visible)
@@ -396,10 +694,24 @@ class PoseScene(QWidget):
 
         if self._robot is not None:
             self._draw_robot_frames(painter, view, step)
+            self._draw_robot_selection(painter, view)
+
+        if self._vectors:
+            self._draw_vectors(painter, view)
+        if self._markers:
+            self._draw_markers(painter, view)
+        if self._measure_points:
+            self._draw_measurements(painter, view)
 
         self._draw_hud(painter, len(visible))
 
-        if not self._poses and self._robot is None:
+        if (
+            not self._poses
+            and self._robot is None
+            and not self._vectors
+            and not self._markers
+            and not self._measure_points
+        ):
             self._draw_empty_state(painter)
 
     def _draw_grid(self, painter, view, cx, cy, step, count) -> None:
@@ -503,6 +815,186 @@ class PoseScene(QWidget):
                 QColor("#FDE68A" if index == 0 else "#E2E8F0")
             )
             painter.drawEllipse(screen[0], radius, radius)
+
+    def _draw_robot_visuals(self, painter, view) -> None:
+        robot = self._robot
+        if robot is None or not robot.visuals:
+            return
+        light = _normalize((0.35, -0.55, 0.75))
+        width = self.width()
+        height = self.height()
+        faces: list[tuple[float, QPolygonF, QColor]] = []
+        for visual in robot.visuals:
+            base = QColor(visual.color)
+            alpha = max(0, min(255, round(visual.alpha * 255)))
+            selected = visual.link == self._selected_link
+            for triangle in visual.triangles:
+                projected = [view.project(vertex) for vertex in triangle]
+                if any(item is None for item in projected):
+                    continue
+                points = [item[0] for item in projected]
+                xs = [point.x() for point in points]
+                ys = [point.y() for point in points]
+                if (
+                    max(xs) < -20
+                    or min(xs) > width + 20
+                    or max(ys) < -20
+                    or min(ys) > height + 20
+                ):
+                    continue
+                depth = sum(item[1] for item in projected) / 3.0
+                first = triangle[1]
+                second = triangle[2]
+                origin = triangle[0]
+                normal = _normalize(
+                    _cross(
+                        (
+                            first[0] - origin[0],
+                            first[1] - origin[1],
+                            first[2] - origin[2],
+                        ),
+                        (
+                            second[0] - origin[0],
+                            second[1] - origin[1],
+                            second[2] - origin[2],
+                        ),
+                    )
+                )
+                shade = 0.45 + 0.55 * abs(_dot(normal, light))
+                if selected:
+                    shade = min(1.0, shade + 0.18)
+                color = QColor.fromRgbF(
+                    min(1.0, base.redF() * shade),
+                    min(1.0, base.greenF() * shade),
+                    min(1.0, base.blueF() * shade),
+                )
+                color.setAlpha(alpha)
+                faces.append((depth, QPolygonF(points), color))
+        faces.sort(key=lambda item: item[0], reverse=True)
+        painter.setPen(Qt.NoPen)
+        for _, polygon, color in faces:
+            painter.setBrush(color)
+            painter.drawPolygon(polygon)
+
+    def _draw_robot_joints(self, painter, view) -> None:
+        robot = self._robot
+        if robot is None:
+            return
+        selected_positions = [
+            joint.position
+            for joint in robot.joints_info
+            if joint.name == self._selected_joint
+        ]
+        for index, position in enumerate(robot.joints):
+            screen = view.project(position)
+            if screen is None:
+                continue
+            selected = any(
+                math.dist(position, target) < 1e-6
+                for target in selected_positions
+            )
+            if selected:
+                glow = QRadialGradient(screen[0], 16.0)
+                inner = QColor("#22D3EE")
+                inner.setAlpha(120)
+                outer = QColor("#22D3EE")
+                outer.setAlpha(0)
+                glow.setColorAt(0.0, inner)
+                glow.setColorAt(1.0, outer)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(glow)
+                painter.drawEllipse(screen[0], 16.0, 16.0)
+            radius = 5.6 if selected else (4.4 if index == 0 else 3.6)
+            painter.setPen(QPen(QColor("#0B1220"), 2.0))
+            if selected:
+                fill = "#22D3EE"
+            else:
+                fill = "#FDE68A" if index == 0 else "#E2E8F0"
+            painter.setBrush(QColor(fill))
+            painter.drawEllipse(screen[0], radius, radius)
+
+    def _draw_joint_axes(self, painter, view, step: float) -> None:
+        robot = self._robot
+        if robot is None or not robot.joints_info:
+            return
+        length = max(0.12, step * 0.45)
+        for joint in robot.joints_info:
+            position = joint.position
+            axis = joint.axis
+            start = tuple(
+                position[index] - axis[index] * length for index in range(3)
+            )
+            end = tuple(
+                position[index] + axis[index] * length for index in range(3)
+            )
+            projected_start = view.project(start)
+            projected_end = view.project(end)
+            if projected_start is None or projected_end is None:
+                continue
+            selected = joint.name == self._selected_joint
+            if selected:
+                color = QColor("#22D3EE")
+                alpha = 230
+                width = 2.4
+            elif joint.type in ("revolute", "continuous"):
+                color = QColor("#FBBF24")
+                alpha = 120
+                width = 1.2
+            else:
+                color = QColor("#38BDF8")
+                alpha = 120
+                width = 1.2
+            color.setAlpha(alpha)
+            painter.setPen(QPen(color, width, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(projected_start[0], projected_end[0])
+            if selected:
+                screen = view.project(position)
+                if screen is not None:
+                    self._draw_tag(
+                        painter,
+                        screen[0],
+                        joint.name,
+                        "#22D3EE",
+                        strong=True,
+                        lift=18.0,
+                    )
+
+    def _draw_robot_selection(self, painter, view) -> None:
+        robot = self._robot
+        if robot is None or not self._selected_link:
+            return
+        point = self._robot_link_point(self._selected_link)
+        if point is None:
+            return
+        projected = view.project(point)
+        if projected is None:
+            return
+        self._draw_tag(
+            painter,
+            projected[0],
+            self._selected_link,
+            "#7DD3FC",
+            strong=True,
+            lift=20.0,
+        )
+
+    def _robot_link_point(self, link: str):
+        robot = self._robot
+        if robot is None:
+            return None
+        if robot.end_effector is not None and robot.end_effector.name == link:
+            return robot.end_effector.position
+        for index, name in enumerate(robot.bone_links):
+            if name == link and index < len(robot.bones):
+                return robot.bones[index][1]
+        for visual in robot.visuals:
+            if visual.link == link and visual.triangles:
+                triangle = visual.triangles[0]
+                return tuple(
+                    sum(vertex[index] for vertex in triangle) / 3.0
+                    for index in range(3)
+                )
+        return None
 
     def _draw_robot_frames(self, painter, view, step: float) -> None:
         robot = self._robot
@@ -624,6 +1116,119 @@ class PoseScene(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(color)
         painter.drawPolygon(polygon)
+
+    def _draw_vectors(self, painter, view) -> None:
+        for vector in self._vectors:
+            if not vector.visible:
+                continue
+            start = view.project(vector.start)
+            end = view.project(vector.end)
+            if start is None or end is None:
+                continue
+            color = QColor(vector.color)
+            glow = QColor(color)
+            glow.setAlpha(60)
+            painter.setPen(QPen(glow, 7.0, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(start[0], end[0])
+            self._draw_arrow(
+                painter,
+                start[0],
+                end[0],
+                color,
+                3.0,
+                label=vector.name if self._show_labels else "",
+            )
+            painter.setPen(QPen(QColor("#0B1220"), 2.0))
+            painter.setBrush(color)
+            painter.drawEllipse(start[0], 4.2, 4.2)
+
+    def _draw_markers(self, painter, view) -> None:
+        for marker in self._markers:
+            projected = view.project(marker.position)
+            if projected is None:
+                continue
+            screen = projected[0]
+            color = QColor(marker.color)
+            painter.setPen(QPen(color, 1.5, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(
+                QPointF(screen.x() - 7.0, screen.y()),
+                QPointF(screen.x() + 7.0, screen.y()),
+            )
+            painter.drawLine(
+                QPointF(screen.x(), screen.y() - 7.0),
+                QPointF(screen.x(), screen.y() + 7.0),
+            )
+            painter.setPen(QPen(QColor("#0B1220"), 2.0))
+            painter.setBrush(color)
+            painter.drawEllipse(screen, 4.0, 4.0)
+            if self._show_labels:
+                self._draw_tag(
+                    painter, screen, marker.name, marker.color, lift=12.0
+                )
+
+    def _draw_measurements(self, painter, view) -> None:
+        color = QColor("#22D3EE")
+        screens = []
+        for point in self._measure_points:
+            projected = view.project(point)
+            screens.append(projected[0] if projected is not None else None)
+
+        painter.setPen(QPen(color, 1.8, Qt.DashLine, Qt.RoundCap))
+        for first, second in zip(screens, screens[1:]):
+            if first is None or second is None:
+                continue
+            painter.drawLine(first, second)
+
+        for index, screen in enumerate(screens):
+            if screen is None:
+                continue
+            painter.setPen(QPen(QColor("#0B1220"), 2.0))
+            painter.setBrush(color)
+            painter.drawEllipse(screen, 5.0, 5.0)
+            if self._show_labels:
+                self._draw_tag(
+                    painter, screen, f"P{index + 1}", "#22D3EE", lift=12.0
+                )
+
+        for index, (first, second) in enumerate(zip(screens, screens[1:])):
+            if first is None or second is None:
+                continue
+            start = self._measure_points[index]
+            end = self._measure_points[index + 1]
+            distance = math.sqrt(
+                (end[0] - start[0]) ** 2
+                + (end[1] - start[1]) ** 2
+                + (end[2] - start[2]) ** 2
+            )
+            midpoint = QPointF(
+                (first.x() + second.x()) / 2.0,
+                (first.y() + second.y()) / 2.0,
+            )
+            self._draw_tag(
+                painter, midpoint, f"{distance:.3f} m", "#22D3EE"
+            )
+
+        if len(screens) == 3 and all(screen is not None for screen in screens):
+            first = self._measure_points[0]
+            middle = self._measure_points[1]
+            last = self._measure_points[2]
+            left = (first[0] - middle[0], first[1] - middle[1], first[2] - middle[2])
+            right = (last[0] - middle[0], last[1] - middle[1], last[2] - middle[2])
+            left_length = math.sqrt(sum(value * value for value in left))
+            right_length = math.sqrt(sum(value * value for value in right))
+            if left_length > 1e-9 and right_length > 1e-9:
+                cosine = sum(a * b for a, b in zip(left, right)) / (
+                    left_length * right_length
+                )
+                angle = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+                self._draw_tag(
+                    painter,
+                    screens[1],
+                    f"θ {angle:.2f}°",
+                    "#22D3EE",
+                    strong=True,
+                    lift=34.0,
+                )
 
     def _draw_frames(self, painter, view, visible, step: float) -> None:
         axis_length = max(0.28, step * 0.62)
@@ -763,15 +1368,42 @@ class PoseScene(QWidget):
             painter.setPen(QColor("#7DD3FC"))
             painter.drawText(QRectF(14, 40, width, 22), Qt.AlignCenter, text)
 
+            if self._selected_link or self._selected_joint:
+                prefix = "连杆" if self._selected_link else "关节"
+                selected_text = (
+                    f"{prefix} · {self._selected_link or self._selected_joint}"
+                )
+                selected_width = (
+                    metrics.horizontalAdvance(selected_text) + 24.0
+                )
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(9, 15, 28, 190))
+                painter.drawRoundedRect(
+                    QRectF(14, 68, selected_width, 22), 11, 11
+                )
+                painter.setPen(QColor("#22D3EE"))
+                painter.drawText(
+                    QRectF(14, 68, selected_width, 22),
+                    Qt.AlignCenter,
+                    selected_text,
+                )
+
         painter.setFont(mono_font(9.5))
         painter.setPen(QColor("#64748B"))
-        painter.drawText(
-            QPointF(16, self.height() - 14),
-            "左键旋转 · 滚轮缩放 · 右键平移 · 双击复位",
-        )
+        if self._measure_mode:
+            instruction = "测量：左键点地面取点 · 两点测距 · 三点测角 · 再次点击开始新测量"
+        else:
+            instruction = "左键旋转 · 滚轮缩放 · 右键平移 · 双击复位"
+        painter.drawText(QPointF(16, self.height() - 14), instruction)
 
+        parts: list[str] = []
         if self._poses and self._show_poses:
-            text = f"显示 {visible_count} / {len(self._poses)} 帧"
+            parts.append(f"显示 {visible_count} / {len(self._poses)} 帧")
+        if self._vectors:
+            visible_vectors = sum(1 for vector in self._vectors if vector.visible)
+            parts.append(f"向量 {visible_vectors} / {len(self._vectors)}")
+        if parts:
+            text = " · ".join(parts)
             metrics = QFontMetricsF(painter.font())
             width = metrics.horizontalAdvance(text) + 20.0
             painter.setPen(QColor("#94A3B8"))
@@ -787,5 +1419,5 @@ class PoseScene(QWidget):
         painter.drawText(
             QRectF(0, 0, self.width(), self.height()),
             Qt.AlignCenter,
-            "粘贴位姿矩阵并添加\n即可在此查看三维位姿",
+            "点击右上角“位姿 · 向量”打开面板添加位姿\n即可在此查看三维位姿",
         )

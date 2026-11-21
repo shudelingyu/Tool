@@ -71,7 +71,7 @@ def app_stylesheet() -> str:
     QMainWindow, QWidget#Root {{
         background: {BACKGROUND};
     }}
-    QDialog#RelativeDialog, QDialog#RobotDialog {{
+    QDialog#RobotDialog, QDialog#CalcDialog, QDialog#PoseVectorDialog {{
         background: {BACKGROUND};
     }}
     QLabel#DialogTitle {{
@@ -121,6 +121,29 @@ def app_stylesheet() -> str:
     }}
     QDoubleSpinBox:focus {{
         border-color: {ACCENT};
+    }}
+    QCheckBox {{
+        color: {TEXT_SECONDARY};
+        font-size: 11px;
+        spacing: 4px;
+    }}
+    QCheckBox::indicator {{
+        width: 14px;
+        height: 14px;
+        border-radius: 4px;
+        border: 1px solid #CBD5E1;
+        background: #FFFFFF;
+    }}
+    QCheckBox::indicator:hover {{
+        border-color: {ACCENT};
+    }}
+    QCheckBox::indicator:checked {{
+        background: {ACCENT};
+        border-color: {ACCENT};
+    }}
+    QCheckBox::indicator:disabled {{
+        background: #F1F5F9;
+        border-color: #E2E8F0;
     }}
     QSlider#JointSlider::groove:horizontal {{
         height: 4px;
@@ -221,6 +244,47 @@ def app_stylesheet() -> str:
         background: #F8FAFC;
         border: 1px solid #EDF2F9;
         border-radius: 9px;
+    }}
+
+    QTabWidget#CalcTabs::pane, QTabWidget#PoseVectorTabs::pane {{
+        border: 1px solid {BORDER};
+        border-radius: 10px;
+        background: transparent;
+        top: -1px;
+    }}
+    QTabWidget#CalcTabs QTabBar::tab, QTabWidget#PoseVectorTabs QTabBar::tab {{
+        background: #F1F5F9;
+        color: {MUTED};
+        border: 1px solid #E9EEF6;
+        border-bottom: none;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        padding: 7px 14px;
+        margin-right: 3px;
+        font-size: 11px;
+    }}
+    QTabWidget#CalcTabs QTabBar::tab:selected,
+    QTabWidget#PoseVectorTabs QTabBar::tab:selected {{
+        background: {ACCENT_SOFT};
+        color: {ACCENT_DARK};
+        border-color: #C7D2FE;
+        font-weight: 600;
+    }}
+    QTableWidget#TrajectoryTable {{
+        background: #F8FAFC;
+        border: 1px solid #EDF2F9;
+        border-radius: 8px;
+        gridline-color: #E9EEF6;
+        selection-background-color: {ACCENT_SOFT};
+    }}
+    QTableWidget#TrajectoryTable QHeaderView::section {{
+        background: #F1F5F9;
+        color: {MUTED};
+        border: none;
+        border-bottom: 1px solid #E9EEF6;
+        padding: 5px 6px;
+        font-size: 11px;
+        font-weight: 600;
     }}
 
     QPlainTextEdit#MatrixEditor {{

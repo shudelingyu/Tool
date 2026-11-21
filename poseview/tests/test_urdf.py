@@ -51,6 +51,27 @@ PRISMATIC = """<robot name="slider">
 </robot>
 """
 
+MIMIC = """<robot name="gripper">
+  <link name="base"/>
+  <link name="left"/>
+  <link name="right"/>
+  <joint name="left_finger" type="prismatic">
+    <parent link="base"/>
+    <child link="left"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="0.05"/>
+  </joint>
+  <joint name="right_finger" type="prismatic">
+    <parent link="base"/>
+    <child link="right"/>
+    <origin xyz="0.05 0 0"/>
+    <axis xyz="-1 0 0"/>
+    <limit lower="0" upper="0.05"/>
+    <mimic joint="left_finger" multiplier="1" offset="0"/>
+  </joint>
+</robot>
+"""
+
 
 class UrdfParseTests(unittest.TestCase):
     def test_tree(self):
@@ -144,6 +165,133 @@ class ForwardKinematicsTests(unittest.TestCase):
         result = robot.forward(robot.default_values())
         self.assertEqual(len(result.segments), 3)
         self.assertEqual(len(result.joint_positions), 4)
+
+    def test_joint_frames(self):
+        robot = parse_urdf_text(ARM)
+        result = robot.forward(robot.default_values())
+        self.assertEqual(set(result.joint_frames), {"j1", "j2", "j3"})
+        for name, expected in (
+            ("j1", (0.0, 0.0, 0.5)),
+            ("j2", (1.0, 0.0, 0.5)),
+            ("j3", (1.5, 0.0, 0.5)),
+        ):
+            actual = _translation(result.joint_frames[name])
+            for value, target in zip(actual, expected):
+                self.assertAlmostEqual(value, target, places=6)
+
+
+VISUAL_BOX = """<robot name="boxy">
+  <material name="blue"><color rgba="0.1 0.2 0.8 1.0"/></material>
+  <link name="base">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="1 2 3"/></geometry>
+      <material name="blue"/>
+    </visual>
+  </link>
+  <link name="tool"/>
+  <joint name="fix" type="fixed">
+    <parent link="base"/>
+    <child link="tool"/>
+  </joint>
+</robot>"""
+
+
+class VisualTests(unittest.TestCase):
+    def test_box_visual_triangles(self):
+        robot = parse_urdf_text(VISUAL_BOX)
+        self.assertEqual(len(robot.visuals), 1)
+        visual = robot.visuals[0]
+        self.assertEqual(visual.link, "base")
+        self.assertEqual(len(visual.triangles), 12)
+        self.assertAlmostEqual(visual.color[2], 0.8, places=6)
+        xs = [vertex[0] for tri in visual.triangles for vertex in tri]
+        zs = [vertex[2] for tri in visual.triangles for vertex in tri]
+        self.assertAlmostEqual(min(xs), -0.5, places=6)
+        self.assertAlmostEqual(max(xs), 0.5, places=6)
+        self.assertAlmostEqual(min(zs), -1.5, places=6)
+        self.assertAlmostEqual(max(zs), 1.5, places=6)
+
+    def test_mesh_missing_file_warns(self):
+        text = """<robot name="meshy">
+          <link name="base">
+            <visual>
+              <geometry><mesh filename="missing.stl"/></geometry>
+            </visual>
+          </link>
+          <link name="tool"/>
+          <joint name="fix" type="fixed">
+            <parent link="base"/>
+            <child link="tool"/>
+          </joint>
+        </robot>"""
+        robot = parse_urdf_text(text)
+        self.assertEqual(robot.visuals, [])
+        self.assertTrue(robot.warnings)
+
+
+class InverseKinematicsTests(unittest.TestCase):
+    def test_solve_reaches_target(self):
+        robot = parse_urdf_text(ARM)
+        goal = robot.default_values()
+        goal["j1"] = math.radians(35.0)
+        goal["j2"] = math.radians(-55.0)
+        target = robot.forward(goal).ee_matrix
+        result = robot.solve_ik(robot.default_values(), "tool", target)
+        self.assertTrue(result.success)
+        self.assertLess(result.position_error, 1e-3)
+        actual = _translation(robot.forward(result.values).ee_matrix)
+        for value, expected in zip(actual, _translation(target)):
+            self.assertAlmostEqual(value, expected, places=3)
+
+    def test_locked_joint_unchanged(self):
+        robot = parse_urdf_text(ARM)
+        goal = robot.default_values()
+        goal["j1"] = math.radians(25.0)
+        goal["j2"] = math.radians(40.0)
+        target = robot.forward(goal).ee_matrix
+        result = robot.solve_ik(
+            robot.default_values(), "tool", target, locked={"j2"}
+        )
+        self.assertAlmostEqual(result.values["j2"], 0.0, places=6)
+
+
+class MimicTests(unittest.TestCase):
+    def test_mimic_follows_source(self):
+        robot = parse_urdf_text(MIMIC)
+        values = robot.default_values()
+        values["left_finger"] = 0.02
+        result = robot.forward(values)
+        self.assertAlmostEqual(result.link_frames["left"][0][3], 0.02, places=6)
+        self.assertAlmostEqual(result.link_frames["right"][0][3], 0.03, places=6)
+        joint = next(item for item in result.joint_infos if item.name == "right_finger")
+        self.assertAlmostEqual(joint.value, 0.02, places=6)
+
+    def test_mimic_multiplier_offset(self):
+        text = MIMIC.replace('multiplier="1" offset="0"', 'multiplier="-0.5" offset="-0.01"')
+        robot = parse_urdf_text(text)
+        values = robot.default_values()
+        values["left_finger"] = 0.02
+        result = robot.forward(values)
+        self.assertAlmostEqual(result.link_frames["right"][0][3], 0.07, places=6)
+
+    def test_mimic_missing_source(self):
+        text = MIMIC.replace('joint="left_finger"', 'joint="missing"')
+        robot = parse_urdf_text(text)
+        self.assertTrue(any("mimic" in warning for warning in robot.warnings))
+        joint = next(item for item in robot.joints if item.name == "right_finger")
+        self.assertEqual(joint.mimic, "")
+
+    def test_mimic_not_ik_variable(self):
+        robot = parse_urdf_text(MIMIC)
+        values = robot.default_values()
+        values["left_finger"] = 0.02
+        target = robot.forward(values).ee_matrix
+        result = robot.solve_ik(
+            robot.default_values(), "right", target, position_weight=1.0,
+            orientation_weight=0.0,
+        )
+        self.assertEqual(result.values["right_finger"], 0.0)
 
 
 def _translation(matrix):

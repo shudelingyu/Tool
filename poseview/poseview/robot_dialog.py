@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -37,12 +38,17 @@ class _Control:
     joint: UrdfJoint
     slider: QSlider
     spin: QDoubleSpinBox
+    lock: QCheckBox
     minimum: float
     maximum: float
 
     @property
     def is_angular(self) -> bool:
         return self.joint.type in ("revolute", "continuous")
+
+    @property
+    def is_mimic(self) -> bool:
+        return self.joint.is_mimic
 
     def to_base(self, display: float) -> float:
         return math.radians(display) if self.is_angular else display
@@ -58,6 +64,7 @@ class RobotDialog(QDialog):
     ee_changed = pyqtSignal(str)
     target_changed = pyqtSignal(object)
     clear_requested = pyqtSignal()
+    visuals_toggled = pyqtSignal(bool)
 
     def __init__(
         self,
@@ -65,6 +72,7 @@ class RobotDialog(QDialog):
         values: dict[str, float],
         ee_link: str,
         target: list[list[float]] | None = None,
+        show_visuals: bool = True,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -72,7 +80,10 @@ class RobotDialog(QDialog):
         self._values = dict(values)
         self._ee_link = ee_link or robot.default_ee_link()
         self._ee_matrix: list[list[float]] | None = None
+        self._target_matrix: list[list[float]] | None = None
         self._controls: dict[str, _Control] = {}
+        self._locked: set[str] = set()
+        self._initial_visuals = bool(show_visuals)
         self._updating = True
         self._copy_timer = QTimer(self)
         self._copy_timer.setSingleShot(True)
@@ -80,8 +91,8 @@ class RobotDialog(QDialog):
 
         self.setObjectName("RobotDialog")
         self.setWindowTitle(f"机器人关节 · {robot.name}")
-        self.resize(500, 740)
-        self.setMinimumSize(440, 560)
+        self.resize(1080, 860)
+        self.setMinimumSize(940, 720)
         self._build()
         if target is not None:
             self._fill_target(target)
@@ -102,7 +113,11 @@ class RobotDialog(QDialog):
 
         subtitle = QLabel(
             f"{self._robot.name} · {len(self._robot.movable_joints)} 个可动关节"
-            " · 仅显示骨架，不加载 mesh"
+            + (
+                f" · {len(self._robot.visuals)} 个外观"
+                if self._robot.visuals
+                else " · 仅骨架"
+            )
         )
         subtitle.setObjectName("DialogHint")
         if self._robot.warnings:
@@ -124,13 +139,35 @@ class RobotDialog(QDialog):
         if index >= 0:
             self._ee_combo.setCurrentIndex(index)
         self._ee_combo.currentTextChanged.connect(self._on_ee_changed)
+        self._ee_combo.setMaximumWidth(360)
         ee_row.addWidget(ee_label)
         ee_row.addWidget(self._ee_combo, 1)
+        self._visuals_check = QCheckBox("外观")
+        self._visuals_check.setChecked(
+            bool(self._robot.visuals) and self._initial_visuals
+        )
+        self._visuals_check.setEnabled(bool(self._robot.visuals))
+        self._visuals_check.setCursor(Qt.PointingHandCursor)
+        if self._robot.visuals:
+            self._visuals_check.setToolTip("显示 / 隐藏 URDF 外观（box/cylinder/sphere/STL/OBJ）")
+        else:
+            self._visuals_check.setToolTip(
+                "该 URDF 没有可绘制外观（box/cylinder/sphere/STL/OBJ）"
+            )
+        self._visuals_check.toggled.connect(self.visuals_toggled.emit)
+        ee_row.addWidget(self._visuals_check)
+        ee_row.addStretch(1)
         layout.addLayout(ee_row)
 
-        layout.addWidget(self._build_joint_card(), 1)
-        layout.addWidget(self._build_fk_card())
-        layout.addWidget(self._build_target_card())
+        body = QHBoxLayout()
+        body.setSpacing(10)
+        body.addWidget(self._build_joint_card(), 1)
+        right_column = QVBoxLayout()
+        right_column.setSpacing(10)
+        right_column.addWidget(self._build_fk_card())
+        right_column.addWidget(self._build_target_card(), 1)
+        body.addLayout(right_column, 1)
+        layout.addLayout(body, 1)
 
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
@@ -201,8 +238,16 @@ class RobotDialog(QDialog):
         name = QLabel(joint.name)
         name.setObjectName("ValueNum")
         name.setFont(font(11))
-        name.setFixedWidth(108)
+        name.setFixedWidth(100)
         name.setToolTip(joint.name)
+
+        lock = QCheckBox("锁")
+        lock.setToolTip("锁定该关节：滑条不可调，且不参与 IK")
+        lock.setCursor(Qt.PointingHandCursor)
+        lock.setFixedWidth(36)
+        lock.toggled.connect(
+            lambda checked, key=joint.name: self._on_lock_toggled(key, checked)
+        )
 
         if joint.type in ("revolute", "continuous"):
             minimum = math.degrees(joint.lower)
@@ -234,13 +279,27 @@ class RobotDialog(QDialog):
         spin.setAlignment(Qt.AlignRight)
         spin.setFixedWidth(92)
 
-        control = _Control(joint, slider, spin, minimum, maximum)
+        control = _Control(joint, slider, spin, lock, minimum, maximum)
         self._controls[joint.name] = control
 
         display = control.to_display(self._values.get(joint.name, 0.0))
         display = max(minimum, min(maximum, display))
         spin.setValue(display)
         slider.setValue(self._to_slider(control, display))
+
+        if control.is_mimic:
+            description = (
+                f"跟随 {joint.mimic}（×{joint.mimic_multiplier:g}"
+                f" + {joint.mimic_offset:g}），由源关节驱动"
+            )
+            name.setToolTip(description)
+            slider.setToolTip(description)
+            spin.setToolTip(description)
+            lock.setToolTip("mimic 关节由源关节驱动，不能单独锁定")
+            lock.setEnabled(False)
+            slider.setEnabled(False)
+            spin.setEnabled(False)
+            name.setStyleSheet("color: #64748B;")
 
         slider.valueChanged.connect(
             lambda value, key=joint.name: self._on_slider(key, value)
@@ -250,6 +309,7 @@ class RobotDialog(QDialog):
         )
 
         row_layout.addWidget(name)
+        row_layout.addWidget(lock)
         row_layout.addWidget(slider, 1)
         row_layout.addWidget(spin)
         return row
@@ -293,7 +353,7 @@ class RobotDialog(QDialog):
         title.setObjectName("SectionTitle")
         card_layout.addWidget(title)
 
-        hint = QLabel("校验外部 IK 结果：目标 x y z roll pitch yaw（度）")
+        hint = QLabel("设置目标位姿后可一键求解 IK，或校验外部 IK 结果")
         hint.setObjectName("CardHint")
         card_layout.addWidget(hint)
 
@@ -322,11 +382,52 @@ class RobotDialog(QDialog):
         buttons.addWidget(clear_button)
         card_layout.addLayout(buttons)
 
+        weights = QHBoxLayout()
+        weights.setSpacing(6)
+        position_label = QLabel("位置权重")
+        position_label.setObjectName("ValueKey")
+        self._position_weight = QDoubleSpinBox()
+        self._position_weight.setRange(0.0, 1.0)
+        self._position_weight.setDecimals(2)
+        self._position_weight.setSingleStep(0.1)
+        self._position_weight.setValue(1.0)
+        self._position_weight.setFixedWidth(70)
+        self._position_weight.setToolTip("IK 中位置误差的权重（0~1）")
+        orientation_label = QLabel("姿态权重")
+        orientation_label.setObjectName("ValueKey")
+        self._orientation_weight = QDoubleSpinBox()
+        self._orientation_weight.setRange(0.0, 1.0)
+        self._orientation_weight.setDecimals(2)
+        self._orientation_weight.setSingleStep(0.1)
+        self._orientation_weight.setValue(1.0)
+        self._orientation_weight.setFixedWidth(70)
+        self._orientation_weight.setToolTip("IK 中姿态误差的权重（0~1）")
+        weights.addWidget(position_label)
+        weights.addWidget(self._position_weight)
+        weights.addStretch(1)
+        weights.addWidget(orientation_label)
+        weights.addWidget(self._orientation_weight)
+        card_layout.addLayout(weights)
+
+        self._solve_button = QPushButton("求解 IK")
+        self._solve_button.setObjectName("Primary")
+        self._solve_button.setCursor(Qt.PointingHandCursor)
+        self._solve_button.setToolTip("以当前目标位姿为输入，求解关节角")
+        self._solve_button.clicked.connect(self._solve_ik)
+        card_layout.addWidget(self._solve_button)
+
+        self._ik_status = QLabel("尚未求解")
+        self._ik_status.setFont(font(10.5))
+        self._ik_status.setStyleSheet("color: #64748B;")
+        self._ik_status.setWordWrap(True)
+        card_layout.addWidget(self._ik_status)
+
         self._target_status = QLabel("未设置目标")
         self._target_status.setFont(font(10.5))
         self._target_status.setStyleSheet("color: #64748B;")
         self._target_status.setWordWrap(True)
         card_layout.addWidget(self._target_status)
+        card_layout.addStretch(1)
         return card
 
     def _make_value_row(self, layout: QVBoxLayout, key: str) -> QLabel:
@@ -356,7 +457,7 @@ class RobotDialog(QDialog):
         return max(0, min(1000, round(ratio * 1000)))
 
     def _on_slider(self, name: str, value: int) -> None:
-        if self._updating:
+        if self._updating or name in self._locked:
             return
         control = self._controls.get(name)
         if control is None:
@@ -367,29 +468,59 @@ class RobotDialog(QDialog):
         actual = control.spin.value()
         self._updating = False
         self._values[name] = control.to_base(actual)
+        self._sync_mimic_values()
         self.angles_changed.emit(dict(self._values))
 
     def _on_spin(self, name: str, display: float) -> None:
-        if self._updating:
+        if self._updating or name in self._locked:
             return
         control = self._controls.get(name)
-        if control is None:
+        if control is None or control.is_mimic:
             return
         self._updating = True
         control.slider.setValue(self._to_slider(control, display))
         self._updating = False
         self._values[name] = control.to_base(display)
+        self._sync_mimic_values()
         self.angles_changed.emit(dict(self._values))
+
+    def _sync_mimic_values(self) -> None:
+        """按源关节刷新 mimic 关节的显示与内部值。"""
+        for control in self._controls.values():
+            if not control.is_mimic:
+                continue
+            base = self._robot.effective_value(control.joint, self._values)
+            self._values[control.joint.name] = base
+            display = control.to_display(base)
+            display = max(control.minimum, min(control.maximum, display))
+            self._updating = True
+            control.spin.setValue(display)
+            control.slider.setValue(self._to_slider(control, display))
+            self._updating = False
+
+    def _on_lock_toggled(self, name: str, checked: bool) -> None:
+        control = self._controls.get(name)
+        if control is None:
+            return
+        if checked:
+            self._locked.add(name)
+        else:
+            self._locked.discard(name)
+        control.slider.setEnabled(not checked)
+        control.spin.setEnabled(not checked)
 
     def _set_all_zero(self) -> None:
         self._updating = True
         for control in self._controls.values():
+            if control.joint.name in self._locked or control.is_mimic:
+                continue
             base = max(control.joint.lower, min(control.joint.upper, 0.0))
             display = control.to_display(base)
             control.spin.setValue(display)
             control.slider.setValue(self._to_slider(control, control.spin.value()))
             self._values[control.joint.name] = control.to_base(control.spin.value())
         self._updating = False
+        self._sync_mimic_values()
         self.angles_changed.emit(dict(self._values))
 
     def _on_ee_changed(self, name: str) -> None:
@@ -457,6 +588,7 @@ class RobotDialog(QDialog):
             [rotation[2][0], rotation[2][1], rotation[2][2], z],
             [0.0, 0.0, 0.0, 1.0],
         ]
+        self._target_matrix = matrix
         self.target_changed.emit(matrix)
 
     def _use_current(self) -> None:
@@ -474,10 +606,13 @@ class RobotDialog(QDialog):
 
     def _clear_target(self) -> None:
         self._target_input.clear()
+        self._target_matrix = None
         self.target_changed.emit(None)
         self.set_error(None, None)
+        self._set_ik_status("尚未求解", "#64748B")
 
     def _fill_target(self, matrix: list[list[float]]) -> None:
+        self._target_matrix = matrix
         values = Pose(matrix).values
         x, y, z = values.position
         self._target_input.setText(
@@ -486,6 +621,59 @@ class RobotDialog(QDialog):
                 for value in (x, y, z, values.roll, values.pitch, values.yaw)
             )
         )
+
+    def _solve_ik(self) -> None:
+        if self._target_matrix is None:
+            self._set_ik_status("请先设置目标位姿", DANGER)
+            return
+        position_weight = self._position_weight.value()
+        orientation_weight = self._orientation_weight.value()
+        if position_weight + orientation_weight < 1e-6:
+            self._set_ik_status("位置/姿态权重不能同时为 0", DANGER)
+            return
+        result = self._robot.solve_ik(
+            self._values,
+            self._ee_link,
+            self._target_matrix,
+            locked=set(self._locked),
+            position_weight=position_weight,
+            orientation_weight=orientation_weight,
+        )
+        self._apply_values(result.values)
+        self.angles_changed.emit(dict(self._values))
+        text = (
+            f"{result.message} · {result.iterations} 次迭代 · "
+            f"位置误差 {result.position_error * 1000.0:.2f} mm · "
+            f"姿态误差 {result.rotation_error:.2f}°"
+        )
+        if result.success:
+            color = SUCCESS
+        elif result.position_error < 0.01 and result.rotation_error < 2.0:
+            color = WARNING
+        else:
+            color = DANGER
+        self._set_ik_status(text, color)
+
+    def _apply_values(self, values: dict[str, float]) -> None:
+        self._updating = True
+        for name, control in self._controls.items():
+            base = float(values.get(name, self._values.get(name, 0.0)))
+            base = max(control.joint.lower, min(control.joint.upper, base))
+            display = max(
+                control.minimum,
+                min(control.maximum, control.to_display(base)),
+            )
+            control.spin.setValue(display)
+            control.slider.setValue(
+                self._to_slider(control, control.spin.value())
+            )
+            self._values[name] = control.to_base(control.spin.value())
+        self._updating = False
+        self._sync_mimic_values()
+
+    def _set_ik_status(self, text: str, color: str) -> None:
+        self._ik_status.setText(text)
+        self._ik_status.setStyleSheet(f"color: {color};")
 
     # ------------------------------------------------------------------
     # 复制

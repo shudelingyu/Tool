@@ -3,129 +3,43 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 from PyQt5.QtCore import QSize, Qt, QTimer
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
-    QAbstractItemView,
-    QButtonGroup,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QShortcut,
-    QSizePolicy,
-    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from .icons import app_icon, dot_icon, icon, logo_pixmap, primary_icon
-from .math3d import (
-    MatrixParseError,
-    Pose,
-    format_number,
-    parse_poses,
-    rotation_angle_between,
-)
-from .relative_dialog import RelativePoseDialog
+from .calc_dialog import CalcDialog
+from .icons import app_icon, icon, logo_pixmap, primary_icon
+from .math3d import rotation_angle_between, transform_point
+from .pose_vector_dialog import PoseVectorDialog
 from .robot_dialog import RobotDialog
-from .scene import POSE_COLORS, PoseScene, RobotSkeleton, SceneFrame, ScenePose
-from .theme import DANGER, MUTED, SUCCESS, mono_font
+from .scene import (
+    PoseScene,
+    RobotJoint,
+    RobotSkeleton,
+    SceneFrame,
+    SceneMarker,
+    ScenePose,
+    SceneVector,
+    SceneVisual,
+)
 from .urdf import UrdfError, UrdfRobot, load_urdf
-from .widgets import PoseValuePanel
-
-SAMPLE_MATRICES = """1 0 0 0
-0 1 0 0
-0 0 1 0
-0 0 0 1
-
-0.707107 -0.707107 0 1.2
-0.707107 0.707107 0 0
-0 0 1 0.35
-0 0 0 1
-
-0 1 0 2.4
--1 0 0 0.9
-0 0 1 0.85
-0 0 0 1
-
-0.5 -0.866025 0 3.2
-0.866025 0.5 0 1.7
-0 0 1 1.5
-0 0 0 1"""
 
 DEFAULT_STATUS = "左键旋转 · 右键平移 · 滚轮缩放 · 双击复位"
-
-QUAT_SAMPLE = """0 0 0   1 0 0 0
-
-1.2 0 0.35   0.92388 0 0 0.382683
-
-2.4 0.9 0.85   0.707107 0 0 0.707107
-
-3.2 1.7 1.5   0.866025 0 0 0.5"""
-
-EULER_SAMPLE = """0 0 0   0 0 0
-
-1.2 0 0.35   0 0 45
-
-2.4 0.9 0.85   0 0 90
-
-3.2 1.7 1.5   0 0 60"""
-
-INPUT_MODES = (
-    ("matrix", "齐次矩阵"),
-    ("quat", "位置 + 四元数"),
-    ("euler", "位置 + 欧拉角"),
-)
-
-SAMPLES = {
-    "matrix": SAMPLE_MATRICES,
-    "quat": QUAT_SAMPLE,
-    "euler": EULER_SAMPLE,
-}
-
-MODE_HINTS = {
-    "matrix": "支持 3x3 / 3x4 / 4x4；空行或 --- 分隔多个矩阵",
-    "quat": "每帧 7 个数：x y z qw qx qy qz；空行或 --- 分隔多帧",
-    "euler": "每帧 6 个数：x y z roll pitch yaw（度）；空行或 --- 分隔多帧",
-}
-
-PLACEHOLDERS = {
-    "matrix": (
-        "粘贴 3x3 / 3x4 / 4x4 矩阵：\n"
-        "1  0  0  0.5\n"
-        "0  1  0  0\n"
-        "0  0  1  0\n"
-        "0  0  0  1"
-    ),
-    "quat": (
-        "粘贴位置 + 四元数，每帧 7 个数：\n"
-        "x y z qw qx qy qz\n"
-        "0 0 0   1 0 0 0"
-    ),
-    "euler": (
-        "粘贴位置 + 欧拉角，每帧 6 个数：\n"
-        "x y z roll pitch yaw\n"
-        "0 0 0   0 0 45"
-    ),
-}
-
-
-@dataclass
-class _Entry:
-    name: str
-    color: str
-    pose: Pose
-    visible: bool = True
+MARKER_COLOR = "#38BDF8"
+DEFAULT_VISUAL_TRIANGLE_LIMIT = 6000
 
 
 def _translation(matrix: list[list[float]]) -> tuple[float, float, float]:
@@ -149,21 +63,20 @@ def _distance(
 class PoseViewWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self._entries: list[_Entry] = []
-        self._mode = "matrix"
-        self._default_hint = MODE_HINTS["matrix"]
+        self._pose_entries: list = []
         self._robot: UrdfRobot | None = None
         self._joint_values: dict[str, float] = {}
         self._ee_link = ""
         self._robot_target: list[list[float]] | None = None
+        self._show_visuals = True
         self._robot_dialog: RobotDialog | None = None
+        self._vectors: list[SceneVector] = []
+        self._tool_dialog: PoseVectorDialog | None = None
+        self._calc_dialog: CalcDialog | None = None
+        self._markers: list[SceneMarker] = []
         self._build_ui()
         self._build_shortcuts()
         self._build_status_bar()
-
-        self._hint_timer = QTimer(self)
-        self._hint_timer.setSingleShot(True)
-        self._hint_timer.timeout.connect(self._reset_hint)
 
         self._status_timer = QTimer(self)
         self._status_timer.setSingleShot(True)
@@ -174,8 +87,6 @@ class PoseViewWindow(QMainWindow):
         self._initial_fit_timer.timeout.connect(self._scene.fit_view)
         self._initial_fit_timer.start(60)
 
-        self._load_demo()
-
     # ------------------------------------------------------------------
     # 界面搭建
     # ------------------------------------------------------------------
@@ -184,7 +95,7 @@ class PoseViewWindow(QMainWindow):
         self.setWindowTitle("PoseView · 位姿矩阵可视化")
         self.setWindowIcon(app_icon())
         self.resize(1360, 880)
-        self.setMinimumSize(1120, 740)
+        self.setMinimumSize(1040, 660)
 
         root = QWidget()
         root.setObjectName("Root")
@@ -194,20 +105,11 @@ class PoseViewWindow(QMainWindow):
         outer.setSpacing(0)
         outer.addWidget(self._build_header())
 
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(10)
-        splitter.addWidget(self._build_left())
-        splitter.addWidget(self._build_view())
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([344, 970])
-
         wrapper = QWidget()
         wrapper_layout = QVBoxLayout(wrapper)
         wrapper_layout.setContentsMargins(14, 14, 14, 12)
         wrapper_layout.setSpacing(0)
-        wrapper_layout.addWidget(splitter)
+        wrapper_layout.addWidget(self._build_view())
         outer.addWidget(wrapper, 1)
 
     def _build_header(self) -> QFrame:
@@ -239,13 +141,29 @@ class PoseViewWindow(QMainWindow):
         badge.setObjectName("Badge")
         layout.addWidget(badge)
 
-        relative_button = QPushButton("相对位姿")
-        relative_button.setObjectName("Ghost")
-        relative_button.setIcon(icon("swap", "#475569", 15))
-        relative_button.setCursor(Qt.PointingHandCursor)
-        relative_button.setToolTip("计算两个坐标系之间的相对位姿")
-        relative_button.clicked.connect(self._show_relative_dialog)
-        layout.addWidget(relative_button)
+        tool_button = QPushButton("位姿 · 向量")
+        tool_button.setObjectName("Primary")
+        tool_button.setIcon(primary_icon("axis", 15))
+        tool_button.setCursor(Qt.PointingHandCursor)
+        tool_button.setToolTip("打开位姿与向量面板：位姿输入/解算/相对位姿，向量与夹角")
+        tool_button.clicked.connect(lambda: self._show_pose_vector_dialog())
+        layout.addWidget(tool_button)
+
+        calc_button = QPushButton("计算")
+        calc_button.setObjectName("Primary")
+        calc_button.setIcon(primary_icon("calc", 15))
+        calc_button.setCursor(Qt.PointingHandCursor)
+        calc_button.setToolTip("坐标变换、位姿测量、变换链、旋转四元数与数据工具")
+        calc_button.clicked.connect(self._show_calc_dialog)
+        layout.addWidget(calc_button)
+
+        urdf_button = QPushButton("URDF")
+        urdf_button.setObjectName("Primary")
+        urdf_button.setIcon(primary_icon("file", 15))
+        urdf_button.setCursor(Qt.PointingHandCursor)
+        urdf_button.setToolTip("加载 URDF 机器人，显示关节骨架")
+        urdf_button.clicked.connect(self._load_urdf)
+        layout.addWidget(urdf_button)
 
         help_button = QPushButton("使用说明")
         help_button.setObjectName("Ghost")
@@ -255,141 +173,10 @@ class PoseViewWindow(QMainWindow):
         layout.addWidget(help_button)
         return header
 
-    def _build_left(self) -> QWidget:
-        panel = QWidget()
-        panel.setMinimumWidth(320)
-        panel.setMaximumWidth(430)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-
-        input_card = QFrame()
-        input_card.setObjectName("Card")
-        card_layout = QVBoxLayout(input_card)
-        card_layout.setContentsMargins(14, 13, 14, 14)
-        card_layout.setSpacing(8)
-
-        head = QHBoxLayout()
-        head.setSpacing(8)
-        title = QLabel("位姿输入")
-        title.setObjectName("SectionTitle")
-        hint = QLabel("统一转为 4x4 解算")
-        hint.setObjectName("CardHint")
-        head.addWidget(title)
-        head.addStretch(1)
-        head.addWidget(hint)
-        card_layout.addLayout(head)
-
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(4)
-        self._mode_group = QButtonGroup(self)
-        self._mode_group.setExclusive(True)
-        self._mode_buttons: dict[str, QToolButton] = {}
-        for key, label in INPUT_MODES:
-            button = QToolButton()
-            button.setObjectName("ModeTab")
-            button.setText(label)
-            button.setCheckable(True)
-            button.setCursor(Qt.PointingHandCursor)
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            button.clicked.connect(
-                lambda _checked=False, name=key: self._set_mode(name)
-            )
-            self._mode_group.addButton(button)
-            self._mode_buttons[key] = button
-            mode_row.addWidget(button, 1)
-        self._mode_buttons["matrix"].setChecked(True)
-        card_layout.addLayout(mode_row)
-
-        self._editor = QPlainTextEdit()
-        self._editor.setObjectName("MatrixEditor")
-        self._editor.setFont(mono_font(11.5))
-        self._editor.setFixedHeight(148)
-        self._editor.setTabChangesFocus(True)
-        self._editor.setPlaceholderText(PLACEHOLDERS["matrix"])
-        card_layout.addWidget(self._editor)
-
-        self._parse_hint = QLabel(self._default_hint)
-        self._parse_hint.setObjectName("CardHint")
-        self._parse_hint.setWordWrap(True)
-        card_layout.addWidget(self._parse_hint)
-
-        buttons = QHBoxLayout()
-        buttons.setSpacing(8)
-        add_button = QPushButton("添加位姿")
-        add_button.setObjectName("Primary")
-        add_button.setIcon(primary_icon("plus", 15))
-        add_button.setCursor(Qt.PointingHandCursor)
-        add_button.clicked.connect(self._add_from_editor)
-        clear_input = QPushButton("清空输入")
-        clear_input.setObjectName("Ghost")
-        clear_input.setIcon(icon("clear", "#475569", 15))
-        clear_input.setCursor(Qt.PointingHandCursor)
-        clear_input.clicked.connect(self._clear_editor)
-        buttons.addWidget(add_button, 1)
-        buttons.addWidget(clear_input)
-        card_layout.addLayout(buttons)
-
-        layout.addWidget(input_card)
-
-        list_card = QFrame()
-        list_card.setObjectName("Card")
-        list_layout = QVBoxLayout(list_card)
-        list_layout.setContentsMargins(14, 13, 14, 14)
-        list_layout.setSpacing(8)
-
-        list_head = QHBoxLayout()
-        list_head.setSpacing(8)
-        list_title = QLabel("位姿列表")
-        list_title.setObjectName("SectionTitle")
-        self._count_badge = QLabel("0 帧")
-        self._count_badge.setObjectName("CountBadge")
-        list_head.addWidget(list_title)
-        list_head.addStretch(1)
-        list_head.addWidget(self._count_badge)
-        list_layout.addLayout(list_head)
-
-        self._list = QListWidget()
-        self._list.setObjectName("PoseList")
-        self._list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._list.setUniformItemSizes(True)
-        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._list.currentRowChanged.connect(self._on_row_changed)
-        self._list.itemChanged.connect(self._on_item_changed)
-        list_layout.addWidget(self._list, 1)
-
-        list_buttons = QHBoxLayout()
-        list_buttons.setSpacing(8)
-        delete_button = QPushButton("删除选中")
-        delete_button.setObjectName("Ghost")
-        delete_button.setIcon(icon("trash", "#475569", 15))
-        delete_button.setCursor(Qt.PointingHandCursor)
-        delete_button.clicked.connect(self._delete_selected)
-        clear_button = QPushButton("清空列表")
-        clear_button.setObjectName("Ghost")
-        clear_button.setIcon(icon("clear", "#475569", 15))
-        clear_button.setCursor(Qt.PointingHandCursor)
-        clear_button.clicked.connect(self._clear_all)
-        list_buttons.addWidget(delete_button, 1)
-        list_buttons.addWidget(clear_button, 1)
-        list_layout.addLayout(list_buttons)
-
-        layout.addWidget(list_card, 1)
-
-        values_card = QFrame()
-        values_card.setObjectName("Card")
-        values_layout = QVBoxLayout(values_card)
-        values_layout.setContentsMargins(0, 0, 0, 0)
-        values_layout.setSpacing(0)
-        self._value_panel = PoseValuePanel()
-        values_layout.addWidget(self._value_panel)
-        layout.addWidget(values_card)
-
-        return panel
-
     def _build_view(self) -> QFrame:
         self._scene = PoseScene()
         self._scene.pose_clicked.connect(self._on_scene_clicked)
+        self._scene.robot_item_selected.connect(self._on_robot_item_selected)
 
         card = QFrame()
         card.setObjectName("ViewCard")
@@ -414,7 +201,7 @@ class PoseViewWindow(QMainWindow):
         bar_layout.addWidget(self._view_button("适配", "fit", self._scene.fit_view, tooltip="缩放至全部可见几何"))
         self._pose_toggle = self._view_button(
             "位姿", "axis", self._scene.set_show_poses,
-            checkable=True, checked=True, tooltip="显示 / 隐藏位姿列表中的坐标轴",
+            checkable=True, checked=True, tooltip="显示 / 隐藏场景中的位姿坐标轴",
         )
         bar_layout.addWidget(self._pose_toggle)
         bar_layout.addWidget(
@@ -432,13 +219,14 @@ class PoseViewWindow(QMainWindow):
         bar_layout.addWidget(
             self._view_button(
                 "标签", "tag", self._scene.set_show_labels,
-                checkable=True, checked=True, tooltip="显示 / 隐藏位姿名称",
+                checkable=True, checked=True, tooltip="显示 / 隐藏位姿与向量名称",
             )
         )
         bar_layout.addWidget(
             self._view_button(
-                "URDF", "file", self._load_urdf,
-                tooltip="加载 URDF 机器人，显示关节骨架",
+                "测量", "ruler", self._toggle_measure,
+                checkable=True, checked=False,
+                tooltip="点击地面取点：两点测距、三点测角，Esc 清除",
             )
         )
         self._robot_button = self._view_button(
@@ -447,6 +235,12 @@ class PoseViewWindow(QMainWindow):
         )
         self._robot_button.setEnabled(False)
         bar_layout.addWidget(self._robot_button)
+        bar_layout.addWidget(
+            self._view_button(
+                "截图", "camera", self._save_screenshot,
+                tooltip="导出当前三维视图截图",
+            )
+        )
 
         layout.addWidget(bar)
         layout.addWidget(self._scene, 1)
@@ -481,13 +275,10 @@ class PoseViewWindow(QMainWindow):
         return button
 
     def _build_shortcuts(self) -> None:
-        add_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
-        add_shortcut.activated.connect(self._add_from_editor)
+        pose_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        pose_shortcut.activated.connect(lambda: self._show_pose_vector_dialog(0))
         help_shortcut = QShortcut(QKeySequence("F1"), self)
         help_shortcut.activated.connect(self._show_help)
-        delete_shortcut = QShortcut(QKeySequence(Qt.Key_Delete), self._list)
-        delete_shortcut.setContext(Qt.WidgetShortcut)
-        delete_shortcut.activated.connect(self._delete_selected)
 
     def _build_status_bar(self) -> None:
         status = self.statusBar()
@@ -498,53 +289,52 @@ class PoseViewWindow(QMainWindow):
         status.addPermanentWidget(self._counts)
 
     # ------------------------------------------------------------------
-    # 数据
+    # 位姿与向量面板
     # ------------------------------------------------------------------
 
-    def _load_demo(self) -> None:
-        self._editor.setPlainText(SAMPLE_MATRICES)
-        try:
-            poses = parse_poses(SAMPLE_MATRICES)
-        except MatrixParseError:
-            return
-        self._append_poses(poses)
-        self._flash_status("已加载示例位姿，可直接替换左侧矩阵后添加")
+    def _ensure_tool_dialog(self) -> PoseVectorDialog:
+        if self._tool_dialog is None:
+            dialog = PoseVectorDialog(self)
+            dialog.poses_changed.connect(self._on_poses_changed)
+            dialog.selection_changed.connect(self._on_pose_selection_changed)
+            dialog.vectors_changed.connect(self._on_vectors_changed)
+            self._tool_dialog = dialog
+        return self._tool_dialog
 
-    def _append_poses(self, poses: list[Pose]) -> None:
-        start = len(self._entries)
-        for offset, pose in enumerate(poses):
-            index = start + offset
-            self._entries.append(
-                _Entry(
-                    name=f"Pose {index + 1}",
-                    color=POSE_COLORS[index % len(POSE_COLORS)],
-                    pose=pose,
-                )
-            )
-        self._rebuild_list(len(self._entries) - 1)
+    def _show_pose_vector_dialog(self, tab: int | None = None) -> None:
+        dialog = self._ensure_tool_dialog()
+        if tab is not None:
+            dialog.set_tab(tab)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _close_tool_dialog(self) -> None:
+        if self._tool_dialog is None:
+            return
+        self._tool_dialog.close()
+        self._tool_dialog.deleteLater()
+        self._tool_dialog = None
+
+    def _on_poses_changed(self, entries: list) -> None:
+        was_empty = not self._pose_entries
+        self._pose_entries = list(entries)
         self._sync_scene()
         self._update_counts()
+        if self._calc_dialog is not None:
+            self._calc_dialog.set_pose_entries(self._pose_entries)
+        if was_empty and self._pose_entries:
+            self._scene.fit_view()
 
-    def _rebuild_list(self, select: int = -1) -> None:
-        self._list.blockSignals(True)
-        self._list.clear()
-        for index, entry in enumerate(self._entries):
-            x, y, z = entry.pose.values.position
-            item = QListWidgetItem(
-                f"{entry.name}    x {format_number(x, 2)}   "
-                f"y {format_number(y, 2)}   z {format_number(z, 2)}"
-            )
-            item.setIcon(dot_icon(entry.color))
-            item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if entry.visible else Qt.Unchecked)
-            item.setData(Qt.UserRole, index)
-            self._list.addItem(item)
-        self._list.blockSignals(False)
+    def _on_pose_selection_changed(self, index: int) -> None:
+        self._scene.set_selected(index)
 
-        if self._entries:
-            select = max(0, min(select, len(self._entries) - 1))
-            self._list.setCurrentRow(select)
-        self._sync_selection()
+    def _on_scene_clicked(self, index: int) -> None:
+        if not (0 <= index < len(self._pose_entries)):
+            return
+        self._show_pose_vector_dialog(0)
+        if self._tool_dialog is not None:
+            self._tool_dialog.select_row(index)
 
     def _sync_scene(self) -> None:
         self._scene.set_poses(
@@ -556,122 +346,102 @@ class PoseViewWindow(QMainWindow):
                     rotation=entry.pose.values.rotation,
                     visible=entry.visible,
                 )
-                for entry in self._entries
+                for entry in self._pose_entries
             ]
         )
-        self._scene.set_selected(self._list.currentRow())
-
-    def _sync_selection(self) -> None:
-        row = self._list.currentRow()
-        if 0 <= row < len(self._entries):
-            entry = self._entries[row]
-            self._value_panel.set_pose(entry.pose, entry.name, entry.color)
-            self._scene.set_selected(row)
-        else:
-            self._value_panel.clear()
-            self._scene.set_selected(-1)
 
     def _update_counts(self) -> None:
-        total = len(self._entries)
-        visible = sum(1 for entry in self._entries if entry.visible)
-        self._count_badge.setText(f"{total} 帧")
+        total = len(self._pose_entries)
+        visible = sum(1 for entry in self._pose_entries if entry.visible)
         self._counts.setText(f"共 {total} 帧 · 显示 {visible} 帧")
 
     # ------------------------------------------------------------------
-    # 操作
+    # 计算工具
     # ------------------------------------------------------------------
 
-    def _add_from_editor(self) -> None:
-        try:
-            poses = parse_poses(self._editor.toPlainText(), mode=self._mode)
-        except MatrixParseError as exc:
-            self._show_parse_hint(str(exc), DANGER)
-            self._flash_status("位姿解析失败")
-            return
-        start = len(self._entries)
-        self._append_poses(poses)
-        self._show_parse_hint(f"已添加 {len(poses)} 个位姿", SUCCESS)
-        self._flash_status(f"已添加 {len(poses)} 个位姿")
-        if start == 0:
-            self._scene.fit_view()
+    def _show_calc_dialog(self) -> None:
+        if self._calc_dialog is None:
+            dialog = CalcDialog(self)
+            dialog.pose_created.connect(self._on_calc_pose_created)
+            dialog.point_added.connect(self._on_calc_point_added)
+            dialog.vector_added.connect(self._on_calc_vector_added)
+            dialog.poses_imported.connect(self._on_poses_imported)
+            dialog.markers_cleared.connect(self._clear_markers)
+            dialog.set_pose_entries(self._pose_entries)
+            self._calc_dialog = dialog
+        self._calc_dialog.show()
+        self._calc_dialog.raise_()
+        self._calc_dialog.activateWindow()
 
-    def _set_mode(self, key: str) -> None:
-        if key not in SAMPLES:
+    def _close_calc_dialog(self) -> None:
+        if self._calc_dialog is None:
             return
-        button = self._mode_buttons.get(key)
-        if button is not None and not button.isChecked():
-            button.setChecked(True)
-        self._mode = key
-        text = self._editor.toPlainText().strip()
-        samples = {sample.strip() for sample in SAMPLES.values()}
-        if not text or text in samples:
-            self._editor.setPlainText(SAMPLES[key].strip())
-        self._editor.setPlaceholderText(PLACEHOLDERS[key])
-        self._default_hint = MODE_HINTS[key]
-        self._show_parse_hint(self._default_hint, MUTED)
+        self._calc_dialog.close()
+        self._calc_dialog.deleteLater()
+        self._calc_dialog = None
 
-    def _clear_editor(self) -> None:
-        self._editor.clear()
-        self._editor.setFocus()
-        self._show_parse_hint(self._default_hint, MUTED)
+    def _on_calc_pose_created(self, matrix, name: str) -> None:
+        dialog = self._ensure_tool_dialog()
+        dialog.add_pose(matrix, name)
+        self._flash_status(f"已添加位姿 {name}")
 
-    def _delete_selected(self) -> None:
-        row = self._list.currentRow()
-        if not (0 <= row < len(self._entries)):
+    def _on_calc_point_added(self, name: str, position) -> None:
+        self._markers.append(SceneMarker(name, MARKER_COLOR, position))
+        self._scene.set_markers(self._markers)
+        self._flash_status(f"已添加标注 {name}")
+
+    def _on_calc_vector_added(self, name: str, start, direction) -> None:
+        dialog = self._ensure_tool_dialog()
+        vector_name = dialog.add_vector(start, direction, name)
+        if not vector_name:
+            self._flash_status("变换结果为零向量，未添加")
             return
-        entry = self._entries.pop(row)
-        self._rebuild_list(min(row, len(self._entries) - 1))
-        self._sync_scene()
-        self._update_counts()
-        self._flash_status(f"已删除 {entry.name}")
+        self._flash_status(f"已添加向量 {vector_name}")
 
-    def _clear_all(self) -> None:
-        if not self._entries:
+    def _on_poses_imported(self, items: list) -> None:
+        dialog = self._ensure_tool_dialog()
+        count = dialog.add_poses(items)
+        self._flash_status(f"已导入 {count} 个位姿")
+
+    def _clear_markers(self) -> None:
+        if not self._markers:
             return
-        answer = QMessageBox.question(
+        self._markers.clear()
+        self._scene.set_markers([])
+        self._flash_status("已清除场景标注")
+
+    # ------------------------------------------------------------------
+    # 测量与截图
+    # ------------------------------------------------------------------
+
+    def _toggle_measure(self, enabled: bool) -> None:
+        self._scene.set_measure_mode(enabled)
+        if enabled:
+            self._flash_status("测量模式：点击地面取点，两点测距、三点测角")
+        else:
+            self._flash_status("已退出测量模式")
+
+    def _save_screenshot(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
             self,
-            "清空位姿",
-            f"确定清空全部 {len(self._entries)} 个位姿？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            "导出三维视图截图",
+            "poseview.png",
+            "PNG 图片 (*.png);;JPEG 图片 (*.jpg *.jpeg)",
         )
-        if answer != QMessageBox.Yes:
+        if not path:
             return
-        self._entries.clear()
-        self._rebuild_list()
-        self._sync_scene()
-        self._update_counts()
-        self._flash_status("已清空位姿列表")
-
-    def _on_row_changed(self, row: int) -> None:
-        self._sync_selection()
-
-    def _on_item_changed(self, item: QListWidgetItem) -> None:
-        row = self._list.row(item)
-        if not (0 <= row < len(self._entries)):
-            return
-        self._entries[row].visible = item.checkState() == Qt.Checked
-        self._sync_scene()
-        self._update_counts()
-
-    def _on_scene_clicked(self, index: int) -> None:
-        if 0 <= index < len(self._entries):
-            self._list.setCurrentRow(index)
-
-    # ------------------------------------------------------------------
-    # 相对位姿与机器人
-    # ------------------------------------------------------------------
-
-    def _show_relative_dialog(self) -> None:
-        if len(self._entries) < 2:
-            QMessageBox.information(
-                self, "相对位姿计算", "至少需要两个位姿才能计算相对位姿。"
+        if not path.lower().endswith((".png", ".jpg", ".jpeg")):
+            path += ".png"
+        if self._scene.grab().save(path):
+            self._flash_status(f"已保存截图：{path}")
+        else:
+            QMessageBox.warning(
+                self, "导出失败", "无法保存图片，请检查路径与权限。"
             )
-            return
-        dialog = RelativePoseDialog(
-            [(entry.name, entry.pose.matrix) for entry in self._entries], self
-        )
-        dialog.exec_()
+
+    # ------------------------------------------------------------------
+    # 机器人
+    # ------------------------------------------------------------------
 
     def _load_urdf(self) -> None:
         path, _selected = QFileDialog.getOpenFileName(
@@ -696,14 +466,27 @@ class PoseViewWindow(QMainWindow):
         self._ee_link = robot.default_ee_link()
         self._robot_target = None
         self._robot_button.setEnabled(True)
+        show_visuals = (
+            robot.visual_triangle_count <= DEFAULT_VISUAL_TRIANGLE_LIMIT
+        )
+        self._show_visuals = show_visuals
+        self._scene.set_show_visuals(show_visuals)
+        pose_count = self._add_joint_poses(robot)
         self._refresh_robot(fit=True)
-        self._show_robot_dialog()
+        self._show_robot_dialog(show_visuals)
         detail = f"已加载机器人 {robot.name} · {len(robot.movable_joints)} 个可动关节"
+        if pose_count:
+            detail += f" · 已添加 {pose_count} 个关节位姿"
         if robot.warnings:
             detail += f"（{len(robot.warnings)} 条提示）"
+        if robot.visuals and not show_visuals:
+            detail += (
+                f" · 外观 {robot.visual_triangle_count} 个三角面，"
+                "已默认关闭，可在关节面板的“外观”开启"
+            )
         self._flash_status(detail)
 
-    def _show_robot_dialog(self) -> None:
+    def _show_robot_dialog(self, show_visuals: bool | None = None) -> None:
         if self._robot is None:
             self._flash_status("请先加载 URDF 机器人")
             return
@@ -713,17 +496,37 @@ class PoseViewWindow(QMainWindow):
                 self._joint_values,
                 self._ee_link,
                 self._robot_target,
+                True if show_visuals is None else show_visuals,
                 self,
             )
             dialog.angles_changed.connect(self._on_robot_angles)
             dialog.ee_changed.connect(self._on_robot_ee_changed)
             dialog.target_changed.connect(self._on_robot_target_changed)
             dialog.clear_requested.connect(self._clear_robot)
+            dialog.visuals_toggled.connect(self._on_visuals_toggled)
             self._robot_dialog = dialog
             self._refresh_robot()
         self._robot_dialog.show()
         self._robot_dialog.raise_()
         self._robot_dialog.activateWindow()
+
+    def _add_joint_poses(self, robot: UrdfRobot) -> int:
+        """把当前各关节坐标系作为位姿加入位姿列表。"""
+        result = robot.forward(self._joint_values, self._ee_link)
+        items = [
+            (f"{robot.name} · {joint.name}", result.joint_frames[joint.name])
+            for joint in robot.joints
+            if joint.name in result.joint_frames
+        ]
+        if not items:
+            return 0
+        dialog = self._ensure_tool_dialog()
+        return dialog.add_poses(items, visible=False)
+
+    def _on_visuals_toggled(self, enabled: bool) -> None:
+        self._show_visuals = bool(enabled)
+        self._scene.set_show_visuals(self._show_visuals)
+        self._refresh_robot()
 
     def _close_robot_dialog(self) -> None:
         if self._robot_dialog is None:
@@ -757,6 +560,37 @@ class PoseViewWindow(QMainWindow):
             rotation_error = rotation_angle_between(
                 _rotation(result.ee_matrix), _rotation(self._robot_target)
             )
+        visuals: list[SceneVisual] = []
+        if self._show_visuals:
+            for visual in self._robot.visuals:
+                frame = result.link_frames.get(visual.link)
+                if frame is None:
+                    continue
+                triangles = [
+                    tuple(
+                        transform_point(frame, vertex) for vertex in triangle
+                    )
+                    for triangle in visual.triangles
+                ]
+                red, green, blue, alpha = visual.color
+                color = "#{:02X}{:02X}{:02X}".format(
+                    round(red * 255), round(green * 255), round(blue * 255)
+                )
+                visuals.append(
+                    SceneVisual(visual.link, color, alpha, triangles)
+                )
+        joints_info = [
+            RobotJoint(
+                info.name,
+                info.type,
+                info.position,
+                info.axis,
+                info.lower,
+                info.upper,
+                info.value,
+            )
+            for info in result.joint_infos
+        ]
         skeleton = RobotSkeleton(
             name=self._robot.name,
             bones=result.segments,
@@ -768,6 +602,9 @@ class PoseViewWindow(QMainWindow):
                 for link, frame in result.link_frames.items()
                 if link != result.ee_link and link != self._robot.root_link
             ],
+            visuals=visuals,
+            bone_links=list(result.segment_links),
+            joints_info=joints_info,
         )
         self._scene.set_robot(skeleton)
         if self._robot_dialog is not None:
@@ -788,6 +625,39 @@ class PoseViewWindow(QMainWindow):
         self._robot_target = matrix
         self._refresh_robot()
 
+    def _on_robot_item_selected(self, kind: str, name: str) -> None:
+        if self._robot is None:
+            return
+        if kind == "joint":
+            joint = next(
+                (
+                    item
+                    for item in self._robot.joints
+                    if item.name == name
+                ),
+                None,
+            )
+            if joint is None:
+                return
+            value = self._robot.effective_value(joint, self._joint_values)
+            suffix = f" · 联动 ← {joint.mimic}" if joint.mimic else ""
+            if joint.type in ("revolute", "continuous"):
+                text = (
+                    f"关节 {name} · {math.degrees(value):.1f}° · "
+                    f"限位 [{math.degrees(joint.lower):.1f}°, "
+                    f"{math.degrees(joint.upper):.1f}°]{suffix}"
+                )
+            elif joint.type == "prismatic":
+                text = (
+                    f"关节 {name} · {value:.3f} m · "
+                    f"限位 [{joint.lower:.3f}, {joint.upper:.3f}] m{suffix}"
+                )
+            else:
+                text = f"关节 {name}{suffix}"
+        else:
+            text = f"连杆 {name}"
+        self._flash_status(text)
+
     def _clear_robot(self) -> None:
         self._close_robot_dialog()
         if self._robot is None:
@@ -802,20 +672,24 @@ class PoseViewWindow(QMainWindow):
         self._flash_status("已移除机器人模型")
 
     # ------------------------------------------------------------------
-    # 提示
+    # 向量
     # ------------------------------------------------------------------
 
-    def _show_parse_hint(self, text: str, color: str) -> None:
-        self._parse_hint.setText(text)
-        self._parse_hint.setStyleSheet(f"color: {color};")
-        if text == self._default_hint:
-            self._hint_timer.stop()
-        else:
-            self._hint_timer.start(5000)
+    def _on_vectors_changed(self, vectors: list) -> None:
+        was_empty = not self._vectors
+        self._vectors = list(vectors)
+        self._scene.set_vectors(self._vectors)
+        if was_empty and self._vectors:
+            self._scene.fit_view()
+        if not self._vectors:
+            self._flash_status("向量已清空")
+            return
+        visible = sum(1 for vector in self._vectors if vector.visible)
+        self._flash_status(f"向量 {visible} / {len(self._vectors)} 显示")
 
-    def _reset_hint(self) -> None:
-        self._parse_hint.setText(self._default_hint)
-        self._parse_hint.setStyleSheet(f"color: {MUTED};")
+    # ------------------------------------------------------------------
+    # 提示
+    # ------------------------------------------------------------------
 
     def _flash_status(self, text: str) -> None:
         self._status_hint.setText(text)
@@ -826,6 +700,8 @@ class PoseViewWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._close_robot_dialog()
+        self._close_tool_dialog()
+        self._close_calc_dialog()
         super().closeEvent(event)
 
     def _show_help(self) -> None:
@@ -833,29 +709,50 @@ class PoseViewWindow(QMainWindow):
             self,
             "PoseView 使用说明",
             "<b>输入</b><br>"
-            "· 顶部可切换三种方式：齐次矩阵 / 位置 + 四元数 / 位置 + 欧拉角<br>"
+            "· 点击右上角“位姿 · 向量”打开合并面板，“位姿”标签页可切换齐次矩阵 / 位置 + 四元数 / 位置 + 欧拉角 / 位置 + 旋转向量<br>"
             "· 齐次矩阵：支持 4x4、3x4（旋转 + 平移）与 3x3（仅旋转）<br>"
             "· 位置 + 四元数：每帧 7 个数 <code>x y z qw qx qy qz</code>，四元数会自动归一化<br>"
             "· 位置 + 欧拉角：每帧 6 个数 <code>x y z roll pitch yaw</code>，角度单位为度<br>"
+            "· 位置 + 旋转向量：每帧 6 个数 <code>x y z rx ry rz</code>，单位为弧度<br>"
             "· 数字之间可用空格、逗号、分号或方括号分隔<br>"
             "· 空行或 <code>---</code> 分隔多帧，一次可添加多个位姿<br>"
             "· 4x4 最后一行须为 <code>0 0 0 1</code><br><br>"
+            "<b>位姿标签页</b><br>"
+            "· 位姿列表复选框控制显隐，轨迹按列表顺序连接可见位姿<br>"
+            "· “姿态解算”显示位置、RPY、四元数、轴角与旋转向量，可复制<br>"
+            "· “相对位姿”选择坐标系 A 与 B，计算 B 在 A 下的 4x4、位置、RPY 与四元数<br>"
+            "· 交换按钮可反向计算，复制按钮导出矩阵与姿态结果<br><br>"
             "<b>约定</b><br>"
             "· 右手坐标系，Z 轴向上；矩阵列向量为位姿的 X / Y / Z 轴<br>"
             "· 欧拉角为 ZYX：先绕 Z 偏航（yaw），再绕 Y 俯仰（pitch），最后绕 X 横滚（roll）<br>"
             "· 四元数按 (w, x, y, z) 显示<br><br>"
-            "<b>相对位姿</b><br>"
-            "· 点击顶部“相对位姿”，选择坐标系 A 与 B，计算 B 在 A 下的 4x4、位置、RPY 与四元数<br>"
-            "· 交换按钮可反向计算，复制按钮导出矩阵与姿态结果<br><br>"
+            "<b>向量标签页</b><br>"
+            "· 用“起点 + 方向”或“起点 + 终点”添加，每行 6 个数<br>"
+            "· 向量以箭头绘制，起点用圆点标记；列表复选框控制显隐<br>"
+            "· “夹角计算”显示夹角、cos θ、点积、模长、叉积与投影，叉积可加入场景<br><br>"
+            "<b>计算工具</b><br>"
+            "· 点击右上角“计算”打开，包含点位变换、位姿测量、变换链、旋转 / 四元数、数据 / 轨迹<br>"
+            "· 点位变换：点按 <code>T·p</code>、向量按 <code>R·v</code> 计算，支持 T⁻¹，可加入场景标注<br>"
+            "· 位姿测量：选择 A / B，显示位置差、距离、姿态夹角与 A 坐标系下的转轴<br>"
+            "· 变换链：勾选位姿按顺序相乘，支持反向，显示 det、正交误差、迹，可加入为位姿<br>"
+            "· 旋转 / 四元数：轴角与旋转向量、四元数乘法 / 共轭、slerp 插值并加入场景<br>"
+            "· 数据 / 轨迹：CSV / JSON 导入导出，总路程、总转角、首末位移与分段表<br><br>"
             "<b>机器人 / URDF</b><br>"
-            "· 点击三维视图右上角“加载 URDF”，显示关节骨架与末端坐标系<br>"
-            "· “关节”打开关节控制：滑条或数值框驱动正运动学，末端位姿实时更新<br>"
-            "· IK 目标校验：输入目标 x y z roll pitch yaw，或取当前末端作为目标，实时查看位置 / 姿态误差<br>"
-            "· 支持 revolute / continuous / prismatic / fixed 关节；仅解析骨架，不加载 mesh 外观<br>"
+            "· 点击右上角“URDF”加载机器人，显示关节骨架、外观与末端坐标系<br>"
+            "· 加载时会把各关节坐标系作为位姿加入位姿列表，名称形如 <code>机器人名 · 关节名</code><br>"
+            "· 外观支持 box / cylinder / sphere 与 STL / OBJ mesh，颜色取自 URDF material；面板中“外观”复选框可整体开关<br>"
+            "· 三维视图右上角“关节”打开关节控制：滑条或数值框驱动正运动学，末端位姿实时更新，可勾选“锁”固定关节<br>"
+            "· 点击场景中的连杆或关节可选中高亮，状态栏显示关节角度与限位<br>"
+            "· IK 求解：输入目标 x y z roll pitch yaw，或取当前末端作为目标，设置位置 / 姿态权重后点“求解 IK”<br>"
+            "· “取当前末端”可校验外部 IK 结果，状态栏显示迭代次数、位置误差与姿态误差<br>"
+            "· 支持 revolute / continuous / prismatic / fixed 关节；mimic 关节按 multiplier / offset 跟随源关节，不能单独拖动或锁定<br>"
+            "· 外观三角面较多（超过 6000）时默认关闭，避免拖动卡顿；交互期间会自动临时隐藏外观，停下后恢复<br>"
+            "· mesh 支持 STL 与 OBJ（DAE 会跳过并提示）<br>"
             "· 取消“位姿”开关可只观察机器人，不受位姿列表干扰<br><br>"
             "<b>操作</b><br>"
             "· 左键拖动旋转，右键拖动平移，滚轮缩放，双击复位<br>"
-            "· 点击三维场景中的位姿原点可选中对应列表项<br>"
-            "· 列表复选框控制显隐，轨迹按列表顺序连接可见位姿<br>"
-            "· <code>Ctrl+Enter</code> 添加位姿，<code>Delete</code> 删除选中",
+            "· 点击三维场景中的位姿原点会打开合并面板并切到“位姿”标签页、选中对应位姿<br>"
+            "· 工具栏“测量”进入测量模式：点击地面取点，两点测距、三点测角，<code>Esc</code> 清除<br>"
+            "· 工具栏“截图”导出当前三维视图<br>"
+            "· <code>Ctrl+Enter</code> 打开“位姿 · 向量”面板，<code>Delete</code> 删除面板中选中的位姿",
         )

@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTreeWidget, QTreeWidgetItem, QComboBox, QSizePolicy,
                              QRadioButton, QStackedWidget, QTabWidget, QHeaderView,
                              QShortcut, QMenu, QAction, QToolButton, QTabBar,
-                             QScrollArea, QFrame)
+                             QScrollArea, QFrame, QDialog, QTextBrowser)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QMimeData, QEvent, QSize, QRectF, QPointF
 from PyQt5.QtGui import (QDrag, QFont, QIcon, QPixmap, QPainter, QPen, QColor,
                          QPainterPath, QCursor)
@@ -3075,6 +3075,132 @@ def _first_timestamp_epoch(ts_series):
 # 屏幕切换事件类型（窗口拖至副屏/DPI 变化时触发界面刷新）
 _SCREEN_CHANGE_TYPE = getattr(QEvent, 'ScreenChangeInternal', None)
 
+
+HELP_HTML = """
+<style>
+  body { color: #334155; font-size: 13px; }
+  h2 { color: #1D4ED8; font-size: 15px; margin-top: 18px; margin-bottom: 6px; }
+  h3 { color: #1E293B; font-size: 13px; margin-top: 12px; margin-bottom: 4px; }
+  li { margin-bottom: 3px; }
+  code { background: #F1F5F9; color: #1E293B; }
+  td { padding: 5px 8px; border-bottom: 1px solid #E2E8F0; }
+  th { padding: 5px 8px; background: #F8FAFC; color: #475569; text-align: left; }
+</style>
+
+<h2>快速开始</h2>
+<ul>
+  <li><b>离线分析</b>：选择日志文件或文件夹（也可直接拖入窗口）→ 点击 <b>加载</b>。</li>
+  <li><b>在线监控</b>：选择设备类型 → 填写 SSH 连接信息 → <b>连接并开始监控</b> → 把左侧数据列拖入右侧绘图区。</li>
+  <li>把左侧数据列树的列名<b>拖到绘图区</b>即可建立曲线。</li>
+</ul>
+
+<h2>离线模式</h2>
+<ul>
+  <li><b>多文件拖拽</b>：一次拖入多个文件时按文件首行时间戳自动排序拼接；修改路径框内容后该批次失效。</li>
+  <li><b>启用缓存</b>：文件夹首次加载生成 <code>_combined_cache.pkl</code>，下次秒开；旧版 parquet 缓存会自动清理。</li>
+  <li><b>使用相对时间</b>：忽略日志原始时间戳，按行号生成时间轴（默认开启）。</li>
+  <li><b>重建缓存</b>：删除缓存后重新解析，仅在选中文件夹且启用缓存时可用。</li>
+  <li><b>取消</b>：中止当前加载任务。</li>
+  <li>数据列超过 150 列时会询问是否只保留前 150 列，避免绘图卡顿。</li>
+</ul>
+
+<h2>在线模式</h2>
+<ul>
+  <li>设备类型（从手 / 主手 / ADS）来自配置文件 <code>online_paths</code>。</li>
+  <li><b>按需记录</b>：把某个臂的数据列拖进绘图区后，该臂才开始记录与绘图，未使用的臂不占带宽。</li>
+  <li><b>暂停 / 继续</b>：快捷键 <code>P</code>，暂停后可自由缩放、回看缓存数据。</li>
+  <li><b>保留时间</b>（1–120 s）：决定可回看的时间跨度与内存占用上限。</li>
+  <li>某个臂超过 10 秒无数据时会自动停止该臂读取，不影响其他臂。</li>
+</ul>
+
+<h2>绘图区</h2>
+<ul>
+  <li><b>分栏</b>：右上角工具条的“水平分栏（左右并排）/ 垂直分栏（上下堆叠）”。</li>
+  <li><b>新建标签页</b>：工具条 <code>+</code>，标签页标题自带关闭按钮。</li>
+  <li><b>跟随最新数据</b>：鼠标移到子视图上，点右上角悬浮按钮 <code>»</code>。</li>
+  <li><b>差分</b>：在图例上点右键 → 显示 / 隐藏差分（相邻采样点差值），曲线名带 <code>[diff]</code> 后缀。</li>
+  <li><b>游标 A / B</b>：工具条 <code>A</code>（红）/ <code>B</code>（蓝），用于读取某一时刻各曲线数值。</li>
+  <li><b>时间跳转</b>：工具条时钟按钮或快捷键 <code>J</code>，会记住上次输入。</li>
+  <li><b>保存图像</b>：左栏“保存当前页图像”，支持 PNG / JPEG / BMP。</li>
+</ul>
+
+<h2>鼠标操作</h2>
+<table cellspacing="0" cellpadding="0" width="100%">
+  <tr><th width="30%">操作</th><th>效果</th></tr>
+  <tr><td>左键拖动</td><td>平移视图</td></tr>
+  <tr><td>中键拖动</td><td>框选放大（拉出矩形，松开后缩放到该区域）</td></tr>
+  <tr><td>右键拖动</td><td>缩放（水平 / 垂直拖动分别改变横 / 纵向比例）</td></tr>
+  <tr><td>滚轮</td><td>缩放</td></tr>
+  <tr><td>右键点图例</td><td>显示 / 隐藏差分、删除曲线</td></tr>
+  <tr><td>双击绘图区</td><td>所有子图跳到最新数据并开启跟随</td></tr>
+  <tr><td>悬浮在曲线上</td><td>显示该点横纵坐标，多条曲线重合时全部列出</td></tr>
+</table>
+
+<h2>快捷键</h2>
+<table cellspacing="0" cellpadding="0" width="100%">
+  <tr><th width="30%">按键</th><th>效果</th></tr>
+  <tr><td><code>J</code></td><td>打开时间跳转对话框</td></tr>
+  <tr><td><code>P</code></td><td>暂停 / 继续（在线模式）</td></tr>
+  <tr><td><code>Tab</code></td><td>在已开启的游标 A / B 之间切换活动游标</td></tr>
+  <tr><td><code>←</code> / <code>→</code></td><td>活动游标左 / 右移动 1 ms</td></tr>
+  <tr><td><code>S</code></td><td>以当前子视图的 X 轴范围同步其他所有子图</td></tr>
+  <tr><td><code>T</code></td><td>以第一个子视图的 X 轴范围同步其他所有子图</td></tr>
+</table>
+
+<h2>配置与日志</h2>
+<ul>
+  <li>解析规则由 <code>configs/data_formats.json</code> 描述，支持 slave / boom / master / lout 四种格式自动识别。</li>
+  <li>配置查找顺序：程序同级 <code>configs/data_formats.json</code> → exe 内置资源 → 代码内嵌默认配置。</li>
+  <li>运行日志：<code>logs/logAnalysis.log</code>；目录不可写时回退到 <code>%TEMP%\\logAnalysis_logs</code>。</li>
+</ul>
+
+<h2>常见问题</h2>
+<table cellspacing="0" cellpadding="0" width="100%">
+  <tr><th width="34%">现象</th><th>处理</th></tr>
+  <tr><td>提示“未找到有效日志数据”</td><td>日志格式不在配置中，核对 <code>data_formats.json</code> 的 detect / fields</td></tr>
+  <tr><td>加载很慢</td><td>勾选“启用缓存”，或“重建缓存”后重试</td></tr>
+  <tr><td>在线模式没有曲线</td><td>需要把该臂的数据列从左侧拖入绘图区</td></tr>
+  <tr><td>某个臂自动停止</td><td>该臂 10 s 内无数据，检查设备日志后重连</td></tr>
+  <tr><td>exe 换机闪退</td><td>确认打包时 <code>upx=False</code>，并使用 <code>logAnalysis.spec</code></td></tr>
+</table>
+"""
+
+
+class HelpDialog(QDialog):
+    """应用内使用说明（可滚动）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("使用说明 · YC日志分析平台")
+        self.resize(880, 720)
+        self.setMinimumSize(640, 480)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        title = QLabel("YC日志分析平台 · 使用说明")
+        title.setStyleSheet(
+            "font-size: 16px; font-weight: 700; color: #1E293B;"
+        )
+        layout.addWidget(title)
+
+        browser = QTextBrowser()
+        browser.setObjectName("HelpBrowser")
+        browser.setOpenExternalLinks(False)
+        browser.setHtml(HELP_HTML)
+        layout.addWidget(browser, 1)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        close_button = QPushButton("关闭")
+        close_button.setProperty("class", "primary")
+        close_button.setMinimumWidth(88)
+        close_button.clicked.connect(self.accept)
+        bottom.addWidget(close_button)
+        layout.addLayout(bottom)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3137,9 +3263,18 @@ class MainWindow(QMainWindow):
         left_layout.setSpacing(8)
         left_layout.setContentsMargins(10, 10, 10, 10)
 
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
         title = QLabel("📊 YC日志分析平台")
         title.setObjectName("appTitle")
-        left_layout.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        help_btn = QPushButton("使用说明")
+        help_btn.setToolTip("查看功能、操作与快捷键说明（F1）")
+        help_btn.clicked.connect(self.show_help)
+        title_row.addWidget(help_btn)
+        QShortcut(Qt.Key_F1, self, self.show_help)
+        left_layout.addLayout(title_row)
 
         # 模式选择
         mode_group = QGroupBox("工作模式")
@@ -3628,6 +3763,11 @@ class MainWindow(QMainWindow):
             else:
                 pixmap.save(path + ".png")
                 self.statusBar().showMessage(f"图像已保存至: {path}.png")
+
+    # ========== 使用说明 ==========
+    def show_help(self):
+        """打开应用内使用说明。"""
+        HelpDialog(self).exec_()
 
     # ========== 模式切换 ==========
     def on_mode_changed(self):

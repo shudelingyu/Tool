@@ -14,12 +14,17 @@ from PyQt5.QtWidgets import (
 )
 
 from .icons import icon
-from .math3d import Pose, format_number
+from .math3d import (
+    Pose,
+    axis_angle_from_rotation,
+    format_number,
+    rotation_vector_from_rotation,
+)
 from .theme import FAINT, SUCCESS, WARNING, mono_font
 
 
 class PoseValuePanel(QWidget):
-    """展示选中位姿的位置、欧拉角与四元数。"""
+    """展示选中位姿的位置、RPY、四元数、轴角与旋转向量。"""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -64,7 +69,7 @@ class PoseValuePanel(QWidget):
         head.addWidget(self._copy_button)
         layout.addLayout(head)
 
-        self._empty = QLabel("选中位姿后显示位置、欧拉角与四元数")
+        self._empty = QLabel("选中位姿后显示位置、RPY、四元数、轴角与旋转向量")
         self._empty.setObjectName("CardHint")
         self._empty.setWordWrap(True)
         layout.addWidget(self._empty)
@@ -77,6 +82,8 @@ class PoseValuePanel(QWidget):
         self._position_label = self._make_row(body, "位置 / m")
         self._euler_label = self._make_row(body, "RPY / °")
         self._quaternion_label = self._make_row(body, "四元数")
+        self._axis_label = self._make_row(body, "轴角")
+        self._rotvec_label = self._make_row(body, "旋转向量")
 
         self._warning = QLabel()
         self._warning.setWordWrap(True)
@@ -136,11 +143,23 @@ class PoseValuePanel(QWidget):
             f"w {format_number(w, 3)}   x {format_number(qx, 3)}   "
             f"y {format_number(qy, 3)}   z {format_number(qz, 3)}"
         )
+        axis, angle = axis_angle_from_rotation(values.rotation)
+        axis_text = (
+            f"axis ({format_number(axis[0], 3)}, {format_number(axis[1], 3)}, "
+            f"{format_number(axis[2], 3)})   angle {format_number(angle, 2)}°"
+        )
+        rx, ry, rz = rotation_vector_from_rotation(values.rotation)
+        rotvec_text = (
+            f"({format_number(rx, 4)}, {format_number(ry, 4)}, "
+            f"{format_number(rz, 4)}) rad"
+        )
 
         for label, text in (
             (self._position_label, position_text),
             (self._euler_label, euler_text),
             (self._quaternion_label, quaternion_text),
+            (self._axis_label, axis_text),
+            (self._rotvec_label, rotvec_text),
         ):
             label.setText(text)
             label.setToolTip(text)
