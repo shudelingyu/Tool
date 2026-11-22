@@ -483,9 +483,15 @@ class CalcDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.viewport().setStyleSheet("background: transparent;")
+        scroll.viewport().setObjectName("CalcScrollViewport")
+        scroll.viewport().setStyleSheet(
+            "QWidget#CalcScrollViewport { background: transparent; }"
+        )
         container = QWidget()
-        container.setStyleSheet("background: transparent;")
+        container.setObjectName("CalcScrollContainer")
+        container.setStyleSheet(
+            "QWidget#CalcScrollContainer { background: transparent; }"
+        )
         layout = QVBoxLayout(container)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
@@ -735,9 +741,15 @@ class CalcDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.viewport().setStyleSheet("background: transparent;")
+        scroll.viewport().setObjectName("CalcScrollViewport")
+        scroll.viewport().setStyleSheet(
+            "QWidget#CalcScrollViewport { background: transparent; }"
+        )
         container = QWidget()
-        container.setStyleSheet("background: transparent;")
+        container.setObjectName("CalcScrollContainer")
+        container.setStyleSheet(
+            "QWidget#CalcScrollContainer { background: transparent; }"
+        )
         layout = QVBoxLayout(container)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
@@ -1293,9 +1305,15 @@ class CalcDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.viewport().setStyleSheet("background: transparent;")
+        scroll.viewport().setObjectName("CalcScrollViewport")
+        scroll.viewport().setStyleSheet(
+            "QWidget#CalcScrollViewport { background: transparent; }"
+        )
         container = QWidget()
-        container.setStyleSheet("background: transparent;")
+        container.setObjectName("CalcScrollContainer")
+        container.setStyleSheet(
+            "QWidget#CalcScrollContainer { background: transparent; }"
+        )
         layout = QVBoxLayout(container)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)

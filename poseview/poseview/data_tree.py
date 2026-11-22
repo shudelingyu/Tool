@@ -251,7 +251,8 @@ class DataTree(QTreeWidget):
         enabled: bool,
     ) -> QWidget:
         row = QWidget()
-        row.setStyleSheet("background: transparent;")
+        row.setObjectName("JointRow")
+        row.setStyleSheet("QWidget#JointRow { background: transparent; }")
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 1, 2, 1)
         layout.setSpacing(5)

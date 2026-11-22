@@ -224,9 +224,15 @@ class RobotDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.viewport().setStyleSheet("background: transparent;")
+        scroll.viewport().setObjectName("RobotScrollViewport")
+        scroll.viewport().setStyleSheet(
+            "QWidget#RobotScrollViewport { background: transparent; }"
+        )
         container = QWidget()
-        container.setStyleSheet("background: transparent;")
+        container.setObjectName("RobotScrollContainer")
+        container.setStyleSheet(
+            "QWidget#RobotScrollContainer { background: transparent; }"
+        )
         rows = QVBoxLayout(container)
         rows.setContentsMargins(0, 0, 2, 0)
         rows.setSpacing(6)
