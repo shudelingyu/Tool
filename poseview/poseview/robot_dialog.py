@@ -41,6 +41,8 @@ class _Control:
     lock: QCheckBox
     minimum: float
     maximum: float
+    label: QLabel
+    row: QWidget
 
     @property
     def is_angular(self) -> bool:
@@ -65,6 +67,7 @@ class RobotDialog(QDialog):
     target_changed = pyqtSignal(object)
     clear_requested = pyqtSignal()
     visuals_toggled = pyqtSignal(bool)
+    skeleton_toggled = pyqtSignal(bool)
 
     def __init__(
         self,
@@ -74,6 +77,7 @@ class RobotDialog(QDialog):
         target: list[list[float]] | None = None,
         show_visuals: bool = True,
         parent=None,
+        show_skeleton: bool = True,
     ) -> None:
         super().__init__(parent)
         self._robot = robot
@@ -82,8 +86,11 @@ class RobotDialog(QDialog):
         self._ee_matrix: list[list[float]] | None = None
         self._target_matrix: list[list[float]] | None = None
         self._controls: dict[str, _Control] = {}
+        self._joint_scroll: QScrollArea | None = None
+        self._selected_control: _Control | None = None
         self._locked: set[str] = set()
         self._initial_visuals = bool(show_visuals)
+        self._initial_skeleton = bool(show_skeleton)
         self._updating = True
         self._copy_timer = QTimer(self)
         self._copy_timer.setSingleShot(True)
@@ -156,6 +163,14 @@ class RobotDialog(QDialog):
             )
         self._visuals_check.toggled.connect(self.visuals_toggled.emit)
         ee_row.addWidget(self._visuals_check)
+        self._skeleton_check = QCheckBox("骨架")
+        self._skeleton_check.setChecked(self._initial_skeleton)
+        self._skeleton_check.setCursor(Qt.PointingHandCursor)
+        self._skeleton_check.setToolTip(
+            "显示 / 隐藏骨架、关节轴与各连杆坐标系（外观单独控制）"
+        )
+        self._skeleton_check.toggled.connect(self.skeleton_toggled.emit)
+        ee_row.addWidget(self._skeleton_check)
         ee_row.addStretch(1)
         layout.addLayout(ee_row)
 
@@ -226,6 +241,7 @@ class RobotDialog(QDialog):
 
         scroll.setWidget(container)
         scroll.setMinimumHeight(140)
+        self._joint_scroll = scroll
         card_layout.addWidget(scroll, 1)
         return card
 
@@ -279,7 +295,9 @@ class RobotDialog(QDialog):
         spin.setAlignment(Qt.AlignRight)
         spin.setFixedWidth(92)
 
-        control = _Control(joint, slider, spin, lock, minimum, maximum)
+        control = _Control(
+            joint, slider, spin, lock, minimum, maximum, name, row
+        )
         self._controls[joint.name] = control
 
         display = control.to_display(self._values.get(joint.name, 0.0))
@@ -508,6 +526,38 @@ class RobotDialog(QDialog):
             self._locked.discard(name)
         control.slider.setEnabled(not checked)
         control.spin.setEnabled(not checked)
+
+    def apply_values(self, values: dict[str, float]) -> None:
+        """外部（数据列表滑条）改变关节值时同步界面，不触发信号。"""
+        self._values = dict(values)
+        self._apply_values(self._values)
+
+    def set_visuals_visible(self, visible: bool) -> None:
+        blocked = self._visuals_check.blockSignals(True)
+        self._visuals_check.setChecked(bool(visible))
+        self._visuals_check.blockSignals(blocked)
+
+    def set_skeleton_visible(self, visible: bool) -> None:
+        blocked = self._skeleton_check.blockSignals(True)
+        self._skeleton_check.setChecked(bool(visible))
+        self._skeleton_check.blockSignals(blocked)
+
+    def select_joint(self, name: str) -> None:
+        """从数据列表定位关节：滚动到对应行并高亮。"""
+        control = self._controls.get(name)
+        if control is None:
+            return
+        if self._selected_control is not None:
+            previous = self._selected_control
+            previous.label.setStyleSheet(
+                "color: #64748B;" if previous.is_mimic else ""
+            )
+        control.label.setStyleSheet("color: #4F46E5; font-weight: 600;")
+        self._selected_control = control
+        if self._joint_scroll is not None:
+            self._joint_scroll.ensureWidgetVisible(control.row, 0, 0)
+        if control.slider.isEnabled():
+            control.slider.setFocus()
 
     def _set_all_zero(self) -> None:
         self._updating = True

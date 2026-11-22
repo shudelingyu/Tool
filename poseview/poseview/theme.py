@@ -71,7 +71,8 @@ def app_stylesheet() -> str:
     QMainWindow, QWidget#Root {{
         background: {BACKGROUND};
     }}
-    QDialog#RobotDialog, QDialog#CalcDialog, QDialog#PoseVectorDialog {{
+    QDialog#RobotDialog, QDialog#CalcDialog, QDialog#PoseInputDialog,
+    QDialog#VectorInputDialog, QDialog#UrdfDialog, QDialog#MergeDialog {{
         background: {BACKGROUND};
     }}
     QLabel#DialogTitle {{
@@ -112,6 +113,15 @@ def app_stylesheet() -> str:
     }}
     QLineEdit#PoseInput:focus {{
         border-color: {ACCENT};
+    }}
+    QPlainTextEdit#RawData {{
+        background: #F8FAFC;
+        border: 1px solid {BORDER};
+        border-radius: 7px;
+        padding: 4px 6px;
+        color: #334155;
+        selection-background-color: #C7D2FE;
+        selection-color: #1E293B;
     }}
     QDoubleSpinBox {{
         background: #FFFFFF;
@@ -245,14 +255,52 @@ def app_stylesheet() -> str:
         border: 1px solid #EDF2F9;
         border-radius: 9px;
     }}
+    QSplitter#BodySplitter::handle {{
+        background: transparent;
+        width: 8px;
+    }}
+    QTreeWidget#DataTree {{
+        background: #FFFFFF;
+        border: 1px solid {BORDER};
+        border-radius: 9px;
+        padding: 4px 3px;
+        outline: none;
+    }}
+    QTreeWidget#DataTree::item {{
+        min-height: 22px;
+        padding: 3px 4px;
+        border-radius: 6px;
+        color: {TEXT_SECONDARY};
+    }}
+    QTreeWidget#DataTree::item:hover {{
+        background: #F8FAFC;
+    }}
+    QTreeWidget#DataTree::item:selected {{
+        background: {ACCENT_SOFT};
+        color: {ACCENT_DARK};
+    }}
+    QTreeWidget#DataTree::indicator {{
+        width: 14px;
+        height: 14px;
+        border-radius: 4px;
+        border: 1px solid #CBD5E1;
+        background: #FFFFFF;
+    }}
+    QTreeWidget#DataTree::indicator:hover {{
+        border-color: {ACCENT};
+    }}
+    QTreeWidget#DataTree::indicator:checked {{
+        background: {ACCENT};
+        border-color: {ACCENT};
+    }}
 
-    QTabWidget#CalcTabs::pane, QTabWidget#PoseVectorTabs::pane {{
+    QTabWidget#CalcTabs::pane {{
         border: 1px solid {BORDER};
         border-radius: 10px;
         background: transparent;
         top: -1px;
     }}
-    QTabWidget#CalcTabs QTabBar::tab, QTabWidget#PoseVectorTabs QTabBar::tab {{
+    QTabWidget#CalcTabs QTabBar::tab {{
         background: #F1F5F9;
         color: {MUTED};
         border: 1px solid #E9EEF6;
@@ -263,8 +311,7 @@ def app_stylesheet() -> str:
         margin-right: 3px;
         font-size: 11px;
     }}
-    QTabWidget#CalcTabs QTabBar::tab:selected,
-    QTabWidget#PoseVectorTabs QTabBar::tab:selected {{
+    QTabWidget#CalcTabs QTabBar::tab:selected {{
         background: {ACCENT_SOFT};
         color: {ACCENT_DARK};
         border-color: #C7D2FE;

@@ -64,6 +64,8 @@ class SceneVector:
     start: tuple[float, float, float]
     direction: tuple[float, float, float]
     visible: bool = True
+    source: str = ""
+    axis: str = ""
 
     @property
     def end(self) -> tuple[float, float, float]:
@@ -262,6 +264,7 @@ class PoseScene(QWidget):
         self._measure_mode = False
         self._measure_points: list[tuple[float, float, float]] = []
         self._show_visuals = True
+        self._show_skeleton = True
         self._selected_link = ""
         self._selected_joint = ""
         self._press_pos = None
@@ -342,6 +345,11 @@ class PoseScene(QWidget):
 
     def set_show_visuals(self, enabled: bool) -> None:
         self._show_visuals = bool(enabled)
+        self.update()
+
+    def set_show_skeleton(self, enabled: bool) -> None:
+        """显示 / 隐藏机器人骨架、关节轴与各连杆坐标系。"""
+        self._show_skeleton = bool(enabled)
         self.update()
 
     def set_show_poses(self, enabled: bool) -> None:
@@ -593,14 +601,15 @@ class PoseScene(QWidget):
         points.extend(marker.position for marker in self._markers)
         points.extend(self._measure_points)
         if self._robot is not None:
-            for start, end in self._robot.bones:
-                points.append(start)
-                points.append(end)
-            points.extend(self._robot.joints)
-            if self._robot.end_effector is not None:
-                points.append(self._robot.end_effector.position)
-            if self._robot.target is not None:
-                points.append(self._robot.target.position)
+            if self._show_skeleton:
+                for start, end in self._robot.bones:
+                    points.append(start)
+                    points.append(end)
+                points.extend(self._robot.joints)
+                if self._robot.end_effector is not None:
+                    points.append(self._robot.end_effector.position)
+                if self._robot.target is not None:
+                    points.append(self._robot.target.position)
             if self._show_visuals:
                 for visual in self._robot.visuals:
                     for triangle in visual.triangles:
@@ -674,17 +683,20 @@ class PoseScene(QWidget):
         ] if self._show_poses else []
 
         if self._robot is not None:
-            self._draw_joint_frames(painter, view, step)
+            if self._show_skeleton:
+                self._draw_joint_frames(painter, view, step)
             reduced = (
                 self._interacting
                 and self._visual_triangle_count > INTERACTIVE_TRIANGLE_LIMIT
             )
             if self._show_visuals and self._robot.visuals and not reduced:
                 self._draw_robot_visuals(painter, view)
-                self._draw_robot_joints(painter, view)
-            else:
+                if self._show_skeleton:
+                    self._draw_robot_joints(painter, view)
+            elif self._show_skeleton:
                 self._draw_robot_body(painter, view)
-            self._draw_joint_axes(painter, view, step)
+            if self._show_skeleton:
+                self._draw_joint_axes(painter, view, step)
 
         if self._show_path and len(visible) >= 2:
             self._draw_path(painter, view, visible)
@@ -692,7 +704,7 @@ class PoseScene(QWidget):
         if self._show_poses:
             self._draw_frames(painter, view, visible, step)
 
-        if self._robot is not None:
+        if self._robot is not None and self._show_skeleton:
             self._draw_robot_frames(painter, view, step)
             self._draw_robot_selection(painter, view)
 

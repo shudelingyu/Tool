@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -40,11 +41,13 @@ from PyQt5.QtWidgets import (
 from .icons import icon
 from .math3d import (
     Pose,
+    angle_between_vectors,
     axis_angle_from_rotation,
     format_number,
     invert_transform,
     matrix_properties,
     multiply_transform,
+    project_vector,
     quaternion_conjugate,
     quaternion_from_rotation,
     quaternion_multiply,
@@ -55,6 +58,9 @@ from .math3d import (
     slerp_quaternion,
     transform_point,
     transform_vector,
+    vector_cross,
+    vector_dot,
+    vector_length,
 )
 from .theme import SUCCESS, mono_font
 
@@ -79,6 +85,44 @@ def _quaternion_text(quaternion) -> str:
     )
 
 
+def _pose_raw_text(label: str, name: str, pose: Pose) -> str:
+    values = pose.values
+    x, y, z = values.position
+    w, qx, qy, qz = values.quaternion
+    matrix = "\n".join(
+        "  " + line for line in pose.matrix_text().splitlines()
+    )
+    return (
+        f"{label} · {name}\n"
+        f"  位置 / m  x {format_number(x, 6)}  y {format_number(y, 6)}  "
+        f"z {format_number(z, 6)}\n"
+        f"  RPY / °   roll {format_number(values.roll, 4)}  "
+        f"pitch {format_number(values.pitch, 4)}  "
+        f"yaw {format_number(values.yaw, 4)}\n"
+        f"  四元数    w {format_number(w, 6)}  x {format_number(qx, 6)}  "
+        f"y {format_number(qy, 6)}  z {format_number(qz, 6)}\n"
+        f"  4x4 矩阵\n{matrix}\n"
+    )
+
+
+def _vector_raw_text(label: str, vector) -> str:
+    start = vector.start
+    end = vector.end
+    direction = vector.direction
+    length = vector_length(direction)
+    return (
+        f"{label} · {vector.name}\n"
+        f"  起点 / m  ({format_number(start[0], 6)}, "
+        f"{format_number(start[1], 6)}, {format_number(start[2], 6)})\n"
+        f"  方向      ({format_number(direction[0], 6)}, "
+        f"{format_number(direction[1], 6)}, "
+        f"{format_number(direction[2], 6)})\n"
+        f"  终点 / m  ({format_number(end[0], 6)}, "
+        f"{format_number(end[1], 6)}, {format_number(end[2], 6)})\n"
+        f"  模长      {format_number(length, 6)}\n"
+    )
+
+
 class CalcDialog(QDialog):
     """坐标变换、位姿测量、变换链、旋转四元数与数据工具。"""
 
@@ -98,6 +142,9 @@ class CalcDialog(QDialog):
         self._chain_initialized = False
         self._chain_result: list[list[float]] | None = None
         self._measure_matrix: list[list[float]] | None = None
+        self._relative_matrix: list[list[float]] | None = None
+        self._vector_entries: list = []
+        self._vector_cross: tuple[float, float, float] | None = None
         self._slerp_matrix: list[list[float]] | None = None
         self._copy_timer = QTimer(self)
         self._copy_timer.setSingleShot(True)
@@ -124,7 +171,7 @@ class CalcDialog(QDialog):
         layout.addWidget(title)
 
         hint = QLabel(
-            "坐标变换、位姿测量、变换链、旋转与四元数、数据导入导出与轨迹分析。"
+            "坐标变换、位姿测量、相对位姿、向量计算、变换链、旋转与四元数、数据导入导出与轨迹分析。"
         )
         hint.setObjectName("DialogHint")
         hint.setWordWrap(True)
@@ -134,6 +181,8 @@ class CalcDialog(QDialog):
         tabs.setObjectName("CalcTabs")
         tabs.addTab(self._build_transform_tab(), "点位变换")
         tabs.addTab(self._build_measure_tab(), "位姿测量")
+        tabs.addTab(self._build_relative_tab(), "相对位姿")
+        tabs.addTab(self._build_vector_tab(), "向量")
         tabs.addTab(self._build_chain_tab(), "变换链")
         tabs.addTab(self._build_rotation_tab(), "旋转 / 四元数")
         tabs.addTab(self._build_data_tab(), "数据 / 轨迹")
@@ -419,6 +468,528 @@ class CalcDialog(QDialog):
         self._measure_a.currentIndexChanged.connect(self._recompute_measure)
         self._measure_b.currentIndexChanged.connect(self._recompute_measure)
         return tab
+
+    # ------------------------------------------------------------------
+    # 相对位姿
+    # ------------------------------------------------------------------
+
+    def _build_relative_tab(self) -> QWidget:
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.viewport().setStyleSheet("background: transparent;")
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        card = QFrame()
+        card.setObjectName("Card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(14, 12, 14, 13)
+        card_layout.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("相对位姿")
+        title.setObjectName("SectionTitle")
+        self._relative_subtitle = QLabel("至少需要两个位姿")
+        self._relative_subtitle.setObjectName("CardHint")
+        self._relative_copy = QToolButton()
+        self._relative_copy.setObjectName("IconButton")
+        self._relative_copy.setIcon(icon("copy", "#475569", 15))
+        self._relative_copy.setFixedSize(26, 26)
+        self._relative_copy.setCursor(Qt.PointingHandCursor)
+        self._relative_copy.setToolTip("复制 4x4 矩阵与姿态")
+        self._relative_copy.clicked.connect(self._copy_relative)
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(self._relative_subtitle)
+        head.addWidget(self._relative_copy)
+        card_layout.addLayout(head)
+
+        hint = QLabel("计算 B 在 A 坐标系下的位姿：T_A→B = inv(T_A) · T_B")
+        hint.setObjectName("CardHint")
+        hint.setWordWrap(True)
+        card_layout.addWidget(hint)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        label = QLabel("坐标系 A")
+        label.setObjectName("ValueKey")
+        label.setFixedWidth(56)
+        self._relative_a = QComboBox()
+        row.addWidget(label)
+        row.addWidget(self._relative_a, 1)
+        card_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        label = QLabel("坐标系 B")
+        label.setObjectName("ValueKey")
+        label.setFixedWidth(56)
+        self._relative_b = QComboBox()
+        self._relative_swap = QToolButton()
+        self._relative_swap.setObjectName("IconButton")
+        self._relative_swap.setIcon(icon("swap", "#475569", 16))
+        self._relative_swap.setFixedSize(26, 26)
+        self._relative_swap.setCursor(Qt.PointingHandCursor)
+        self._relative_swap.setToolTip("交换 A / B")
+        self._relative_swap.clicked.connect(self._swap_relative)
+        row.addWidget(label)
+        row.addWidget(self._relative_b, 1)
+        row.addWidget(self._relative_swap)
+        card_layout.addLayout(row)
+
+        self._relative_labels = self._make_matrix_box(card_layout)
+        self._relative_position = self._make_value_row(
+            card_layout, "位置 / m", width=70
+        )
+        self._relative_euler = self._make_value_row(
+            card_layout, "RPY / °", width=70
+        )
+        self._relative_quaternion = self._make_value_row(
+            card_layout, "四元数", width=70
+        )
+
+        raw_head = QHBoxLayout()
+        raw_head.setSpacing(8)
+        raw_title = QLabel("原始数据")
+        raw_title.setObjectName("ValueKey")
+        self._relative_raw_copy = QToolButton()
+        self._relative_raw_copy.setObjectName("IconButton")
+        self._relative_raw_copy.setIcon(icon("copy", "#475569", 15))
+        self._relative_raw_copy.setFixedSize(26, 26)
+        self._relative_raw_copy.setCursor(Qt.PointingHandCursor)
+        self._relative_raw_copy.setToolTip("复制 A / B 的原始参数")
+        self._relative_raw_copy.clicked.connect(self._copy_relative_raw)
+        raw_head.addWidget(raw_title)
+        raw_head.addStretch(1)
+        raw_head.addWidget(self._relative_raw_copy)
+        card_layout.addLayout(raw_head)
+
+        self._relative_raw = QPlainTextEdit()
+        self._relative_raw.setObjectName("RawData")
+        self._relative_raw.setReadOnly(True)
+        self._relative_raw.setFont(mono_font(9.5))
+        self._relative_raw.setFixedHeight(150)
+        self._relative_raw.setPlaceholderText("选择两个位姿后显示 A / B 的原始参数")
+        card_layout.addWidget(self._relative_raw)
+
+        layout.addWidget(card)
+        layout.addStretch(1)
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
+        self._relative_a.currentIndexChanged.connect(
+            self._recompute_relative
+        )
+        self._relative_b.currentIndexChanged.connect(
+            self._recompute_relative
+        )
+        return tab
+
+    def _refresh_relative_combos(self) -> None:
+        names = [entry.name for entry in self._entries]
+        for combo, fallback_last in (
+            (self._relative_a, False),
+            (self._relative_b, True),
+        ):
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(names)
+            if names:
+                combo.setCurrentIndex(
+                    names.index(current)
+                    if current in names
+                    else (len(names) - 1 if fallback_last else 0)
+                )
+            combo.blockSignals(False)
+            combo.setEnabled(len(names) >= 2)
+        self._relative_swap.setEnabled(len(names) >= 2)
+        self._recompute_relative()
+
+    def _recompute_relative(self) -> None:
+        index_a = self._relative_a.currentIndex()
+        index_b = self._relative_b.currentIndex()
+        if (
+            len(self._entries) < 2
+            or not (0 <= index_a < len(self._entries))
+            or not (0 <= index_b < len(self._entries))
+        ):
+            self._relative_matrix = None
+            self._relative_subtitle.setText("至少需要两个位姿")
+            for row in self._relative_labels:
+                for label in row:
+                    label.setText("—")
+            self._relative_position.setText("—")
+            self._relative_euler.setText("—")
+            self._relative_quaternion.setText("—")
+            self._relative_raw.clear()
+            self._relative_copy.setEnabled(False)
+            self._relative_raw_copy.setEnabled(False)
+            return
+
+        entry_a = self._entries[index_a]
+        entry_b = self._entries[index_b]
+        relative = relative_transform(
+            entry_a.pose.matrix, entry_b.pose.matrix
+        )
+        self._relative_matrix = relative
+        for row in range(4):
+            for col in range(4):
+                self._relative_labels[row][col].setText(
+                    format_number(relative[row][col], 6)
+                )
+        values = Pose(relative).values
+        x, y, z = values.position
+        self._relative_position.setText(
+            f"x {format_number(x, 4)}   y {format_number(y, 4)}   "
+            f"z {format_number(z, 4)}"
+        )
+        self._relative_euler.setText(
+            f"roll {format_number(values.roll, 3)}°   "
+            f"pitch {format_number(values.pitch, 3)}°   "
+            f"yaw {format_number(values.yaw, 3)}°"
+        )
+        w, qx, qy, qz = values.quaternion
+        self._relative_quaternion.setText(
+            f"w {format_number(w, 4)}   x {format_number(qx, 4)}   "
+            f"y {format_number(qy, 4)}   z {format_number(qz, 4)}"
+        )
+        self._relative_subtitle.setText(f"{entry_b.name} 在 {entry_a.name} 中")
+        self._relative_raw.setPlainText(
+            _pose_raw_text("坐标系 A", entry_a.name, entry_a.pose)
+            + "\n"
+            + _pose_raw_text("坐标系 B", entry_b.name, entry_b.pose)
+        )
+        self._relative_copy.setEnabled(True)
+        self._relative_raw_copy.setEnabled(True)
+
+    def _swap_relative(self) -> None:
+        if len(self._entries) < 2:
+            return
+        index_a = self._relative_a.currentIndex()
+        index_b = self._relative_b.currentIndex()
+        self._relative_a.blockSignals(True)
+        self._relative_b.blockSignals(True)
+        self._relative_a.setCurrentIndex(index_b)
+        self._relative_b.setCurrentIndex(index_a)
+        self._relative_a.blockSignals(False)
+        self._relative_b.blockSignals(False)
+        self._recompute_relative()
+
+    def _copy_relative(self) -> None:
+        if self._relative_matrix is None:
+            return
+        index_a = self._relative_a.currentIndex()
+        index_b = self._relative_b.currentIndex()
+        name_a = self._entries[index_a].name
+        name_b = self._entries[index_b].name
+        relative = Pose(self._relative_matrix)
+        QApplication.clipboard().setText(
+            f"T_A->B: {name_b} in {name_a}\n"
+            f"{relative.matrix_text()}\n\n"
+            f"{relative.values.report()}"
+        )
+        self._relative_copy.setIcon(icon("check", SUCCESS, 15))
+        self._relative_copy.setToolTip("已复制")
+        QTimer.singleShot(1200, self._restore_relative_copy_icon)
+
+    def _restore_relative_copy_icon(self) -> None:
+        self._relative_copy.setIcon(icon("copy", "#475569", 15))
+        self._relative_copy.setToolTip("复制 4x4 矩阵与姿态")
+
+    def _copy_relative_raw(self) -> None:
+        text = self._relative_raw.toPlainText()
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self._relative_raw_copy.setIcon(icon("check", SUCCESS, 15))
+        self._relative_raw_copy.setToolTip("已复制")
+        QTimer.singleShot(1200, self._restore_relative_raw_copy_icon)
+
+    def _restore_relative_raw_copy_icon(self) -> None:
+        self._relative_raw_copy.setIcon(icon("copy", "#475569", 15))
+        self._relative_raw_copy.setToolTip("复制 A / B 的原始参数")
+
+    # ------------------------------------------------------------------
+    # 向量计算
+    # ------------------------------------------------------------------
+
+    def _build_vector_tab(self) -> QWidget:
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.viewport().setStyleSheet("background: transparent;")
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        card = QFrame()
+        card.setObjectName("Card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(14, 12, 14, 13)
+        card_layout.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        title = QLabel("向量计算")
+        title.setObjectName("SectionTitle")
+        self._vector_subtitle = QLabel("从向量树选择两个向量")
+        self._vector_subtitle.setObjectName("CardHint")
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(self._vector_subtitle)
+        card_layout.addLayout(head)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        label = QLabel("向量 A")
+        label.setObjectName("ValueKey")
+        label.setFixedWidth(56)
+        self._vector_a = QComboBox()
+        row.addWidget(label)
+        row.addWidget(self._vector_a, 1)
+        card_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        label = QLabel("向量 B")
+        label.setObjectName("ValueKey")
+        label.setFixedWidth(56)
+        self._vector_b = QComboBox()
+        self._vector_swap = QToolButton()
+        self._vector_swap.setObjectName("IconButton")
+        self._vector_swap.setIcon(icon("swap", "#475569", 16))
+        self._vector_swap.setFixedSize(26, 26)
+        self._vector_swap.setCursor(Qt.PointingHandCursor)
+        self._vector_swap.setToolTip("交换 A / B")
+        self._vector_swap.clicked.connect(self._swap_vector)
+        row.addWidget(label)
+        row.addWidget(self._vector_b, 1)
+        row.addWidget(self._vector_swap)
+        card_layout.addLayout(row)
+
+        self._vector_angle = self._make_value_row(
+            card_layout, "夹角 / °", width=76
+        )
+        self._vector_cosine = self._make_value_row(
+            card_layout, "cos θ", width=76
+        )
+        self._vector_dot = self._make_value_row(
+            card_layout, "点积", width=76
+        )
+        self._vector_len_a = self._make_value_row(
+            card_layout, "模长 A", width=76
+        )
+        self._vector_len_b = self._make_value_row(
+            card_layout, "模长 B", width=76
+        )
+        self._vector_unit_a = self._make_value_row(
+            card_layout, "单位向量 A", width=76
+        )
+        self._vector_unit_b = self._make_value_row(
+            card_layout, "单位向量 B", width=76
+        )
+        self._vector_cross_label = self._make_value_row(
+            card_layout, "叉积 A×B", width=76
+        )
+        self._vector_projection = self._make_value_row(
+            card_layout, "A 在 B 上投影", width=76
+        )
+
+        self._vector_add_cross = QPushButton("叉积加入场景")
+        self._vector_add_cross.setObjectName("Ghost")
+        self._vector_add_cross.setCursor(Qt.PointingHandCursor)
+        self._vector_add_cross.setToolTip("以原点为起点添加 A×B 向量")
+        self._vector_add_cross.clicked.connect(self._add_vector_cross)
+        card_layout.addWidget(self._vector_add_cross)
+
+        raw_head = QHBoxLayout()
+        raw_head.setSpacing(8)
+        raw_title = QLabel("原始数据")
+        raw_title.setObjectName("ValueKey")
+        self._vector_raw_copy = QToolButton()
+        self._vector_raw_copy.setObjectName("IconButton")
+        self._vector_raw_copy.setIcon(icon("copy", "#475569", 15))
+        self._vector_raw_copy.setFixedSize(26, 26)
+        self._vector_raw_copy.setCursor(Qt.PointingHandCursor)
+        self._vector_raw_copy.setToolTip("复制 A / B 的原始参数")
+        self._vector_raw_copy.clicked.connect(self._copy_vector_raw)
+        raw_head.addWidget(raw_title)
+        raw_head.addStretch(1)
+        raw_head.addWidget(self._vector_raw_copy)
+        card_layout.addLayout(raw_head)
+
+        self._vector_raw = QPlainTextEdit()
+        self._vector_raw.setObjectName("RawData")
+        self._vector_raw.setReadOnly(True)
+        self._vector_raw.setFont(mono_font(9.5))
+        self._vector_raw.setFixedHeight(120)
+        self._vector_raw.setPlaceholderText("选择两个向量后显示 A / B 的原始参数")
+        card_layout.addWidget(self._vector_raw)
+
+        layout.addWidget(card)
+        layout.addStretch(1)
+        scroll.setWidget(container)
+        outer.addWidget(scroll)
+
+        self._vector_a.currentIndexChanged.connect(self._recompute_vector)
+        self._vector_b.currentIndexChanged.connect(self._recompute_vector)
+        return tab
+
+    def set_vector_entries(self, vectors: list) -> None:
+        self._vector_entries = list(vectors)
+        self._refresh_vector_combos()
+
+    def _refresh_vector_combos(self) -> None:
+        names = [vector.name for vector in self._vector_entries]
+        for combo, fallback_last in (
+            (self._vector_a, False),
+            (self._vector_b, True),
+        ):
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(names)
+            if names:
+                combo.setCurrentIndex(
+                    names.index(current)
+                    if current in names
+                    else (len(names) - 1 if fallback_last else 0)
+                )
+            combo.blockSignals(False)
+            combo.setEnabled(len(names) >= 2)
+        self._vector_swap.setEnabled(len(names) >= 2)
+        self._recompute_vector()
+
+    def _recompute_vector(self) -> None:
+        index_a = self._vector_a.currentIndex()
+        index_b = self._vector_b.currentIndex()
+        rows = (
+            self._vector_angle,
+            self._vector_cosine,
+            self._vector_dot,
+            self._vector_len_a,
+            self._vector_len_b,
+            self._vector_unit_a,
+            self._vector_unit_b,
+            self._vector_cross_label,
+            self._vector_projection,
+        )
+        if (
+            len(self._vector_entries) < 2
+            or not (0 <= index_a < len(self._vector_entries))
+            or not (0 <= index_b < len(self._vector_entries))
+        ):
+            self._vector_cross = None
+            self._vector_subtitle.setText("至少需要两个向量")
+            for row in rows:
+                row.setText("—")
+            self._vector_raw.clear()
+            self._vector_add_cross.setEnabled(False)
+            self._vector_raw_copy.setEnabled(False)
+            return
+
+        first = self._vector_entries[index_a]
+        second = self._vector_entries[index_b]
+        a = first.direction
+        b = second.direction
+        length_a = vector_length(a)
+        length_b = vector_length(b)
+        dot = vector_dot(a, b)
+        angle = angle_between_vectors(a, b)
+        cosine = dot / (length_a * length_b)
+        cross = vector_cross(a, b)
+        projection = project_vector(a, b)
+        self._vector_cross = cross
+
+        self._vector_angle.setText(f"{angle:.4f}")
+        self._vector_cosine.setText(f"{cosine:.6f}")
+        self._vector_dot.setText(f"{dot:.6f}")
+        self._vector_len_a.setText(f"{length_a:.6f}")
+        self._vector_len_b.setText(f"{length_b:.6f}")
+        if length_a > 1e-12:
+            self._vector_unit_a.setText(
+                f"({a[0] / length_a:.4f}, {a[1] / length_a:.4f}, "
+                f"{a[2] / length_a:.4f})"
+            )
+        else:
+            self._vector_unit_a.setText("—")
+        if length_b > 1e-12:
+            self._vector_unit_b.setText(
+                f"({b[0] / length_b:.4f}, {b[1] / length_b:.4f}, "
+                f"{b[2] / length_b:.4f})"
+            )
+        else:
+            self._vector_unit_b.setText("—")
+        self._vector_cross_label.setText(
+            f"({cross[0]:.4f}, {cross[1]:.4f}, {cross[2]:.4f})"
+        )
+        self._vector_projection.setText(
+            f"({projection[0]:.4f}, {projection[1]:.4f}, "
+            f"{projection[2]:.4f})"
+        )
+        self._vector_subtitle.setText(f"{first.name} 与 {second.name}")
+        self._vector_raw.setPlainText(
+            _vector_raw_text("向量 A", first)
+            + "\n"
+            + _vector_raw_text("向量 B", second)
+        )
+        self._vector_raw_copy.setEnabled(True)
+        self._vector_add_cross.setEnabled(vector_length(cross) > 1e-9)
+
+    def _swap_vector(self) -> None:
+        if len(self._vector_entries) < 2:
+            return
+        index_a = self._vector_a.currentIndex()
+        index_b = self._vector_b.currentIndex()
+        self._vector_a.blockSignals(True)
+        self._vector_b.blockSignals(True)
+        self._vector_a.setCurrentIndex(index_b)
+        self._vector_b.setCurrentIndex(index_a)
+        self._vector_a.blockSignals(False)
+        self._vector_b.blockSignals(False)
+        self._recompute_vector()
+
+    def _add_vector_cross(self) -> None:
+        if self._vector_cross is None:
+            return
+        if vector_length(self._vector_cross) < 1e-9:
+            return
+        self.vector_added.emit(
+            "A×B", (0.0, 0.0, 0.0), self._vector_cross
+        )
+
+    def _copy_vector_raw(self) -> None:
+        text = self._vector_raw.toPlainText()
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self._vector_raw_copy.setIcon(icon("check", SUCCESS, 15))
+        self._vector_raw_copy.setToolTip("已复制")
+        QTimer.singleShot(1200, self._restore_vector_raw_copy_icon)
+
+    def _restore_vector_raw_copy_icon(self) -> None:
+        self._vector_raw_copy.setIcon(icon("copy", "#475569", 15))
+        self._vector_raw_copy.setToolTip("复制 A / B 的原始参数")
 
     def _swap_measure(self) -> None:
         if len(self._entries) < 2:
@@ -1268,6 +1839,8 @@ class CalcDialog(QDialog):
     def _refresh_all(self) -> None:
         self._refresh_transform_frames()
         self._refresh_measure_combos()
+        self._refresh_relative_combos()
+        self._refresh_vector_combos()
         self._refresh_chain_list()
         self._refresh_rotation_combos()
         self._refresh_trajectory()

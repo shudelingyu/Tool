@@ -453,6 +453,160 @@ def load_urdf(path: str) -> UrdfRobot:
     return parse_urdf(tree.getroot(), Path(path).resolve().parent)
 
 
+def _sanitize_name(name: str) -> str:
+    value = "".join(
+        ch if (ch.isascii() and (ch.isalnum() or ch == "_")) else "_"
+        for ch in name
+    )
+    return value.strip("_") or "part"
+
+
+def merge_urdf(
+    primary: UrdfRobot,
+    attachment: UrdfRobot,
+    mount_link: str,
+    joint_name: str = "mount",
+    origin: list[list[float]] | None = None,
+    prefix: str = "",
+) -> tuple[UrdfRobot, list[str]]:
+    """把附加 URDF 通过一个固定关节接到主机器人上，返回合并结果。
+
+    attachment 只有根 link 所在的连通部分会被拼接；名称冲突时自动或按
+    prefix 为附加模型的 link / joint 加前缀。
+    """
+    if mount_link not in primary.link_names:
+        raise UrdfError(f"主机器人不存在 link：{mount_link}")
+
+    children: dict[str, list[UrdfJoint]] = {}
+    for joint in attachment.joints:
+        children.setdefault(joint.parent, []).append(joint)
+    reachable = {attachment.root_link}
+    stack = [attachment.root_link]
+    while stack:
+        parent = stack.pop()
+        for joint in children.get(parent, []):
+            if joint.child in reachable:
+                continue
+            reachable.add(joint.child)
+            stack.append(joint.child)
+
+    links = [link for link in attachment.link_names if link in reachable]
+    joints = [
+        joint
+        for joint in attachment.joints
+        if joint.parent in reachable and joint.child in reachable
+    ]
+    visuals = [
+        visual for visual in attachment.visuals if visual.link in reachable
+    ]
+    if not links:
+        raise UrdfError("附加 URDF 没有可拼接的 link")
+
+    warnings: list[str] = []
+    skipped = len(attachment.link_names) - len(links)
+    if skipped:
+        warnings.append(
+            f"附加 URDF 有 {skipped} 个 link 未连接到根节点，已忽略"
+        )
+
+    link_conflict = set(primary.link_names) & set(links)
+    joint_conflict = {item.name for item in primary.joints} & {
+        item.name for item in joints
+    }
+    raw_prefix = prefix.strip()
+    if not raw_prefix and (link_conflict or joint_conflict):
+        raw_prefix = _sanitize_name(attachment.name) + "_"
+        warnings.append(f"检测到名称冲突，附加模型自动加前缀 {raw_prefix}")
+
+    link_map = {link: raw_prefix + link for link in links}
+    joint_map = {joint.name: raw_prefix + joint.name for joint in joints}
+    if set(primary.link_names) & set(link_map.values()):
+        raise UrdfError("附加模型加前缀后仍与主机器人 link 重名")
+    existing_joints = {item.name for item in primary.joints} | set(
+        joint_map.values()
+    )
+    if {item.name for item in primary.joints} & set(joint_map.values()):
+        raise UrdfError("附加模型加前缀后仍与主机器人 joint 重名")
+
+    merged_joints: list[UrdfJoint] = []
+    for joint in joints:
+        mimic = joint.mimic
+        if mimic:
+            mimic = joint_map.get(mimic, mimic)
+            if mimic not in existing_joints:
+                warnings.append(
+                    f"关节 {joint.name} 的 mimic 目标 {mimic} 不存在"
+                )
+        merged_joints.append(
+            UrdfJoint(
+                name=joint_map[joint.name],
+                type=joint.type,
+                parent=link_map[joint.parent],
+                child=link_map[joint.child],
+                origin=[row[:] for row in joint.origin],
+                axis=joint.axis,
+                lower=joint.lower,
+                upper=joint.upper,
+                mimic=mimic,
+                mimic_multiplier=joint.mimic_multiplier,
+                mimic_offset=joint.mimic_offset,
+            )
+        )
+
+    base_name = (joint_name or "mount").strip() or "mount"
+    unique_name = base_name
+    suffix = 2
+    while unique_name in existing_joints:
+        unique_name = f"{base_name}_{suffix}"
+        suffix += 1
+    if unique_name != base_name:
+        warnings.append(f"装配关节名 {base_name} 已存在，改用 {unique_name}")
+
+    mount = UrdfJoint(
+        name=unique_name,
+        type="fixed",
+        parent=mount_link,
+        child=link_map[attachment.root_link],
+        origin=(
+            [row[:] for row in origin] if origin is not None else _identity()
+        ),
+        axis=(1.0, 0.0, 0.0),
+        lower=0.0,
+        upper=0.0,
+    )
+
+    link_order = list(primary.link_names) + [link_map[link] for link in links]
+    joint_list = (
+        list(primary.joints) + merged_joints + [mount]
+    )
+    parent_links = {item.parent for item in joint_list}
+    attachment_leaves = {
+        link_map[link]
+        for link in attachment.leaf_links
+        if link in link_map
+    }
+    order = {link: index for index, link in enumerate(link_order)}
+    leaf_links = [link for link in link_order if link not in parent_links]
+    leaf_links.sort(
+        key=lambda link: (0 if link in attachment_leaves else 1, order[link])
+    )
+
+    merged_visuals = list(primary.visuals) + [
+        UrdfVisual(link_map[visual.link], visual.color, visual.triangles)
+        for visual in visuals
+    ]
+    merged = UrdfRobot(
+        name=f"{primary.name}+{attachment.name}",
+        link_names=link_order,
+        joints=joint_list,
+        root_link=primary.root_link,
+        leaf_links=leaf_links,
+        warnings=list(attachment.warnings) + warnings,
+        visuals=merged_visuals,
+    )
+    return merged, warnings
+
+
 def parse_urdf_text(
     text: str, base_dir: Path | str | None = None
 ) -> UrdfRobot:
