@@ -1431,5 +1431,5 @@ class PoseScene(QWidget):
         painter.drawText(
             QRectF(0, 0, self.width(), self.height()),
             Qt.AlignCenter,
-            "点击右上角“位姿 · 向量”打开面板添加位姿\n即可在此查看三维位姿",
+            "点击左侧“位姿”“向量”按钮添加数据\n或加载 URDF 机器人后在此查看三维视图",
         )
