@@ -3113,6 +3113,25 @@ HELP_HTML = """
   <li>某个臂超过 10 秒无数据时会自动停止该臂读取，不影响其他臂。</li>
 </ul>
 
+<h2>ADS 支持的格式</h2>
+<ul>
+  <li><b>ADS 数据行</b>（离线 / 在线）：
+    <code>[ADS]:&lt;模型号&gt;,&lt;变量名&gt;: &lt;数值&gt; [&lt;数值&gt; ...]</code>；
+    一行可包含多个 <code>[ADS]</code> 片段，分别解析。</li>
+  <li>模型号为数字，数值可用空格或逗号分隔。单值列名 <code>&lt;模型号&gt;_&lt;变量名&gt;</code>，
+    多值列名 <code>&lt;模型号&gt;_&lt;变量名&gt;_&lt;序号&gt;</code>（序号从 1 开始）。</li>
+  <li>例如 <code>[ADS]:0,cmdTorque: -0.0029 0.0805</code> 会生成
+    <code>0_cmdTorque_1</code> 与 <code>0_cmdTorque_2</code> 两列。</li>
+  <li><b>DISPLAY 行</b>（离线加载）：
+    <code>[DISPLAY]count: &lt;时间值&gt;, &lt;变量名&gt;:[v1, v2, ...], ...</code>；
+    以 count 作为时间轴，列名 <code>&lt;变量名&gt;[&lt;索引&gt;]</code>（索引从 0 开始）。</li>
+  <li>行首可带时间戳 <code>[YYYY-MM-DD HH:MM:SS.fff]</code>；没有时间戳时按相对时间或行号生成横轴。</li>
+  <li>其他行仍按 <code>data_formats.json</code> 的 slave / boom / master / lout 自动识别，
+    ADS 日志中混有这些格式也能直接加载。</li>
+  <li>在线 ADS 默认读取 <code>/data/log/rt/LOUT/LOUT</code>，可在配置文件的
+    <code>online_paths</code> 中修改。</li>
+</ul>
+
 <h2>绘图区</h2>
 <ul>
   <li><b>分栏</b>：右上角工具条的“水平分栏（左右并排）/ 垂直分栏（上下堆叠）”。</li>
@@ -3149,7 +3168,7 @@ HELP_HTML = """
 
 <h2>配置与日志</h2>
 <ul>
-  <li>解析规则由 <code>configs/data_formats.json</code> 描述，支持 slave / boom / master / lout 四种格式自动识别。</li>
+  <li>解析规则由 <code>configs/data_formats.json</code> 描述，支持 slave / boom / master / lout 四种格式自动识别；ADS / DISPLAY 行由内置解析器处理。</li>
   <li>配置查找顺序：程序同级 <code>configs/data_formats.json</code> → exe 内置资源 → 代码内嵌默认配置。</li>
   <li>运行日志：<code>logs/logAnalysis.log</code>；目录不可写时回退到 <code>%TEMP%\\logAnalysis_logs</code>。</li>
 </ul>
