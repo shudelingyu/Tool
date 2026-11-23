@@ -43,6 +43,7 @@ from .scene import (
     SceneVisual,
 )
 from .solve_panel import SolvePanel
+from .trajectory_dialog import TrajectoryDialog
 from .urdf import UrdfError, UrdfRobot, load_urdf, merge_urdf
 from .urdf_dialog import UrdfDialog
 from .vector_input_dialog import VectorInputDialog
@@ -86,6 +87,7 @@ class PoseViewWindow(QMainWindow):
         self._show_skeleton = True
         self._robot_dialog: RobotDialog | None = None
         self._calc_dialog: CalcDialog | None = None
+        self._trajectory_dialog: TrajectoryDialog | None = None
         self._markers: list[SceneMarker] = []
         self._selected_pose = -1
         self._view_tools: list[QToolButton] = []
@@ -785,6 +787,7 @@ class PoseViewWindow(QMainWindow):
                         names, self._tool_index
                     )
                 return
+        self._close_trajectory_dialog()
         self._tool_index = index
         self._robot = robot
         values = robot.default_values()
@@ -833,6 +836,7 @@ class PoseViewWindow(QMainWindow):
         self, robot: UrdfRobot, values: dict[str, float] | None = None
     ) -> None:
         self._close_robot_dialog()
+        self._close_trajectory_dialog()
         self._base_robot = robot
         self._tools = []
         self._tool_index = -1
@@ -893,6 +897,9 @@ class PoseViewWindow(QMainWindow):
             dialog.skeleton_toggled.connect(self._on_skeleton_toggled)
             dialog.tool_changed.connect(self._on_tool_selected)
             dialog.tool_merge_requested.connect(self._merge_urdf)
+            dialog.trajectory_requested.connect(
+                self._show_trajectory_dialog
+            )
             self._robot_dialog = dialog
             self._refresh_robot()
         self._robot_dialog.set_visuals_visible(self._show_visuals)
@@ -900,6 +907,38 @@ class PoseViewWindow(QMainWindow):
         self._robot_dialog.show()
         self._robot_dialog.raise_()
         self._robot_dialog.activateWindow()
+
+    def _show_trajectory_dialog(self) -> None:
+        if self._robot is None:
+            self._flash_status("请先加载 URDF 机器人")
+            return
+        if self._trajectory_dialog is not None:
+            self._trajectory_dialog.show()
+            self._trajectory_dialog.raise_()
+            self._trajectory_dialog.activateWindow()
+            return
+        dialog = TrajectoryDialog(self._robot, self._joint_values, self)
+        dialog.frame_applied.connect(self._on_trajectory_frame)
+        dialog.finished.connect(self._on_trajectory_closed)
+        self._trajectory_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_trajectory_frame(self, values: dict) -> None:
+        self._joint_values = dict(values)
+        self._refresh_robot()
+
+    def _on_trajectory_closed(self, _result: int = 0) -> None:
+        if self._trajectory_dialog is None:
+            return
+        self._trajectory_dialog.deleteLater()
+        self._trajectory_dialog = None
+
+    def _close_trajectory_dialog(self) -> None:
+        if self._trajectory_dialog is None:
+            return
+        self._trajectory_dialog.close()
 
     @staticmethod
     def _joint_limits(joint) -> tuple[float, float]:
@@ -1193,6 +1232,7 @@ class PoseViewWindow(QMainWindow):
 
     def _clear_robot(self) -> None:
         self._close_robot_dialog()
+        self._close_trajectory_dialog()
         if self._robot is None:
             return
         self._robot = None
@@ -1250,6 +1290,7 @@ class PoseViewWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802
         self._close_robot_dialog()
         self._close_calc_dialog()
+        self._close_trajectory_dialog()
         super().closeEvent(event)
 
     def _show_help(self) -> None:
@@ -1278,6 +1319,9 @@ class PoseViewWindow(QMainWindow):
             "· 关节控制：滑条或数值框驱动正运动学，支持关节锁定、目标位姿与 IK 求解<br>"
             "· 工具：可在关节控制面板的“工具”下拉框切换已拼接的工具，选择“无工具”卸载；"
             "“拼接工具…”可直接追加工具，末端连杆会默认切换到工具末端<br>"
+            "· 轨迹仿真：点击关节控制面板的“轨迹仿真…”，导入 .cst / .cvt / .csv / .txt 关节角文件，"
+            "支持自动 / 顺序 / 逐列自定义映射、弧度 / 角度单位、播放暂停、变速与循环；"
+            "列数不必等于关节数，可把不需要的列设为“不映射”，对应关节保持当前角度<br>"
             "· 点击场景中的连杆或关节可选中高亮，状态栏显示关节角度与限位<br><br>"
             "<b>计算工具</b><br>"
             "· 点击右上角“计算”打开，包含点位变换、位姿测量、相对位姿、向量、变换链、旋转 / 四元数、数据 / 轨迹<br>"

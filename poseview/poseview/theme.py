@@ -72,7 +72,8 @@ def app_stylesheet() -> str:
         background: {BACKGROUND};
     }}
     QDialog#RobotDialog, QDialog#CalcDialog, QDialog#PoseInputDialog,
-    QDialog#VectorInputDialog, QDialog#UrdfDialog, QDialog#MergeDialog {{
+    QDialog#VectorInputDialog, QDialog#UrdfDialog, QDialog#MergeDialog,
+    QDialog#TrajectoryDialog {{
         background: {BACKGROUND};
     }}
     QLabel#DialogTitle {{

@@ -70,6 +70,7 @@ class RobotDialog(QDialog):
     skeleton_toggled = pyqtSignal(bool)
     tool_changed = pyqtSignal(int)
     tool_merge_requested = pyqtSignal()
+    trajectory_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -152,9 +153,18 @@ class RobotDialog(QDialog):
         self._tool_button.setCursor(Qt.PointingHandCursor)
         self._tool_button.setToolTip("加载工具 URDF 并拼接到机器人上")
         self._tool_button.clicked.connect(self.tool_merge_requested.emit)
+        self._trajectory_button = QPushButton("轨迹仿真…")
+        self._trajectory_button.setObjectName("Ghost")
+        self._trajectory_button.setIcon(icon("path", "#475569", 15))
+        self._trajectory_button.setCursor(Qt.PointingHandCursor)
+        self._trajectory_button.setToolTip("导入关节角文件并逐帧播放机器人运动")
+        self._trajectory_button.clicked.connect(
+            self.trajectory_requested.emit
+        )
         tool_row.addWidget(tool_label)
         tool_row.addWidget(self._tool_combo, 1)
         tool_row.addWidget(self._tool_button)
+        tool_row.addWidget(self._trajectory_button)
         layout.addLayout(tool_row)
         self.set_tool_selection(self._tool_names, self._tool_index)
 
