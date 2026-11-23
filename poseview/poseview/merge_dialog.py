@@ -1,7 +1,8 @@
-"""URDF 拼接对话框：把附加模型固定到当前机器人上。"""
+"""工具拼接对话框：把工具 URDF 固定到当前机器人上。"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt5.QtCore import Qt
@@ -20,6 +21,18 @@ from .icons import icon, primary_icon
 from .math3d import rotation_from_euler
 from .theme import DANGER, SUCCESS, WARNING
 from .urdf import UrdfError, UrdfRobot, load_urdf, merge_urdf
+
+
+@dataclass
+class ToolSpec:
+    """可切换工具：附加 URDF 及其安装参数。"""
+
+    name: str
+    robot: UrdfRobot
+    mount_link: str
+    joint_name: str = "mount"
+    origin: list[list[float]] | None = None
+    prefix: str = ""
 
 
 def _parse_origin(text: str):
@@ -41,7 +54,7 @@ def _parse_origin(text: str):
 
 
 class MergeDialog(QDialog):
-    """选择附加 URDF 与安装参数，确认后生成拼接机器人。"""
+    """选择工具 URDF 与安装参数，确认后生成拼接机器人与工具配置。"""
 
     def __init__(self, robot: UrdfRobot, parent=None) -> None:
         super().__init__(parent)
@@ -49,10 +62,11 @@ class MergeDialog(QDialog):
         self._attachment: UrdfRobot | None = None
         self.merged_robot: UrdfRobot | None = None
         self.merge_warnings: list[str] = []
+        self.tool_spec: ToolSpec | None = None
 
         self.setObjectName("MergeDialog")
-        self.setWindowTitle("拼接 URDF")
-        self.resize(660, 430)
+        self.setWindowTitle("拼接工具")
+        self.resize(660, 470)
         self.setMinimumWidth(580)
         self._build()
 
@@ -65,7 +79,7 @@ class MergeDialog(QDialog):
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(10)
 
-        title = QLabel("拼接 URDF")
+        title = QLabel("拼接工具")
         title.setObjectName("DialogTitle")
         layout.addWidget(title)
 
@@ -73,7 +87,8 @@ class MergeDialog(QDialog):
             f"当前机器人 {self._robot.name} · "
             f"{len(self._robot.link_names)} 个 link · "
             f"{len(self._robot.movable_joints)} 个可动关节\n"
-            "把附加 URDF 的根 link 通过固定关节接到当前机器人的指定 link。"
+            "把工具 URDF 的根 link 通过固定关节接到机器人指定 link；"
+            "拼接后可在关节控制面板中切换工具。"
         )
         hint.setObjectName("DialogHint")
         hint.setWordWrap(True)
@@ -81,7 +96,19 @@ class MergeDialog(QDialog):
 
         row = QHBoxLayout()
         row.setSpacing(8)
-        path_label = QLabel("附加 URDF")
+        label = QLabel("工具名称")
+        label.setObjectName("ValueKey")
+        label.setFixedWidth(76)
+        self._name_edit = QLineEdit()
+        self._name_edit.setObjectName("PoseInput")
+        self._name_edit.setPlaceholderText("留空使用附加 URDF 名称")
+        row.addWidget(label)
+        row.addWidget(self._name_edit, 1)
+        layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        path_label = QLabel("工具 URDF")
         path_label.setObjectName("ValueKey")
         path_label.setFixedWidth(76)
         self._path_edit = QLineEdit()
@@ -105,7 +132,11 @@ class MergeDialog(QDialog):
         label.setFixedWidth(76)
         self._mount_combo = QComboBox()
         self._mount_combo.addItems(self._robot.link_names)
-        tooltip = "当前机器人上用于安装附加模型的 link"
+        default_mount = self._robot.default_ee_link()
+        index = self._mount_combo.findText(default_mount)
+        if index >= 0:
+            self._mount_combo.setCurrentIndex(index)
+        tooltip = "当前机器人上用于安装工具的 link，默认末端连杆"
         self._mount_combo.setToolTip(tooltip)
         row.addWidget(label)
         row.addWidget(self._mount_combo, 1)
@@ -118,7 +149,7 @@ class MergeDialog(QDialog):
         label.setFixedWidth(76)
         self._root_label = QLabel("—")
         self._root_label.setObjectName("ValueNum")
-        self._root_label.setToolTip("附加 URDF 的根 link，将作为装配关节的子 link")
+        self._root_label.setToolTip("工具 URDF 的根 link，将作为装配关节的子 link")
         row.addWidget(label)
         row.addWidget(self._root_label, 1)
         layout.addLayout(row)
@@ -159,7 +190,7 @@ class MergeDialog(QDialog):
         row.addWidget(self._origin_edit, 1)
         layout.addLayout(row)
 
-        self._hint = QLabel("选择附加 URDF 后显示预览")
+        self._hint = QLabel("选择工具 URDF 后显示预览")
         self._hint.setObjectName("CardHint")
         self._hint.setWordWrap(True)
         layout.addWidget(self._hint)
@@ -172,7 +203,7 @@ class MergeDialog(QDialog):
         cancel.setObjectName("Ghost")
         cancel.setCursor(Qt.PointingHandCursor)
         cancel.clicked.connect(self.reject)
-        self._merge_button = QPushButton("拼接")
+        self._merge_button = QPushButton("拼接工具")
         self._merge_button.setObjectName("Primary")
         self._merge_button.setIcon(primary_icon("link", 15))
         self._merge_button.setCursor(Qt.PointingHandCursor)
@@ -183,13 +214,13 @@ class MergeDialog(QDialog):
         layout.addLayout(buttons)
 
     # ------------------------------------------------------------------
-    # 附加模型
+    # 工具模型
     # ------------------------------------------------------------------
 
     def _browse(self) -> None:
         path, _selected = QFileDialog.getOpenFileName(
             self,
-            "选择附加 URDF",
+            "选择工具 URDF",
             "",
             "URDF 文件 (*.urdf *.xml);;所有文件 (*.*)",
         )
@@ -201,23 +232,24 @@ class MergeDialog(QDialog):
         path = self._path_edit.text().strip()
         self._attachment = None
         self.merged_robot = None
+        self.tool_spec = None
         self._merge_button.setEnabled(False)
         self._root_label.setText("—")
         if not path:
-            self._set_hint("请选择附加 URDF", DANGER)
+            self._set_hint("请选择工具 URDF", DANGER)
             return
         if not Path(path).is_file():
-            self._set_hint("附加 URDF 文件不存在", DANGER)
+            self._set_hint("工具 URDF 文件不存在", DANGER)
             return
         try:
             robot = load_urdf(path)
         except UrdfError as exc:
-            self._set_hint(f"附加 URDF 加载失败：{exc}", DANGER)
+            self._set_hint(f"工具 URDF 加载失败：{exc}", DANGER)
             return
         self._attachment = robot
         self._root_label.setText(robot.root_link)
         details = (
-            f"附加模型 {robot.name} · {len(robot.link_names)} 个 link · "
+            f"工具模型 {robot.name} · {len(robot.link_names)} 个 link · "
             f"{len(robot.movable_joints)} 个可动关节 · 根 link {robot.root_link}"
         )
         if robot.warnings:
@@ -232,7 +264,7 @@ class MergeDialog(QDialog):
 
     def _accept(self) -> None:
         if self._attachment is None:
-            self._set_hint("请先加载附加 URDF", DANGER)
+            self._set_hint("请先加载工具 URDF", DANGER)
             return
         mount_link = self._mount_combo.currentText().strip()
         if not mount_link:
@@ -242,20 +274,30 @@ class MergeDialog(QDialog):
         if origin is None:
             self._set_hint("安装位姿需要 6 个数：x y z roll pitch yaw", DANGER)
             return
+        joint_name = self._joint_edit.text().strip() or "mount"
+        prefix = self._prefix_edit.text()
         try:
             merged, warnings = merge_urdf(
                 self._robot,
                 self._attachment,
                 mount_link,
-                self._joint_edit.text().strip() or "mount",
+                joint_name,
                 origin,
-                self._prefix_edit.text(),
+                prefix,
             )
         except UrdfError as exc:
             self._set_hint(f"拼接失败：{exc}", DANGER)
             return
         self.merged_robot = merged
         self.merge_warnings = warnings
+        self.tool_spec = ToolSpec(
+            name=self._name_edit.text().strip() or self._attachment.name,
+            robot=self._attachment,
+            mount_link=mount_link,
+            joint_name=joint_name,
+            origin=origin,
+            prefix=prefix,
+        )
         self.accept()
 
     def _set_hint(self, text: str, color: str) -> None:

@@ -27,7 +27,7 @@ from .calc_dialog import CalcDialog
 from .data_tree import DataTree, PoseEntry
 from .icons import app_icon, icon, logo_pixmap, primary_icon
 from .math3d import Pose, rotation_angle_between, transform_point
-from .merge_dialog import MergeDialog
+from .merge_dialog import MergeDialog, ToolSpec
 from .pose_input_dialog import PoseInputDialog
 from .robot_dialog import RobotDialog
 from .scene import (
@@ -43,7 +43,7 @@ from .scene import (
     SceneVisual,
 )
 from .solve_panel import SolvePanel
-from .urdf import UrdfError, UrdfRobot, load_urdf
+from .urdf import UrdfError, UrdfRobot, load_urdf, merge_urdf
 from .urdf_dialog import UrdfDialog
 from .vector_input_dialog import VectorInputDialog
 
@@ -75,7 +75,10 @@ class PoseViewWindow(QMainWindow):
         super().__init__()
         self._pose_entries: list[PoseEntry] = []
         self._vectors: list[SceneVector] = []
+        self._base_robot: UrdfRobot | None = None
         self._robot: UrdfRobot | None = None
+        self._tools: list[ToolSpec] = []
+        self._tool_index = -1
         self._joint_values: dict[str, float] = {}
         self._ee_link = ""
         self._robot_target: list[list[float]] | None = None
@@ -240,7 +243,6 @@ class PoseViewWindow(QMainWindow):
             ("位姿", "axis", self._add_poses_dialog, "录入位姿矩阵、四元数或欧拉角"),
             ("向量", "vector", self._add_vectors_dialog, "录入带起点的向量"),
             ("URDF", "file", self._load_urdf, "加载 URDF 机器人"),
-            ("拼接", "link", self._merge_urdf, "把附加 URDF 接到当前机器人"),
         ):
             button = QPushButton(text)
             button.setObjectName("Primary")
@@ -736,30 +738,104 @@ class PoseViewWindow(QMainWindow):
         self._apply_robot(robot)
 
     def _merge_urdf(self) -> None:
-        if self._robot is None:
-            self._flash_status("请先加载主机器人，再拼接附加 URDF")
+        if self._base_robot is None:
+            self._flash_status("请先加载主机器人，再拼接工具 URDF")
             return
-        dialog = MergeDialog(self._robot, self)
-        if dialog.exec_() != dialog.Accepted or dialog.merged_robot is None:
+        parent = (
+            self._robot_dialog
+            if self._robot_dialog is not None
+            else self
+        )
+        dialog = MergeDialog(self._base_robot, parent)
+        if dialog.exec_() != dialog.Accepted or dialog.tool_spec is None:
             return
-        merged = dialog.merged_robot
-        values = merged.default_values()
+        spec = dialog.tool_spec
+        base_name = spec.name
+        existing = {tool.name for tool in self._tools}
+        suffix = 2
+        while spec.name in existing:
+            spec.name = f"{base_name} {suffix}"
+            suffix += 1
+        self._tools.append(spec)
+        self._select_tool(len(self._tools) - 1)
+
+    def _select_tool(self, index: int) -> None:
+        """在主机器人上装配指定工具，-1 表示卸载工具。"""
+        if self._base_robot is None:
+            return
+        names = [tool.name for tool in self._tools]
+        if index < 0 or index >= len(self._tools):
+            robot = self._base_robot
+            index = -1
+        else:
+            spec = self._tools[index]
+            try:
+                robot, _warnings = merge_urdf(
+                    self._base_robot,
+                    spec.robot,
+                    spec.mount_link,
+                    spec.joint_name,
+                    spec.origin,
+                    spec.prefix,
+                )
+            except UrdfError as exc:
+                self._flash_status(f"工具 {spec.name} 拼接失败：{exc}")
+                if self._robot_dialog is not None:
+                    self._robot_dialog.set_tool_selection(
+                        names, self._tool_index
+                    )
+                return
+        self._tool_index = index
+        self._robot = robot
+        values = robot.default_values()
         for name, value in self._joint_values.items():
             if name in values:
                 values[name] = value
-        self._apply_robot(merged, values)
-        detail = (
-            f"已拼接 {merged.name} · {len(merged.link_names)} 个 link · "
-            f"{len(merged.movable_joints)} 个可动关节"
+        self._joint_values = values
+        self._ee_link = robot.default_ee_link()
+        self._show_visuals = (
+            robot.visual_triangle_count <= DEFAULT_VISUAL_TRIANGLE_LIMIT
         )
-        if merged.warnings:
-            detail += f"（{len(merged.warnings)} 条提示）"
-        self._flash_status(detail)
+        self._scene.set_show_visuals(self._show_visuals)
+        self._sync_robot_tree()
+        self._add_joint_poses(robot)
+        if self._robot_dialog is not None:
+            self._robot_dialog.reload_robot(
+                robot,
+                self._joint_values,
+                self._ee_link,
+                names,
+                self._tool_index,
+            )
+            self._robot_dialog.set_visuals_visible(self._show_visuals)
+            self._robot_dialog.set_skeleton_visible(self._show_skeleton)
+        self._refresh_robot()
+        if index >= 0:
+            self._flash_status(
+                f"已选择工具 {self._tools[index].name} · "
+                f"{len(robot.movable_joints)} 个可动关节"
+            )
+        else:
+            self._flash_status("已卸载工具，恢复主机器人")
+
+    def _sync_robot_tree(self) -> None:
+        if self._robot is None:
+            return
+        self._tree.set_robot(
+            self._robot.name,
+            bool(self._robot.visuals),
+            self._show_visuals,
+            self._joint_tree_items(self._robot),
+            skeleton_visible=self._show_skeleton,
+        )
 
     def _apply_robot(
         self, robot: UrdfRobot, values: dict[str, float] | None = None
     ) -> None:
         self._close_robot_dialog()
+        self._base_robot = robot
+        self._tools = []
+        self._tool_index = -1
         self._robot = robot
         self._joint_values = (
             dict(values) if values is not None else robot.default_values()
@@ -775,13 +851,7 @@ class PoseViewWindow(QMainWindow):
         self._show_skeleton = True
         self._scene.set_show_visuals(show_visuals)
         self._scene.set_show_skeleton(True)
-        self._tree.set_robot(
-            robot.name,
-            bool(robot.visuals),
-            show_visuals,
-            self._joint_tree_items(robot),
-            skeleton_visible=True,
-        )
+        self._sync_robot_tree()
         pose_count = self._add_joint_poses(robot)
         self._refresh_robot(fit=True)
         self._show_robot_dialog(show_visuals)
@@ -812,6 +882,8 @@ class PoseViewWindow(QMainWindow):
                 else show_visuals,
                 self,
                 show_skeleton=self._show_skeleton,
+                tool_names=[tool.name for tool in self._tools],
+                tool_index=self._tool_index,
             )
             dialog.angles_changed.connect(self._on_robot_angles)
             dialog.ee_changed.connect(self._on_robot_ee_changed)
@@ -819,6 +891,8 @@ class PoseViewWindow(QMainWindow):
             dialog.clear_requested.connect(self._clear_robot)
             dialog.visuals_toggled.connect(self._on_visuals_toggled)
             dialog.skeleton_toggled.connect(self._on_skeleton_toggled)
+            dialog.tool_changed.connect(self._on_tool_selected)
+            dialog.tool_merge_requested.connect(self._merge_urdf)
             self._robot_dialog = dialog
             self._refresh_robot()
         self._robot_dialog.set_visuals_visible(self._show_visuals)
@@ -1066,6 +1140,9 @@ class PoseViewWindow(QMainWindow):
         self._joint_values = dict(values)
         self._refresh_robot()
 
+    def _on_tool_selected(self, index: int) -> None:
+        self._select_tool(index)
+
     def _on_robot_ee_changed(self, name: str) -> None:
         self._ee_link = name
         self._refresh_robot()
@@ -1119,6 +1196,9 @@ class PoseViewWindow(QMainWindow):
         if self._robot is None:
             return
         self._robot = None
+        self._base_robot = None
+        self._tools = []
+        self._tool_index = -1
         self._joint_values = {}
         self._ee_link = ""
         self._robot_target = None
@@ -1180,8 +1260,7 @@ class PoseViewWindow(QMainWindow):
             "· “位姿”按钮：独立输入框，支持齐次矩阵 / 位置 + 四元数 / 位置 + 欧拉角 / 位置 + 旋转向量<br>"
             "· 齐次矩阵支持 4x4、3x4（旋转 + 平移）与 3x3（仅旋转）；空行或 <code>---</code> 分隔多帧<br>"
             "· “向量”按钮：独立输入框，支持“起点 + 方向”或“起点 + 终点”，每行 6 个数<br>"
-            "· “URDF”按钮：输入或浏览 URDF 文件路径，加载后显示在机器人节点<br>"
-            "· “拼接”按钮：把附加 URDF 的根 link 通过固定关节接到当前机器人，可设置安装 link、前缀与安装位姿<br><br>"
+            "· “URDF”按钮：输入或浏览 URDF 文件路径，加载后显示在机器人节点<br><br>"
             "<b>数据列表</b><br>"
             "· 根节点“位姿 / 向量 / 机器人”可展开或收起，右键可全部展开 / 收起<br>"
             "· 子项复选框控制场景显隐，双击或右键重命名，Delete 或右键菜单删除<br>"
@@ -1197,6 +1276,8 @@ class PoseViewWindow(QMainWindow):
             "· 拖动关节或求解 IK 时，这些关节坐标系的矩阵与场景显示会实时同步<br>"
             "· 外观支持 box / cylinder / sphere 与 STL / OBJ mesh，颜色取自 URDF material<br>"
             "· 关节控制：滑条或数值框驱动正运动学，支持关节锁定、目标位姿与 IK 求解<br>"
+            "· 工具：可在关节控制面板的“工具”下拉框切换已拼接的工具，选择“无工具”卸载；"
+            "“拼接工具…”可直接追加工具，末端连杆会默认切换到工具末端<br>"
             "· 点击场景中的连杆或关节可选中高亮，状态栏显示关节角度与限位<br><br>"
             "<b>计算工具</b><br>"
             "· 点击右上角“计算”打开，包含点位变换、位姿测量、相对位姿、向量、变换链、旋转 / 四元数、数据 / 轨迹<br>"

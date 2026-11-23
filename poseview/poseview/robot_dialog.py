@@ -68,6 +68,8 @@ class RobotDialog(QDialog):
     clear_requested = pyqtSignal()
     visuals_toggled = pyqtSignal(bool)
     skeleton_toggled = pyqtSignal(bool)
+    tool_changed = pyqtSignal(int)
+    tool_merge_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -78,6 +80,8 @@ class RobotDialog(QDialog):
         show_visuals: bool = True,
         parent=None,
         show_skeleton: bool = True,
+        tool_names: list[str] | None = None,
+        tool_index: int = -1,
     ) -> None:
         super().__init__(parent)
         self._robot = robot
@@ -87,8 +91,16 @@ class RobotDialog(QDialog):
         self._target_matrix: list[list[float]] | None = None
         self._controls: dict[str, _Control] = {}
         self._joint_scroll: QScrollArea | None = None
+        self._joint_rows_layout: QVBoxLayout | None = None
         self._selected_control: _Control | None = None
         self._locked: set[str] = set()
+        self._tool_names = list(tool_names or [])
+        self._tool_index = (
+            tool_index
+            if 0 <= tool_index < len(self._tool_names)
+            else -1
+        )
+        self._tool_updating = False
         self._initial_visuals = bool(show_visuals)
         self._initial_skeleton = bool(show_skeleton)
         self._updating = True
@@ -118,18 +130,33 @@ class RobotDialog(QDialog):
         title.setObjectName("DialogTitle")
         layout.addWidget(title)
 
-        subtitle = QLabel(
-            f"{self._robot.name} · {len(self._robot.movable_joints)} 个可动关节"
-            + (
-                f" · {len(self._robot.visuals)} 个外观"
-                if self._robot.visuals
-                else " · 仅骨架"
-            )
+        self._subtitle = QLabel()
+        self._subtitle.setObjectName("DialogHint")
+        layout.addWidget(self._subtitle)
+        self._update_subtitle()
+
+        tool_row = QHBoxLayout()
+        tool_row.setSpacing(8)
+        tool_label = QLabel("工具")
+        tool_label.setObjectName("ValueKey")
+        tool_label.setFixedWidth(64)
+        self._tool_combo = QComboBox()
+        self._tool_combo.setMaximumWidth(360)
+        self._tool_combo.setToolTip("选择安装在机器人上的工具，切换后末端与外观同步更新")
+        self._tool_combo.currentIndexChanged.connect(
+            self._on_tool_combo_changed
         )
-        subtitle.setObjectName("DialogHint")
-        if self._robot.warnings:
-            subtitle.setToolTip("\n".join(self._robot.warnings))
-        layout.addWidget(subtitle)
+        self._tool_button = QPushButton("拼接工具…")
+        self._tool_button.setObjectName("Ghost")
+        self._tool_button.setIcon(icon("link", "#475569", 15))
+        self._tool_button.setCursor(Qt.PointingHandCursor)
+        self._tool_button.setToolTip("加载工具 URDF 并拼接到机器人上")
+        self._tool_button.clicked.connect(self.tool_merge_requested.emit)
+        tool_row.addWidget(tool_label)
+        tool_row.addWidget(self._tool_combo, 1)
+        tool_row.addWidget(self._tool_button)
+        layout.addLayout(tool_row)
+        self.set_tool_selection(self._tool_names, self._tool_index)
 
         ee_row = QHBoxLayout()
         ee_row.setSpacing(8)
@@ -137,14 +164,7 @@ class RobotDialog(QDialog):
         ee_label.setObjectName("ValueKey")
         ee_label.setFixedWidth(64)
         self._ee_combo = QComboBox()
-        options = list(self._robot.leaf_links)
-        if self._ee_link and self._ee_link not in options:
-            options.insert(0, self._ee_link)
-        for name in options:
-            self._ee_combo.addItem(name)
-        index = self._ee_combo.findText(self._ee_link)
-        if index >= 0:
-            self._ee_combo.setCurrentIndex(index)
+        self._refresh_ee_options()
         self._ee_combo.currentTextChanged.connect(self._on_ee_changed)
         self._ee_combo.setMaximumWidth(360)
         ee_row.addWidget(ee_label)
@@ -200,6 +220,109 @@ class RobotDialog(QDialog):
         bottom.addWidget(close_button)
         layout.addLayout(bottom)
 
+    def _update_subtitle(self) -> None:
+        robot = self._robot
+        text = f"{robot.name} · {len(robot.movable_joints)} 个可动关节"
+        text += (
+            f" · {len(robot.visuals)} 个外观"
+            if robot.visuals
+            else " · 仅骨架"
+        )
+        self._subtitle.setText(text)
+        self._subtitle.setToolTip(
+            "\n".join(robot.warnings) if robot.warnings else ""
+        )
+
+    def _refresh_ee_options(self) -> None:
+        blocked = self._ee_combo.blockSignals(True)
+        self._ee_combo.clear()
+        options = list(self._robot.leaf_links)
+        if self._ee_link and self._ee_link not in options:
+            options.insert(0, self._ee_link)
+        self._ee_combo.addItems(options)
+        index = self._ee_combo.findText(self._ee_link)
+        if index >= 0:
+            self._ee_combo.setCurrentIndex(index)
+        self._ee_combo.blockSignals(blocked)
+
+    def _populate_joint_rows(self) -> None:
+        layout = self._joint_rows_layout
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._controls.clear()
+        self._locked &= {joint.name for joint in self._robot.movable_joints}
+        if not self._robot.movable_joints:
+            empty = QLabel("该 URDF 没有可动关节")
+            empty.setObjectName("CardHint")
+            layout.addWidget(empty)
+        for joint in self._robot.movable_joints:
+            layout.addWidget(self._build_joint_row(joint))
+        layout.addStretch(1)
+        for name in list(self._locked):
+            control = self._controls.get(name)
+            if control is None or control.is_mimic:
+                continue
+            control.lock.setChecked(True)
+
+    def set_tool_selection(self, names: list[str], index: int) -> None:
+        """更新工具下拉列表，不触发切换信号。"""
+        self._tool_names = list(names)
+        self._tool_index = (
+            index if 0 <= index < len(self._tool_names) else -1
+        )
+        self._tool_updating = True
+        blocked = self._tool_combo.blockSignals(True)
+        self._tool_combo.clear()
+        self._tool_combo.addItem("无工具")
+        self._tool_combo.addItems(self._tool_names)
+        self._tool_combo.setCurrentIndex(self._tool_index + 1)
+        self._tool_combo.blockSignals(blocked)
+        self._tool_updating = False
+
+    def _on_tool_combo_changed(self, position: int) -> None:
+        if self._tool_updating:
+            return
+        self.tool_changed.emit(position - 1)
+
+    def reload_robot(
+        self,
+        robot: UrdfRobot,
+        values: dict[str, float],
+        ee_link: str,
+        tool_names: list[str] | None = None,
+        tool_index: int = -1,
+    ) -> None:
+        """模型或工具变化后原地重建关节控件，保留目标与权重设置。"""
+        self._robot = robot
+        self._values = dict(values)
+        self._ee_link = ee_link or robot.default_ee_link()
+        self._ee_matrix = None
+        self._selected_control = None
+        self.setWindowTitle(f"机器人关节 · {robot.name}")
+        self._update_subtitle()
+        self._refresh_ee_options()
+        self._populate_joint_rows()
+        self._visuals_check.setEnabled(bool(robot.visuals))
+        if robot.visuals:
+            self._visuals_check.setToolTip(
+                "显示 / 隐藏 URDF 外观（box/cylinder/sphere/STL/OBJ）"
+            )
+        else:
+            self._visuals_check.setToolTip(
+                "该 URDF 没有可绘制外观（box/cylinder/sphere/STL/OBJ）"
+            )
+        self.set_tool_selection(
+            tool_names if tool_names is not None else self._tool_names,
+            tool_index,
+        )
+        self._set_ik_status("尚未求解", "#64748B")
+
     def _build_joint_card(self) -> QFrame:
         card = QFrame()
         card.setObjectName("Card")
@@ -236,14 +359,8 @@ class RobotDialog(QDialog):
         rows = QVBoxLayout(container)
         rows.setContentsMargins(0, 0, 2, 0)
         rows.setSpacing(6)
-
-        if not self._robot.movable_joints:
-            empty = QLabel("该 URDF 没有可动关节")
-            empty.setObjectName("CardHint")
-            rows.addWidget(empty)
-        for joint in self._robot.movable_joints:
-            rows.addWidget(self._build_joint_row(joint))
-        rows.addStretch(1)
+        self._joint_rows_layout = rows
+        self._populate_joint_rows()
 
         scroll.setWidget(container)
         scroll.setMinimumHeight(140)
